@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Gasket",
   "version": "0.0.0",
-  "identifier": "com.gasket.app",
+  "identifier": "com.gasket.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
