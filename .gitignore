@@ -31,4 +31,6 @@ config.yaml
 .fastembed_cache
 .worktrees/
 gasket/target/
+web/src-tauri/target/
+web/src-tauri/gen/
 .zread

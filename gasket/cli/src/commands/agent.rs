@@ -85,7 +85,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
     // Initialize wiki stores if wiki config is enabled or wiki directory exists
     let wiki_root = workspace.join("wiki");
     let (page_store, page_index) =
-        if wiki_root.exists() || agent_config.wiki.as_ref().map_or(false, |w| w.enabled) {
+        if wiki_root.exists() || agent_config.wiki.as_ref().is_some_and(|w| w.enabled) {
             use gasket_engine::wiki::{PageIndex, PageStore};
             use gasket_storage::wiki::TantivyPageIndex;
             let (wiki_changed_tx, mut wiki_changed_rx) = tokio::sync::mpsc::channel(64);

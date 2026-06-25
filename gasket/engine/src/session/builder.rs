@@ -126,12 +126,12 @@ impl SessionBuilder {
         let session_store = SessionStore::new(pool.clone());
         #[cfg(feature = "embedding")]
         let event_store = if let Some(tx) = self.event_store_tx {
-            EventStore::with_pool_and_sender(pool, tx)
+            EventStore::with_pool_and_sender(pool.clone(), tx)
         } else {
-            EventStore::new(pool)
+            EventStore::new(pool.clone())
         };
         #[cfg(not(feature = "embedding"))]
-        let event_store = EventStore::new(pool);
+        let event_store = EventStore::new(pool.clone());
 
         // ── 2. Query provider for real model limits ──────────────────
         let model_limits = self
@@ -255,6 +255,14 @@ impl SessionBuilder {
             history_config,
         );
 
+        // ── 10. Wiki PageStore for finalizer (index.md rebuild) ──
+        let wiki_root = self.workspace.join("wiki");
+        let page_store = if wiki_root.exists() {
+            Some(crate::wiki::PageStore::new(pool.clone(), wiki_root))
+        } else {
+            None
+        };
+
         let finalizer = ResponseFinalizer::new(
             context_builder.hooks().clone(),
             context_builder.event_store().clone(),
@@ -262,6 +270,7 @@ impl SessionBuilder {
             None,
             effective_max_tokens,
             self.config.after_response_hook_timeout_secs,
+            page_store,
         );
 
         let mut config = self.config;

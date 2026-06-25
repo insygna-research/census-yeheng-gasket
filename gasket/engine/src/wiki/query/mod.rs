@@ -102,6 +102,11 @@ impl WikiQueryEngine {
 
     /// Full hybrid query with RRF fusion and budget-aware selection.
     pub async fn query(&self, query: &str, budget: TokenBudget) -> Result<QueryResult> {
+        // JIT watermark reconciliation: ensure any out-of-band disk edits
+        // are incrementally compiled into SQLite before we search.
+        if let Err(e) = self.store.sync_db_from_disk().await {
+            tracing::warn!("WikiQueryEngine: JIT sync failed (continuing): {}", e);
+        }
         let candidates = self.hybrid_search(query, 50).await?;
         let total_candidates = candidates.len();
 

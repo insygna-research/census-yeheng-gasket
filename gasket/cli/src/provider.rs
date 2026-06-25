@@ -62,7 +62,6 @@ pub fn build_provider(
         );
     }
     gasket_engine::providers::build_provider(name, api_key, provider_config, model)
-        .map_err(Into::into)
 }
 
 /// Infer `ProviderType` from a provider name (used when no config entry exists).

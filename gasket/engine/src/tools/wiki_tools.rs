@@ -82,6 +82,11 @@ impl Tool for WikiSearchTool {
             parsed.query, parsed.limit
         );
 
+        // JIT watermark reconciliation before search.
+        if let Err(e) = self.page_store.sync_db_from_disk().await {
+            tracing::warn!("wiki_search: JIT sync failed (continuing): {}", e);
+        }
+
         let hits = self
             .page_index
             .search_with_store(&parsed.query, parsed.limit, Some(&self.page_store))
@@ -353,6 +358,21 @@ impl Tool for WikiReadTool {
             return Err(ToolError::InvalidArguments(
                 "path must not be empty".to_string(),
             ));
+        }
+
+        // JIT: if this specific file is newer than the watermark, trigger
+        // incremental sync so SQLite and search index are consistent.
+        let disk_path = self.page_store.wiki_root().join(format!("{}.md", path));
+        if let Ok(mtime) = PageStore::file_mtime(&disk_path).await {
+            if let Ok(Some(wm_str)) = self.page_store.kv_read_watermark().await {
+                if let Ok(watermark) = wm_str.parse::<i64>() {
+                    if mtime > watermark {
+                        if let Err(e) = self.page_store.sync_db_from_disk().await {
+                            tracing::warn!("wiki_read: JIT sync failed (continuing): {}", e);
+                        }
+                    }
+                }
+            }
         }
 
         let page = self.page_store.read(path).await.map_err(|e| {
