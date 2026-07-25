@@ -11,16 +11,7 @@ description = "A lightweight personal AI assistant framework"
 [workspace]
 resolver = "2"
 members = [
-    "types",
-    "storage",
-    "embedding",
-    "broker",
-    "engine",
-    "cli",
-    "providers",
-    "channels",
-    "sandbox",
-    "command",
+    "gasket-core",
 ]
 
 [profile.release]

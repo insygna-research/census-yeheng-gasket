@@ -1,0 +1,133 @@
+//! `read` tool — read a file with optional offset/limit pagination.
+
+use std::sync::Arc;
+
+use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::ContentBlock;
+
+/// Maximum bytes returned in one read, to keep tool results bounded.
+const MAX_BYTES: usize = 2_000_000;
+
+pub fn tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "read".into(),
+        label: "Read".into(),
+        description: "Read a UTF-8 text file. Supports offset/limit by line."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to cwd" },
+                "offset": { "type": "integer", "description": "1-based start line (default 1)" },
+                "limit": { "type": "integer", "description": "Max lines to return (default all)" }
+            },
+            "required": ["path"]
+        }),
+        execute: Arc::new(|ctx| Box::pin(execute(ctx))),
+    }
+}
+
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+    let path = ctx.args["path"]
+        .as_str()
+        .ok_or_else(|| crate::error::ToolError::Message("path is required".into()))?;
+    let offset = ctx.args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = ctx.args["limit"].as_u64().map(|l| l as usize);
+
+    let full = ctx.ctx.cwd.join(path);
+    let bytes = tokio::fs::read(&full).await?;
+    if bytes.len() > MAX_BYTES {
+        return Ok(ToolResult::error(format!(
+            "file too large ({} bytes > {} limit)",
+            bytes.len(),
+            MAX_BYTES
+        )));
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let start = offset.min(lines.len());
+    let end = match limit {
+        Some(l) => (start + l).min(lines.len()),
+        None => lines.len(),
+    };
+    let out: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:>6}\t{}", start + i + 1, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(ToolResult {
+        content: vec![ContentBlock::text(if out.is_empty() {
+            "(empty)".to_string()
+        } else {
+            out
+        })],
+        details: serde_json::json!({"path": path, "lines": end - start}),
+        is_error: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::tool::ToolContext;
+    use std::sync::atomic::AtomicBool;
+
+    async fn run(args: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
+        let t = tool();
+        (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: cwd.to_path_buf(),
+            },
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reads_file_with_line_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\nc")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt"}),
+            tmp.path(),
+        )
+        .await;
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(text.contains("1\ta"));
+        assert!(text.contains("3\tc"));
+    }
+
+    #[tokio::test]
+    async fn respects_offset_and_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "1\n2\n3\n4\n5")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "offset": 1, "limit": 2}),
+            tmp.path(),
+        )
+        .await;
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(text.contains("2"));
+        assert!(text.contains("3"));
+        assert!(!text.contains("1\t"));
+        assert!(!text.contains("4"));
+    }
+}

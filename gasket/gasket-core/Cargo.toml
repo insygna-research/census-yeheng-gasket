@@ -1,0 +1,50 @@
+[package]
+name = "gasket-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pi-style pluggable agent core for gasket"
+
+[lib]
+name = "gasket_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP client (providers)
+reqwest = { workspace = true }
+
+# Async utilities
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+async-stream = "0.3"
+
+# cdylib plugin loading
+libloading = "0.8"
+
+# IDs
+uuid = { workspace = true }
+
+# Home/config dir lookup
+dirs = { workspace = true }
+
+# File walking (list tool)
+walkdir = "2"
+
+# Glob matching (list tool)
+glob = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
