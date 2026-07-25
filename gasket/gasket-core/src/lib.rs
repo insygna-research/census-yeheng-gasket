@@ -19,7 +19,7 @@ pub mod types;
 pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
 pub use storage::JsonlStorage;
-pub use providers::{AnthropicProvider, OpenAiCompat};
+pub use providers::{AnthropicProvider, OpenAiCompat, ProviderConfig, ConfigError};
 pub use tools::built_in_tools;
 pub use extension::{ExtensionApi, ExtensionApiImpl, ExtensionContext, Plugin};
 pub use types::context::{

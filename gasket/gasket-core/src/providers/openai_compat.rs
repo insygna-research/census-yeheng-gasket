@@ -31,6 +31,25 @@ impl OpenAiCompat {
             client: reqwest::Client::new(),
         }
     }
+
+    /// Construct with a pre-built client (e.g. one carrying proxy config from
+    /// [`crate::providers::ProviderConfig`]).
+    pub fn with_client(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            client,
+        }
+    }
+
+    /// Build from a [`ProviderConfig`] (reads base_url/key/client).
+    pub fn from_config(cfg: &crate::providers::ProviderConfig) -> Self {
+        Self::with_client(&cfg.base_url, &cfg.api_key, cfg.client.clone())
+    }
 }
 
 impl std::fmt::Debug for OpenAiCompat {

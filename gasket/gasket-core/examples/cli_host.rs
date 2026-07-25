@@ -40,19 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timestamp: gasket_core::now(),
     });
 
-    let api_key = std::env::var("GASKET_API_KEY").ok();
-    let base_url = std::env::var("GASKET_BASE_URL")
-        .unwrap_or_else(|_| "https://api.deepseek.com/v1".into());
-    let model_id = std::env::var("GASKET_MODEL")
-        .unwrap_or_else(|_| "deepseek-chat".into());
-
-    let stream_fn: Arc<dyn StreamFn> = match api_key {
-        Some(key) => Arc::new(OpenAiCompat::new(base_url, key)),
-        None => {
-            println!("(no GASKET_API_KEY set; using mock reply)\n");
-            Arc::new(MockStream)
-        }
-    };
+    // Provider config from env: GASKET_LLM_BASE_URL / KEY / MODEL / *_PROXY.
+    // See `ProviderConfig::from_env`. Falls back to a mock if not configured.
+    let (model_id, provider): (String, Option<Arc<dyn StreamFn>>) =
+        match gasket_core::ProviderConfig::from_env() {
+            Ok(cfg) => {
+                let model = cfg.model.clone();
+                let stream: Arc<dyn StreamFn> = Arc::new(OpenAiCompat::from_config(&cfg));
+                (model, Some(stream))
+            }
+            Err(e) => {
+                println!("(no LLM config: {e}; using mock reply)\n");
+                ("mock".to_string(), None)
+            }
+        };
+    let stream_fn: Arc<dyn StreamFn> = provider.unwrap_or_else(|| Arc::new(MockStream));
 
     let config = gasket_core::AgentLoopConfig {
         model: gasket_core::ModelSpec {
