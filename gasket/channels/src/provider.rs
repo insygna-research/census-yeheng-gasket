@@ -25,7 +25,7 @@ pub enum ImProvider {
     Slack(crate::slack::SlackAdapter),
     #[cfg(feature = "websocket")]
     WebSocket(crate::websocket::WebSocketAdapter),
-    Cli(crate::websocket::CliAdapter), // re-use the no-op adapter
+    Cli(crate::adapter::CliAdapter), // re-use the no-op adapter
     #[cfg(feature = "feishu")]
     Feishu(crate::feishu::FeishuAdapter),
     #[cfg(feature = "wechat")]
@@ -87,18 +87,6 @@ impl ImProvider {
         }
     }
 
-    /// Return webhook routes for this provider, if any.
-    pub fn routes(&self) -> Option<axum::Router> {
-        match self {
-            #[cfg(feature = "websocket")]
-            Self::WebSocket(a) => Some(a.routes()),
-            #[cfg(feature = "feishu")]
-            Self::Feishu(a) => Some(a.routes()),
-
-            _ => None,
-        }
-    }
-
     pub async fn send(&self, msg: &OutboundMessage) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "telegram")]
@@ -119,10 +107,14 @@ impl ImProvider {
 }
 
 impl ImProviders {
-    /// Build providers from configuration, including only enabled platforms.
+    /// Build providers from configuration.
+    ///
+    /// After the V0.1 channel-adapter removal, only the no-op CLI adapter is
+    /// registered regardless of config; `config`/`inbound` are kept for API
+    /// stability (callers in cli still pass them).
     pub fn from_config(
-        config: &crate::config::ChannelsConfig,
-        inbound: crate::middleware::InboundSender,
+        _config: &crate::config::ChannelsConfig,
+        _inbound: crate::middleware::InboundSender,
     ) -> Self {
         let mut providers = Vec::new();
 
@@ -183,7 +175,7 @@ impl ImProviders {
 
         // Always register the no-op CLI adapter so outbound messages tagged with
         // ChannelType::Cli are gracefully absorbed instead of dropped with a warning.
-        providers.push(ImProvider::Cli(crate::websocket::CliAdapter));
+        providers.push(ImProvider::Cli(crate::adapter::CliAdapter));
 
         Self { providers }
     }

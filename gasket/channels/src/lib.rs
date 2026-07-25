@@ -1,22 +1,13 @@
-//! Messaging channel abstractions and implementations for gasket.
+//! Messaging channel core types for gasket.
 //!
-//! This crate provides:
-//! - Core channel types (`events`, `config`, `adapter`, `middleware`, `provider`)
-//! - Feature-gated IM adapter implementations (Telegram, Discord, Slack, etc.)
-//! - Platform-specific webhook handlers (Feishu)
+//! This crate provides only the core channel abstractions:
+//! - Channel types (`events`, `config`, `adapter`, `middleware`, `provider`)
+//! - Session addressing (`SessionKey`, `ChannelType`)
 //!
-//! # Platform Modules
-//!
-//! Each platform module contains both adapter and webhook implementations:
-//!
-//! - [`feishu`] - Feishu (飞书) adapter and webhook
+//! Platform adapter implementations (Telegram/Discord/Slack/Feishu/WeChat/WebSocket)
+//! were removed in the V0.1 refactor — they belong in plugins now.
 
-//!
-//! # WebSocket & CLI
-//!
-//! - [`websocket`] - WebSocket server and `WebSocketAdapter`/`CliAdapter`
-
-// Core types (always compiled)
+// Core types
 pub mod adapter;
 pub mod approval_router;
 pub mod config;
@@ -25,19 +16,8 @@ pub mod events;
 pub mod middleware;
 pub mod provider;
 
-// Platform adapter implementations (feature-gated)
-#[cfg(feature = "discord")]
-pub mod discord;
-#[cfg(feature = "feishu")]
-pub mod feishu;
-#[cfg(feature = "slack")]
-pub mod slack;
-#[cfg(feature = "telegram")]
-pub mod telegram;
-#[cfg(feature = "websocket")]
-pub mod websocket;
-#[cfg(feature = "wechat")]
-pub mod wechat;
+// Platform adapter implementations (telegram/discord/slack/feishu/wechat/websocket)
+// were removed in the V0.1 refactor. Only core types remain.
 
 // Convenience re-exports
 pub use adapter::ImAdapter;
@@ -55,6 +35,3 @@ pub use middleware::{
     log_inbound, ChannelError, InboundSender, SimpleAuthChecker, SimpleRateLimiter,
 };
 pub use provider::{ImProvider, ImProviders};
-
-#[cfg(feature = "websocket")]
-pub use websocket::WebSocketApprovalCallback;

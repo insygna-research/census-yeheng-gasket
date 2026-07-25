@@ -25,3 +25,26 @@ pub trait ImAdapter: Send + Sync {
     /// Send an outbound message.
     async fn send(&self, msg: &crate::events::OutboundMessage) -> anyhow::Result<()>;
 }
+
+/// No-op adapter for the local CLI channel.
+///
+/// CLI sessions don't use a real transport; inbound/outbound go directly through
+/// stdin/stdout. This adapter satisfies the `ImAdapter` contract with empty
+/// implementations so the provider registry has a placeholder for `ChannelType::Cli`.
+#[derive(Clone, Copy)]
+pub struct CliAdapter;
+
+#[async_trait]
+impl ImAdapter for CliAdapter {
+    fn name(&self) -> &str {
+        "cli"
+    }
+
+    async fn start(&self, _inbound: crate::middleware::InboundSender) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, _msg: &crate::events::OutboundMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+}

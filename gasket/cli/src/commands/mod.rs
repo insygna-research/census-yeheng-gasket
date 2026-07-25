@@ -8,7 +8,6 @@ mod command_host;
 mod cron;
 mod dispatching_handler;
 mod embedding;
-mod gateway;
 mod onboard;
 mod plugin_commands;
 pub mod registry;
@@ -25,7 +24,6 @@ pub use cron::{
     cmd_cron_remove, cmd_cron_show,
 };
 pub use embedding::{cmd_embedding_rebuild, cmd_embedding_stats};
-pub use gateway::cmd_gateway;
 pub use onboard::cmd_onboard;
 pub use status::{cmd_auth_status, cmd_status};
 pub use tool::cmd_tool_execute;

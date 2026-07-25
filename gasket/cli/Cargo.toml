@@ -11,7 +11,7 @@ name = "gasket"
 path = "src/main.rs"
 
 [features]
-default = ["markdown", "websocket"]
+default = ["markdown"]
 
 # Rendering
 markdown = ["termimad"]
@@ -19,15 +19,8 @@ markdown = ["termimad"]
 # Telemetry (optional, for production/debugging)
 telemetry = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
 
-# Channels (for gateway mode)
-telegram = ["gasket-channels/telegram"]
-discord = ["gasket-channels/discord"]
-slack = ["gasket-channels/slack"]
-
-feishu = ["gasket-channels/feishu"]
-wechat = ["gasket-channels/wechat"]
-websocket = ["gasket-channels/websocket", "axum", "dep:tower-http"]
-all-channels = ["gasket-channels/all-channels", "axum", "teloxide", "dep:tower-http"]
+# Channel adapters (telegram/discord/slack/feishu/wechat/websocket) were removed
+# in the V0.1 refactor — they belong in plugins now.
 
 # Providers
 provider-anthropic = ["gasket-engine/provider-anthropic"]
@@ -44,7 +37,7 @@ embedding = ["gasket-engine/embedding"]
 workspace-download = ["dep:tar", "dep:flate2"]
 
 # Full build (all optional features enabled)
-full = ["default", "all-providers", "workspace-download", "all-channels", "telemetry", "embedding"]
+full = ["default", "all-providers", "workspace-download", "telemetry", "embedding"]
 
 [dependencies]
 gasket-engine = { path = "../engine" }
@@ -103,15 +96,8 @@ uuid.workspace = true
 # Markdown rendering (optional)
 termimad = { workspace = true, optional = true }
 
-# Telegram (optional)
-teloxide = { workspace = true, optional = true }
-
 # TLS
 rustls.workspace = true
-
-# HTTP server
-axum = { workspace = true, features = ["ws"], optional = true }
-tower-http = { workspace = true, optional = true }
 
 # HTTP client (for workspace downloads)
 reqwest.workspace = true

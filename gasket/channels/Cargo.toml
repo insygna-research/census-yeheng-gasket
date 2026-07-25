@@ -7,15 +7,9 @@ authors.workspace = true
 description = "Messaging channel abstractions and implementations for gasket"
 
 [features]
-default = ["websocket"]
-telegram = ["teloxide"]
-discord = ["serenity"]
-slack = ["tokio-tungstenite"]
-
-feishu = ["axum", "tower", "tower-http", "dashmap"]
-wechat = ["dep:wechatbot"]
-websocket = ["axum", "tower", "tower-http", "dashmap"]
-all-channels = ["telegram", "discord", "slack", "feishu", "wechat", "websocket"]
+# Platform adapter implementations were removed in the V0.1 refactor.
+# Only core channel types (SessionKey/ChannelType/InboundMessage/OutboundMessage,
+# adapter trait, middleware, provider registry) remain.
 
 [dependencies]
 # Internal crates
@@ -53,26 +47,9 @@ urlencoding = "2.1"
 
 # Base64
 base64 = "0.22"
-
-
-
-# Telegram (optional)
-teloxide = { workspace = true, optional = true }
-
-# Discord (optional)
-serenity = { workspace = true, optional = true }
-
-# Slack WebSocket (optional)
-tokio-tungstenite = { workspace = true, optional = true }
-
-# WeChat iLink Bot SDK (optional)
-wechatbot = { version = "0.3", optional = true }
-
-# Webhook HTTP server (optional - used by feishu and standalone webhook)
-axum = { workspace = true, optional = true, features = ["ws"] }
-tower = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true }
 bytes = "1"
-dashmap = { version = "6.1", optional = true }
+
+# Concurrent map (used by approval_router core)
+dashmap = "6.1"
 
 

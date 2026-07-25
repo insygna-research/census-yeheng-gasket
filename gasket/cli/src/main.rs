@@ -63,7 +63,6 @@ async fn main() -> Result<()> {
         Some(Commands::Onboard) => commands::cmd_onboard().await,
         Some(Commands::Status) => commands::cmd_status().await,
         Some(Commands::Agent(opts)) => commands::cmd_agent(opts).await,
-        Some(Commands::Gateway) => commands::cmd_gateway().await,
         Some(Commands::Channels { command }) => match command {
             ChannelsCommands::Status => commands::cmd_channels_status().await,
         },
@@ -129,7 +128,6 @@ async fn main() -> Result<()> {
             println!("  status    Show status");
             println!("  agent     Chat with the agent (REPL)");
             println!("  channels  Manage chat channels");
-            println!("  gateway   Start the gateway");
             println!("  auth      Authentication commands");
             println!("  cron      Manage scheduled tasks");
             println!("  stats     Show session token usage and cost statistics");

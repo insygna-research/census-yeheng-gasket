@@ -23,9 +23,6 @@ pub enum Commands {
     /// Chat with the agent
     Agent(AgentOptions),
 
-    /// Start the gateway (for chat channels)
-    Gateway,
-
     /// Manage chat channels
     Channels {
         #[command(subcommand)]
