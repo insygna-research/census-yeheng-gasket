@@ -47,7 +47,7 @@ fn save(ctx: &gasket_core::ToolContext, state: &State) {
 }
 
 /// Register the `todo` tool.
-pub fn register(api: &mut impl ExtensionApi) {
+pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
     api.register_tool(ToolDefinition {
         name: "todo".into(),
         label: "Todo".into(),

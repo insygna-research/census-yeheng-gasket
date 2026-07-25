@@ -18,7 +18,7 @@ use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolResult};
 /// A plugin's `register` is its only entry point. It receives the
 /// `ExtensionApi` and calls `register_tool` / `register_before_tool_call` /
 /// `register_event_handler` as needed. Nothing else.
-pub fn register(api: &mut impl ExtensionApi) {
+pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
     api.register_tool(ToolDefinition {
         name: "hello".into(),
         label: "Hello".into(),
@@ -43,17 +43,20 @@ pub fn register(api: &mut impl ExtensionApi) {
     });
 }
 
-// ── cdylib entry point ────────────────────────────────────────────────────
-// When compiled as a cdylib (crate-type = ["cdylib"]), this is the symbol
-// `loader::load_plugin` looks up. For in-process use (tests, the host linking
-// the example directly) `register` above is called directly instead.
+// ── cdylib entry point (for the standalone-plugin build) ─────────────────
+// When this file is the lib of its OWN crate (`crate-type = ["cdylib"]`), the
+// cdylib entry point looks like the function below. It is intentionally NOT
+// compiled here (this example builds all three plugins into one binary, where
+// a `#[no_mangle]` symbol would clash); see `docs/plugin-tutorial.md` for the
+// real standalone-crate setup.
 //
-// The `gasket_abi_version = 1` line in the matching `manifest.toml` must equal
-// `gasket_core::extension::loader::GASKET_ABI_VERSION` or the loader refuses to
-// load the plugin. See §5.1.1 of the refactor plan.
-
-#[cfg(feature = "cdylib_demo")]
-#[no_mangle]
-pub extern "C" fn register_cdylib(api: &mut dyn ExtensionApi) {
-    register(api);
-}
+//     #[no_mangle]
+//     pub extern "C" fn register(api: &mut dyn ExtensionApi) {
+//         register(api);
+//     }
+//
+// Note: `dyn ExtensionApi` across an FFI boundary is not strictly FFI-safe
+// (the loader suppresses that lint), and the plugin must be compiled with the
+// same toolchain as the host — see §5.1.1 of the refactor plan. The
+// `gasket_abi_version = 1` in the matching `manifest.toml` must equal
+// `gasket_core::extension::loader::GASKET_ABI_VERSION`.

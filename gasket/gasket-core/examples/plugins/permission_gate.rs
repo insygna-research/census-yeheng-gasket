@@ -34,7 +34,7 @@ impl BeforeToolCallHandler for DangerousCommandGate {
             return ToolCallVerdict::Block(format!(
                 "Refused: command matches a dangerous pattern ({}). \
                  Ask the user to confirm before retrying.",
-                BLOCKED_PATTERNS.iter().cloned().collect::<Vec<_>>().join(", ")
+                BLOCKED_PATTERNS.join(", ")
             ));
         }
         ToolCallVerdict::Allow
@@ -42,6 +42,10 @@ impl BeforeToolCallHandler for DangerousCommandGate {
 }
 
 /// Install the gate.
-pub fn register(api: &mut impl ExtensionApi) {
+pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
     api.register_before_tool_call(Box::new(DangerousCommandGate));
 }
+
+// cdylib entry point omitted here (this example builds 3 plugins into one
+// binary; a `#[no_mangle]` symbol would clash). See `plugins/hello.rs` for the
+// standalone-crate cdylib pattern.
