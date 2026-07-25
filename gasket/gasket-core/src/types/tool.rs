@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::error::ToolError;
-use crate::types::message::ContentBlock;
+use crate::types::message::{ContentBlock, ToolResultMessage};
 
 /// A tool registered with the agent. `parameters` is a JSON Schema; the host
 /// validates args before calling `execute`.
@@ -100,4 +100,24 @@ pub enum ToolCallVerdict {
     Block(String),
     /// Replace the args, then execute.
     Modify(serde_json::Value),
+}
+
+/// Object-safe hook chain the agent loop consults around each tool call.
+///
+/// Defined in `types` (not `extension`) so `AgentLoopConfig` can hold an
+/// `Option<Arc<dyn HookChain>>` without a circular dependency. The concrete
+/// implementation is `ExtensionApiImpl`; `None` means "no hooks installed"
+/// (the default — used by tests and the bare `agent_loop` helper).
+pub trait HookChain: Send + Sync {
+    /// Consult all `before_tool_call` handlers. First `Block` wins; otherwise
+    /// the last `Modify` wins; default `Allow`.
+    fn before_tool_call(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> ToolCallVerdict;
+
+    /// Consult all `after_tool_call` handlers, each may replace the result.
+    fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage;
 }

@@ -136,6 +136,32 @@ impl ExtensionApiImpl {
     pub fn drain_outbound(&mut self) -> Vec<AgentMessage> {
         std::mem::take(&mut self.outbound)
     }
+
+    /// Build a placeholder `ExtensionContext` for hook invocation. Real
+    /// session id/cwd are owned by the host's `AgentContext`; if a hook needs
+    /// them, wire them through here in a later iteration.
+    fn placeholder_ctx() -> ExtensionContext {
+        ExtensionContext {
+            session_id: String::new(),
+            cwd: PathBuf::new(),
+            signal: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl crate::types::tool::HookChain for ExtensionApiImpl {
+    fn before_tool_call(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> ToolCallVerdict {
+        ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args, &Self::placeholder_ctx())
+    }
+
+    fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {
+        ExtensionApiImpl::after_tool_call(self, tool_call_id, result, &Self::placeholder_ctx())
+    }
 }
 
 impl ExtensionApi for ExtensionApiImpl {

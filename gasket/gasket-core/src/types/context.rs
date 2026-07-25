@@ -37,6 +37,9 @@ pub struct AgentLoopConfig {
     /// The LLM call entry point. Injected by the host so the loop is
     /// provider-agnostic and testable with a mock.
     pub stream_fn: Arc<dyn StreamFn>,
+    /// Optional hook chain consulted around each tool call (block / modify /
+    /// redact). `None` = no hooks (default — used by tests and `agent_loop`).
+    pub hooks: Option<Arc<dyn crate::types::tool::HookChain>>,
 }
 
 impl std::fmt::Debug for AgentLoopConfig {

@@ -171,11 +171,16 @@ where
             break;
         }
 
-        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+        let mut args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
             .unwrap_or(serde_json::Value::Null);
 
-        // 1. before_tool_call hook (no-op stub until stage 3g).
-        match before_tool_call(&tc.id, &tc.function.name, &args) {
+        // 1. before_tool_call hook: consult the hook chain if installed.
+        //    Block → refuse; Modify → replace args; Allow → proceed.
+        let verdict = match &config.hooks {
+            Some(h) => h.before_tool_call(&tc.id, &tc.function.name, &args),
+            None => ToolCallVerdict::Allow,
+        };
+        match verdict {
             ToolCallVerdict::Block(reason) => {
                 let result = ToolResultMessage {
                     tool_call_id: tc.id.clone(),
@@ -192,9 +197,7 @@ where
                 results.push(result);
                 continue;
             }
-            ToolCallVerdict::Modify(new_args) => {
-                let _ = new_args; // applied below; kept simple in V0.1
-            }
+            ToolCallVerdict::Modify(new_args) => args = new_args,
             ToolCallVerdict::Allow => {}
         }
 
@@ -226,7 +229,7 @@ where
         .await
         .map_err(AgentError::from)?;
 
-        let result = ToolResultMessage {
+        let mut result = ToolResultMessage {
             tool_call_id: tc.id.clone(),
             tool_name: tc.function.name.clone(),
             content: raw.content,
@@ -234,8 +237,10 @@ where
             timestamp: crate::now(),
         };
 
-        // 4. after_tool_call hook (no-op stub until stage 3g).
-        let result = after_tool_call(&tc.id, &result).unwrap_or(result);
+        // 4. after_tool_call hook: chain may replace the result (redact, etc.).
+        if let Some(h) = &config.hooks {
+            result = h.after_tool_call(&tc.id, &result);
+        }
 
         emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: tc.id.clone(),
@@ -256,24 +261,6 @@ fn tool_state_dir(context: &AgentContext, tool_name: &str) -> std::path::PathBuf
         .join("tool_state")
         .join(&context.session_id)
         .join(tool_name)
-}
-
-// ── hook stubs (replaced by real handler chains in stage 3g) ──────────────
-
-fn before_tool_call(
-    _id: &str,
-    _name: &str,
-    _args: &serde_json::Value,
-) -> ToolCallVerdict {
-    ToolCallVerdict::Allow
-}
-
-fn after_tool_call(
-    _id: &str,
-    result: &ToolResultMessage,
-) -> Option<ToolResultMessage> {
-    let _ = result;
-    None
 }
 
 /// Stream one assistant response from the LLM, accumulating into an
@@ -375,6 +362,7 @@ mod tests {
     use crate::types::context::{ModelSpec, ProviderApi};
     use crate::ThinkingLevel;
     use crate::StreamFn;
+    use crate::ExtensionApi;
     use futures_util::stream;
     use std::sync::atomic::AtomicBool;
 
@@ -408,6 +396,7 @@ mod tests {
             api_key: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
+            hooks: None,
         }
     }
 
@@ -490,5 +479,160 @@ mod tests {
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "{\"x\":1}")))
         });
         assert!(has_tool_result, "expected echo tool result");
+    }
+
+    /// A `before_tool_call` handler that blocks the `bash` tool.
+    struct BlockBash;
+    impl crate::extension::BeforeToolCallHandler for BlockBash {
+        fn call(
+            &self,
+            _id: &str,
+            tool_name: &str,
+            _args: &serde_json::Value,
+            _ctx: &crate::ExtensionContext,
+        ) -> ToolCallVerdict {
+            if tool_name == "bash" {
+                ToolCallVerdict::Block("blocked by policy".into())
+            } else {
+                ToolCallVerdict::Allow
+            }
+        }
+    }
+
+    /// An `after_tool_call` handler that redacts text content.
+    struct Redactor;
+    impl crate::extension::AfterToolCallHandler for Redactor {
+        fn call(
+            &self,
+            _id: &str,
+            _result: &crate::ToolResultMessage,
+            _ctx: &crate::ExtensionContext,
+        ) -> Option<crate::ToolResultMessage> {
+            Some(crate::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "echo".into(),
+                content: vec![ContentBlock::text("[REDACTED]")],
+                is_error: false,
+                timestamp: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn before_hook_blocks_tool() {
+        // Register a BlockBash handler, then have the model call `bash`.
+        let mut api = crate::extension::ExtensionApiImpl::new();
+        api.register_before_tool_call(Box::new(BlockBash));
+
+        let echo = crate::ToolDefinition {
+            name: "bash".into(),
+            label: "Bash".into(),
+            description: "shell".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::ToolResult::text("ran")) })
+            }),
+        };
+        let config = AgentLoopConfig {
+            model: ModelSpec {
+                id: "test".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 1024,
+                supports_thinking: false,
+            },
+            thinking_level: ThinkingLevel::Off,
+            max_turns: 5,
+            max_tool_calls_per_turn: 5,
+            api_key: None,
+            signal: None,
+            stream_fn: std::sync::Arc::new(MockStream(vec![
+                StreamChunk::ToolCallDelta {
+                    id: "t1".into(),
+                    name: Some("bash".into()),
+                    args_delta: "{\"command\":\"rm -rf /\"}".into(),
+                },
+                StreamChunk::Done,
+            ])),
+            hooks: Some(std::sync::Arc::new(api)),
+        };
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s3".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+
+        // The tool was NOT executed — instead we got an error result with the
+        // block reason.
+        let blocked = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.tool_name == "bash" && tr.is_error
+                && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "blocked by policy")))
+        });
+        assert!(blocked, "expected bash to be blocked, not executed");
+    }
+
+    #[tokio::test]
+    async fn after_hook_redacts_result() {
+        let mut api = crate::extension::ExtensionApiImpl::new();
+        api.register_after_tool_call(Box::new(Redactor));
+
+        let echo = crate::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::ToolResult::text(c.args.to_string())) })
+            }),
+        };
+        let config = AgentLoopConfig {
+            model: ModelSpec {
+                id: "test".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 1024,
+                supports_thinking: false,
+            },
+            thinking_level: ThinkingLevel::Off,
+            max_turns: 5,
+            max_tool_calls_per_turn: 5,
+            api_key: None,
+            signal: None,
+            stream_fn: std::sync::Arc::new(MockStream(vec![
+                StreamChunk::ToolCallDelta {
+                    id: "t1".into(),
+                    name: Some("echo".into()),
+                    args_delta: "{\"secret\":1}".into(),
+                },
+                StreamChunk::Done,
+            ])),
+            hooks: Some(std::sync::Arc::new(api)),
+        };
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s4".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+
+        // Original secret output was replaced by [REDACTED].
+        let redacted = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "[REDACTED]")))
+        });
+        let leaked = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("secret"))))
+        });
+        assert!(redacted, "expected redacted result");
+        assert!(!leaked, "secret must not appear in output");
     }
 }

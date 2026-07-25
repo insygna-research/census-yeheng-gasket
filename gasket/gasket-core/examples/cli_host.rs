@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_key: None,
         signal: Some(Arc::new(AtomicBool::new(false))),
         stream_fn,
+        hooks: None,
     };
 
     let msgs = agent_loop(vec![user_msg], context, config).await?;
