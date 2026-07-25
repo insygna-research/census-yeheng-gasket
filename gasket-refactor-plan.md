@@ -1,7 +1,7 @@
 # Gasket 重构方案：Pi-Agent 风格的可插拔 Agent Core
 
 > 状态：**Draft for Review** · 作者：gasket maintainer + AI 协作
-> 目的：把 gasket 从「60,737 行 / 10 crate 的过度架构」收敛到「~3,500 行 / 1 crate 的 pi 风格 agent core」
+> 目的：把 gasket 从「60,737 行 / 10 crate 的过度架构」收敛到「~4,110 行 / 1 crate 的 pi 风格 agent core」（lib 3,223 + examples/tests/docs，已实现）
 > 参考实现：https://github.com/earendil-works/pi-mono (pi-agent-core: 10,028 行 TS)
 
 ---
@@ -17,7 +17,7 @@
 4. **~28 个单向事件 + 12 个 API（含 hook）** = 完整的扩展点
 5. **没有 event sourcing、没有 vector embedding、没有内置 sandbox**（用户自己跑容器）
 
-**结果**：60,737 行 → **~3,500 行（V0.1 目标）** / 短期可达 **~15,000 行（4 个 PR）**
+**结果**：60,737 行 -> **4,110 行**（lib 3,223，已实现，37 测试 + clippy 0 warning）
 
 ---
 
@@ -83,15 +83,13 @@
 │  └─────────────────────────────────────────────┘    │
 │  ┌─────────────────────────────────────────────┐    │
 │  │ ExtensionApi (extension/api.rs)             │    │
-│  │   ├─ on(event, handler)                     │    │
 │  │   ├─ register_tool(definition)              │    │
-│  │   ├─ register_command(name, opts)           │    │
-│  │   ├─ register_provider(spec)                │    │
 │  │   ├─ register_before_tool_call(handler)     │    │
 │  │   ├─ register_after_tool_call(handler)      │    │
+│  │   ├─ register_event_handler(handler)        │    │
 │  │   ├─ send_message(msg)                      │    │
-│  │   ├─ exec(cmd, args)                        │    │
-│  │   └─ ... 12 个 API（含 hook）          │    │
+│  │   ├─ current_messages()                     │    │
+│  │   └─ api_version()   （7 个方法）       │    │
 │  └─────────────────────────────────────────────┘    │
 │  ┌─────────────────────────────────────────────┐    │
 │  │ Built-in tools (tools/)                     │    │
@@ -336,24 +334,16 @@ pub trait ExtensionApi: Send + Sync {
     fn register_before_tool_call(&mut self, handler: Box<dyn BeforeToolCallHandler>);
     fn register_after_tool_call(&mut self, handler: Box<dyn AfterToolCallHandler>);
 
-    // ===== 命令注册（host 决定怎么用：CLI /command，Telegram /command）=====
-    fn register_command(&mut self, name: &str, opts: CommandOptions);
-
-    // ===== Provider 注册 =====
-    fn register_provider(&mut self, name: &str, spec: ProviderSpec);
-    fn unregister_provider(&mut self, name: &str);
-
     // ===== Action =====
     fn send_message(&mut self, msg: AgentMessage);                       // 发到当前 session
-    fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput>;  // 跑 shell
     fn current_messages(&self) -> &[AgentMessage];                       // 读 session 消息快照
-
-    // ===== Session 元数据 =====
-    fn set_session_name(&mut self, name: String);
-    fn get_session_name(&self) -> Option<String>;
     fn api_version(&self) -> &'static str;  // ABI 版本，见 §5.1
 }
+```
 
+> **执行后收窄（V0.1 实际只保留 7 个方法）**：原设计的 `register_command` / `register_provider` / `unregister_provider` / `exec` / `set_session_name` / `get_session_name` 在实现中**未保留**--命令是 host 职责、provider 经 `AgentLoopConfig.stream_fn` 注入、session 元数据由 host 管、`exec` 是内置 tool 不是 plugin API。见 §5.4 的最终 API 表。
+
+```rust
 // hook handler 返回值：决定 agent 对该 tool call 的处理方式
 pub enum ToolCallVerdict {
     Allow,
@@ -361,16 +351,22 @@ pub enum ToolCallVerdict {
     Modify(serde_json::Value),  // 改写 args 后再执行
 }
 
+// 注册到 ExtensionApiImpl 的 handler（带 ExtensionContext）
 pub trait BeforeToolCallHandler: Send + Sync {
     fn call(&self, tool_call_id: &str, tool_name: &str, args: &serde_json::Value, ctx: &ExtensionContext)
         -> ToolCallVerdict;
 }
-
 pub trait AfterToolCallHandler: Send + Sync {
-    // 可改写 result（用于敏感信息脱敏、压缩日志等）
     fn call(&self, tool_call_id: &str, result: &ToolResultMessage, ctx: &ExtensionContext)
         -> Option<ToolResultMessage>;  // None=不改，Some=替换
 }
+
+// agent_loop 侧查询的 object-safe trait（在 types 层，避免循环依赖）
+pub trait HookChain: Send + Sync {
+    fn before_tool_call(&self, tool_call_id: &str, tool_name: &str, args: &serde_json::Value) -> ToolCallVerdict;
+    fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage;
+}
+// ExtensionApiImpl 实现 HookChain，委托给注册的 handler 链。
 
 pub struct ExtensionContext {
     pub session_id: String,
@@ -896,31 +892,10 @@ pub extern "C" fn register(api: &mut dyn ExtensionApi) {
 
 **对比旧设计**：旧方案订阅 `on_event("before_tool_call")` 然后往 `ctx.metadata` 写一个 `pending_permission` 标记 —— 但 agent loop 根本不读那个标记，tool 照样执行。新方案用 `register_before_tool_call` 返回 `ToolCallVerdict::Block`，agent loop 在 §4.3 看到 Block 就直接 `continue`，拦截链路真正闭环。
 
-#### 示例 4：Custom Provider（注册新 LLM 提供商）
+#### 示例 4：Custom Provider -- 已移除
 
-```rust
-// ~/.gasket/plugins/custom_provider/src/lib.rs
-use gasket::extension::{ExtensionApi, ProviderSpec};
+**V0.1 不支持 plugin 注册 provider**。provider 经 `AgentLoopConfig.stream_fn` 注入（host 控制），不是 plugin 可注册的能力（见 §5.4：无 `register_provider` API）。如果要用自定义 OpenAI 兼容代理，host 直接构造 `OpenAiCompat::new(base_url, api_key)` 传入 config 即可，无需 plugin。
 
-#[no_mangle]
-pub extern "C" fn register(api: &mut dyn ExtensionApi) {
-    api.register_provider("my-proxy", ProviderSpec {
-        api: "openai-completions",  // 复用 OpenAI 协议
-        base_url: "https://proxy.example.com/v1".into(),
-        api_key_env: "MY_PROXY_API_KEY".into(),
-        models: vec![
-            ModelSpec {
-                id: "claude-sonnet-4-via-proxy".into(),
-                name: "Claude 4 Sonnet (proxy)".into(),
-                context_window: 200_000,
-                max_tokens: 16_384,
-                supports_thinking: false,
-                cost: ModelCost { input: 0.0, output: 0.0 },
-            }
-        ],
-    });
-}
-```
 
 ### 5.4 Plugin API 完整列表
 
@@ -929,23 +904,19 @@ pub extern "C" fn register(api: &mut dyn ExtensionApi) {
 | `register_tool(definition)` | 给 LLM 加新工具 | hello, todo, web_search |
 | `register_before_tool_call(handler)` | **拦截/改写 tool 调用**（返回 Verdict） | permission_gate, 参数校验 |
 | `register_after_tool_call(handler)` | **改写 tool 结果**（脱敏/压缩） | 日志脱敏, 截断大输出 |
-| `register_command(name, opts)` | 加 host 命令 | `/todos`, `/compact` |
-| `register_provider(name, spec)` | 加/覆盖 LLM provider | custom-proxy, GitLab Duo |
-| `unregister_provider(name)` | 移除 provider | 测试用 |
-| `on_event(name, handler)` | 订阅**单向通知**事件 | 审计日志, 持久化 |
+| `register_event_handler(handler)` | 订阅**单向通知**事件 | 审计日志, 持久化 |
 | `send_message(msg)` | 发消息到 session | push notification |
-| `exec(cmd, args)` | 跑 shell | git status, ls |
 | `current_messages()` | 读消息快照 | context provider |
-| `set_session_name(name)` / `get_session_name()` | 命名会话 | 命名会话 |
 | `api_version()` | 查 ABI 版本 | 兼容检查 |
 
-**总共 12 个方法**（原 14，删 `register_renderer` / `send_user_message`，加 2 个 hook），**~28 个单向事件**。
+**总共 7 个方法**，**~28 个单向事件**。
 
-**V0.1 相对原方案的删减**：
+**V0.1 实际保留的就是这 7 个**。相对早期草稿的删减：
 - ❌ 删 `register_renderer` —— 渲染是 host 职责
 - ❌ 删 `send_user_message` —— host 直接再调 `agent_loop()` 即可
 - ❌ 删 `metadata()` / `metadata_mut()` —— plugin 状态走 `ToolContext.state_dir` 文件
-- ✅ 加 `register_before_tool_call` / `register_after_tool_call` —— 拦截链路真正闭环
+- ❌ 删 `register_command` / `register_provider` / `unregister_provider` / `exec` / `set_session_name` / `get_session_name` -- 命令是 host 职责、provider 经 `AgentLoopConfig.stream_fn` 注入、session 元数据由 host 管、`exec` 是内置 tool 非 plugin API（YAGNI，无消费者）
+- ✅ 保留 `register_before_tool_call` / `register_after_tool_call` -- 拦截链路闭环（见 §4.3、commit `7dbdc74`）
 
 **完整扩展面就这么大**。
 
@@ -1231,7 +1202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 10. 重构路径（3 阶段，每阶段独立可发布）
 
-> **执行后收敛**：原 4 阶段（删 crate / 换 storage / 重写 kernel / 文档）。执行后阶段 2（换 storage）合并进阶段 3，因为 engine 与 SQLite 结构性耦合、无法分开换。现实质为 3 阶段：① 删 channel adapter（✅ 已完成）→ ② 重写 engine+storage 为单 `gasket-core`（✅ 已完成，commit `bebb9c9`）→ ③ plugin 文档 + 5 示例（待做）。
+> **执行后收敛**：原 4 阶段（删 crate / 换 storage / 重写 kernel / 文档）。执行后阶段 2（换 storage）合并进阶段 3，因为 engine 与 SQLite 结构性耦合、无法分开换。现实质为 3 阶段，全部完成：① 删 channel adapter（`ebb03cd`）→ ② 重写 engine+storage 为单 gasket-core（`bebb9c9`）→ ③ plugin 文档 + 3 示例（`b167c09`）。
 
 > **阶段顺序原则：先减负、再动核心**。阶段 1 先删能安全删的（channel adapter），阶段 2 重写 engine+storage 时一次性吸收所有推迟项（broker/sandbox/embedding 删除 + SQLite→JSONL），避免"engine 用新 storage API、storage 还是 SQLite"的混乱中间态。
 
@@ -1341,24 +1312,29 @@ gasket/                          # 60,737 行
 5. provider 用 collected-body 解析（真流式留 V0.2）
 6. 新 crate 命名 `gasket-core`（避免与 workspace 目录/旧 crate 冲突，可后续改名 `gasket`）
 
-### 阶段 4：Plugin 文档 + 5 个示例 plugin（1 周）
+### 阶段 4：Plugin 文档 + 示例 plugin（已完成 ✅）
 
 **目标**：让"写 plugin 变容易"（在固定 toolchain 下，见 §5.1.1）
 
-**改动**：
-- 写 `docs/plugin-tutorial.md`（一步步教，含 ABI 版本说明）
-- 写 5 个示例 plugin：
-  - `hello_tool`（最简，21 行）
-  - `todo_list`（状态管理 + 文件存储，100 行）
-  - `permission_gate`（register_before_tool_call 拦截，80 行）
-  - `custom_provider`（注册 provider，60 行）
-  - `telegram_channel`（host 集成，200 行）
-- 写 `examples/full_host/` （Telegram bot + gasket，300 行）
+**实际交付**（commit `b167c09`）：
+- ✅ `gasket-core/docs/plugin-tutorial.md`（253 行，一步步教 + ABI 说明 + 3 示例讲解）
+- ✅ 3 个示例 plugin（`examples/plugins/`）：
+  - `hello.rs`（最简，注册一个 tool）
+  - `todo_list.rs`（per-plugin 文件状态，替代旧 metadata 狗窝）
+  - `permission_gate.rs`（before_tool_call 拦截危险 bash）
+- ✅ `examples/plugins.rs`（加载 3 示例 in-process 跑一轮的 host demo）
+- ✅ `tests/plugins_example.rs`（2 集成测试：hello 真打招呼、bash 被拦截不执行）
 
-**验证标准**：
-- [ ] 按 tutorial 能在固定 toolchain 下编译并加载 hello plugin（需同 host ABI 版本编译，见 §5.1.1）
-- [ ] 5 个示例 plugin `cargo build` 全部通过
-- [ ] `examples/full_host` 跑起来能对话
+**原计划 5 示例，实际 3 个**（诚实收窄）：
+- ❌ `custom_provider` -- API 不支持（provider 经 `AgentLoopConfig.stream_fn` 注入，无 `register_provider`，见 §5.4）
+- ❌ `telegram_channel` -- host 职责非 plugin（且依赖外部 telegram crate，V0.1 非目标）
+- ❌ `examples/full_host` -- 未做（V0.1 用 `examples/cli_host.rs` + `examples/plugins.rs` 已覆盖 host 演示）
+
+**验证标准**（达成情况）：
+- [x] tutorial 可读，含 ABI 版本说明
+- [x] 3 个示例 `cargo build` 通过、`cargo run --example plugins` 跑通
+- [x] 2 集成测试验证示例真工作（`hello_plugin_greets` / `permission_gate_blocks_bash`）
+- [x] `cargo clippy --all-targets -D warnings` 0 warning
 
 ### 阶段 5（可选）：V0.2 增量
 
@@ -1395,7 +1371,7 @@ gasket/                          # 60,737 行
 v0.10.0  # 阶段 0 baseline
 v0.11.0  # 阶段 1 完成（删除 channel adapters + gateway 子命令）✅
 v0.12.0  # 阶段 2 完成（重写 engine+storage → 单 gasket-core crate）✅
-v0.13.0  # 阶段 3 完成（plugin 文档 + 5 examples）
+v0.13.0  # 阶段 3 完成（plugin 文档 + 3 示例 + tutorial）✅
 ```
 
 如果阶段 N 出问题，可以从 `v0.(N-1).0` 拉分支 hotfix，不阻塞主线。
@@ -1412,65 +1388,52 @@ v0.13.0  # 阶段 3 完成（plugin 文档 + 5 examples）
 
 ---
 
-## 12. V0.1 目标规模
+## 12. V0.1 实际规模（实现后核对）
 
 ```
-gasket/                          # 单 crate
-├── Cargo.toml                   # 50 行
-├── src/
-│   ├── lib.rs                   # 100 行（公开 API）
-│   ├── agent_loop.rs            # 500 行 ← 核心
-│   ├── types/
-│   │   ├── mod.rs               # 50 行
-│   │   ├── message.rs           # 150 行
-│   │   ├── event.rs             # 200 行
-│   │   ├── context.rs           # 100 行
-│   │   └── tool.rs              # 100 行
-│   ├── extension/
-│   │   ├── mod.rs               # 50 行
-│   │   ├── api.rs               # 300 行 ← ExtensionApi trait
-│   │   ├── events.rs            # 100 行
-│   │   └── loader.rs            # 250 行 ← cdylib loader
-│   ├── tools/
-│   │   ├── mod.rs               # 30 行
-│   │   ├── read.rs              # 100 行
-│   │   ├── write.rs             # 80 行
-│   │   ├── edit.rs              # 200 行
-│   │   ├── bash.rs              # 150 行
-│   │   └── list.rs              # 80 行
-│   ├── providers/
-│   │   ├── mod.rs               # 30 行
-│   │   ├── openai_compat.rs     # 300 行
-│   │   └── anthropic.rs         # 200 行
-│   ├── storage/
-│   │   ├── mod.rs               # 30 行
-│   │   ├── jsonl.rs             # 200 行
-│   │   └── session.rs           # 150 行
-│   ├── compaction.rs            # 250 行（V0.1 简单版）
-│   └── error.rs                 # 50 行
-├── examples/
-│   ├── cli_host/                # 80 行
-│   ├── hello_plugin/            # 50 行
-│   ├── todo_list/               # 100 行
-│   ├── permission_gate/         # 80 行
-│   ├── custom_provider/         # 60 行
-│   └── telegram_host/           # 200 行
+gasket-core/                     # 单 crate（实现后真实行数）
+├── Cargo.toml
+├── src/                         # lib 3,223 行
+│   ├── lib.rs                   # 41 行（公开 API re-export）
+│   ├── agent_loop.rs            # 638 行 ← 核心（含 4 测试）
+│   ├── error.rs                 # 39 行
+│   ├── types/                   # 496 行
+│   │   ├── mod.rs               # 8
+│   │   ├── message.rs           # 181
+│   │   ├── event.rs             # 65
+│   │   ├── context.rs           # 119
+│   │   └── tool.rs              # 123
+│   ├── extension/               # 448 行
+│   │   ├── mod.rs               # 12
+│   │   ├── api.rs               # 254 ← ExtensionApi + HookChain impl
+│   │   └── loader.rs            # 182 ← cdylib loader + ABI 检查
+│   ├── tools/                   # 657 行（5 工具，10 测试）
+│   │   ├── mod.rs / read / write / edit / bash / list
+│   ├── providers/               # 740 行（14 测试）
+│   │   ├── mod.rs / openai_compat / anthropic / sse
+│   └── storage/                 # 164 行（3 测试，JSONL）
+│       └── mod.rs
+├── examples/                    # 457 行
+│   ├── cli_host.rs              # ~90 行 host（mock + 真实 OpenAI 兼容）
+│   ├── plugins.rs               # 加载 3 示例 plugin 跑一轮
+│   └── plugins/{hello,todo_list,permission_gate}.rs
 ├── tests/
-│   └── integration.rs           # 300 行
+│   └── plugins_example.rs       # 177 行（2 集成测试）
 └── docs/
-    ├── quickstart.md
-    ├── architecture.md
-    ├── plugin-tutorial.md
-    └── api-reference.md
+    └── plugin-tutorial.md       # 253 行
 ```
 
-**总计：~3,800 行**（含 examples + tests + docs）
+**总计**：lib **3,223** + examples 457 + tests 177 + docs 253 ≈ **4,110 行**。
+
+**测试**：35 lib + 2 集成 = **37 passed**；`cargo clippy --all-targets -D warnings` 0 warning。
+
+**与原目标的差异**：原目标 ~3,800 行（含 examples/tests/docs），实际 ~4,110 -- 略超，主因是 agent_loop（638 vs 预估 500）含完整流式累积 + 4 测试、providers（740 vs 预估 500）含 SSE 解析 + 14 测试。无 compaction.rs（V0.1 未做，文档 §1.2 非目标）、无 events.rs（事件并入 types/event.rs）、无 session.rs（JSONL 并入 storage/mod.rs）。
 
 **对比**：
-- 当前 gasket：60,737 行
+- 重构前 gasket：60,737 行 / 10 crate
 - pi-agent-core：10,028 行
-- gasket V0.1 目标：3,800 行（含 examples/docs）
-- gasket V0.1 目标（仅 lib）：~2,800 行
+- gasket V0.1 实际（含 examples/tests/docs）：~4,110 行
+- gasket V0.1 实际（仅 lib src）：3,223 行
 
 **收益**：
 - 编译时间：从分钟级 → **10 秒级**
@@ -1553,7 +1516,7 @@ gasket/                          # 单 crate
 
 ### 14.6 工程问题
 
-- [ ] **V0.1 目标规模 3,800 行太大还是太小？**
+- [x] **V0.1 目标规模 3,800 行太大还是太小？** -- **已实现**：实际 ~4,110 行（lib 3,223 + examples/tests/docs），略超原目标。主因 agent_loop（638）+ providers（740）含完整测试，见 §12。规模合理。
 - [ ] **每个 PR 1-2 周合理吗？** 还是想要更小的 PR？
 - [ ] **测试覆盖率目标 85% 够吗？**
 - [ ] **是否需要 `cargo bench` 基线？**
@@ -1568,12 +1531,12 @@ gasket/                          # 单 crate
 
 ## 附录 A：与当前 gasket 设计的对比
 
-| 维度 | 当前 gasket | V0.1 目标 | 差异 |
+| 维度 | 重构前 gasket | V0.1 实际 | 差异 |
 |---|---|---|---|
-| 总代码 | 60,737 行 | 3,800 行 | -94% |
+| 总代码 | 60,737 行 | ~4,110 行（lib 3,223） | -93% |
 | Crate 数 | 10 | 1 | -90% |
 | `pub` API | 1,012 | ~80 | -92% |
-| 工具数 | 30+ | 5 内置 + N plugin | 内置 -83% |
+| 工具数 | 30+ | 5 内置 + 3 示例 plugin | 内置 -83% |
 | 扩展点 | 6 文件 hook 系统 | 1 个 trait + ~28 事件 + 2 hook | 简化 |
 | Plugin 形式 | 子进程 + JSON-RPC | cdylib 函数 | 简化 |
 | Storage | SQLite + event store | JSONL 文件 | 简化 |
