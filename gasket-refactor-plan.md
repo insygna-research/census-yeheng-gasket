@@ -1133,6 +1133,31 @@ pub struct AnthropicProvider {
 - ❌ 不做 token 计数（plugin 可以监听 `after_provider_response` 自己算）
 - ❌ 不做 cost 计算（plugin 可以监听 `after_provider_response` 自己算）
 
+### 8.4 为何 V0.1 不用 rig-core（决策记录）
+
+[rig-core](https://github.com/0xPlaygrounds/rig) 是成熟库：20+ provider 统一抽象、type-safe tool、structured output。讨论过「LLM 层是否该用 rig-core 替代自写的 740 行」，**结论：V0.1 不用，但保持隔离，触发条件满足时重评。**
+
+**不用的理由（按重要性排序）**：
+
+1. **范围错配（YAGNI）**：rig 解决"20+ provider 统一适配"，而 §8 明确 V0.1 只要 2 provider（openai_compat 覆盖 80% + anthropic）。在 V0.1 范围内，"多 provider 成本"是想象的问题，不是当前问题。为未来需求引入重依赖违反 YAGNI。
+
+2. **架构价值错位**：gasket 的核心差异化是 pi 风格的 `EventStream` + hook + cdylib plugin（见 §2-§5），**不在** provider 适配。rig 的核心价值是它**自己的** agent 框架。我们不需要它的 agent 层，只用其 provider 层 → 要在 rig 的 `CompletionModel` 与我们的 `StreamFn` 之间写适配层，复杂度没减反增。
+
+3. **`StreamChunk` 耦合风险**：`StreamChunk`（TextDelta/ToolCallDelta/ThinkingDelta/Usage/Done/Error）是**为 `agent_loop` 的累积逻辑定制**的——`append_tool_call` 依赖 ToolCallDelta 的 id/name/args_delta 三元组语义。rig 的 completion stream 模型不保证这种语义对齐，换入需逐一验证。
+
+4. **可测试性下降**：当前 provider 层有 14 个纯单测（SSE + chunk 解析，不依赖网络）。rig 的 provider 是黑盒，测试要么 mock rig（更难）要么打真实 HTTP。
+
+**现在换代价最低（Layer 4 时间窗口）**：gasket-core 刚提交、无外部用户、`agent_loop` 对 `StreamChunk` 的依赖还浅。**这正是必须现在做决策的原因**——等 hook 接线、真实 LLM 验证、多 provider 需求出现后，换的代价指数上升。
+
+**已做的隔离（保证未来可控）**：`StreamFn` trait 是 agent_loop 与 provider 的**唯一边界**。未来若用 rig，只需写一个 `RigProvider: impl StreamFn`，`agent_loop` 一行不动。
+
+**触发重新评估的条件**（满足任一即重评）：
+- 第 3 个 provider（Gemini / Cohere / Ollama / vLLM 原生）成为**真实**需求（非推测）
+- 自写 provider 层的维护负担开始挤占 agent_loop/tool/extension 的开发时间
+- rig-core 的 streaming API 与 `StreamChunk` 语义能干净对齐（消除适配复杂度）
+
+**反模式警告**：不要因为"成熟项目都用 rig"就引入。专业是按真实需求选型，不是堆砌知名库。这条决策与 §13「不做什么」精神一致。
+
 ---
 
 ## 9. Host 示例（让用户立刻能用起来）
@@ -1206,7 +1231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 10. 重构路径（3 阶段，每阶段独立可发布）
 
-> **执行后收敛**：原 4 阶段（删 crate / 换 storage / 重写 kernel / 文档）。执行后阶段 2（换 storage）合并进阶段 3，因为 engine 与 SQLite 结构性耦合、无法分开换。现实质为 3 阶段：① 删 channel adapter（已完成）→ ② 重写 engine+storage（合并）→ ③ plugin 文档。
+> **执行后收敛**：原 4 阶段（删 crate / 换 storage / 重写 kernel / 文档）。执行后阶段 2（换 storage）合并进阶段 3，因为 engine 与 SQLite 结构性耦合、无法分开换。现实质为 3 阶段：① 删 channel adapter（✅ 已完成）→ ② 重写 engine+storage 为单 `gasket-core`（✅ 已完成，commit `bebb9c9`）→ ③ plugin 文档 + 5 示例（待做）。
 
 > **阶段顺序原则：先减负、再动核心**。阶段 1 先删能安全删的（channel adapter），阶段 2 重写 engine+storage 时一次性吸收所有推迟项（broker/sandbox/embedding 删除 + SQLite→JSONL），避免"engine 用新 storage API、storage 还是 SQLite"的混乱中间态。
 
@@ -1274,49 +1299,47 @@ gasket/                          # 60,737 行
 
 > **认知修正**：阶段 2"窄切 storage 边角"在事实上找不到边角。SQLite→JSONL 的转换必须在 engine 重写时完成，因为 engine 直接穿透 storage 抽象写 SQL。强行分两阶段会制造"engine 用新 storage API、storage 还是 SQLite"的混乱中间态。**阶段 2 与阶段 3 合并**，storage 的 SQLite→JSONL 翻转随 engine 重写一并完成。
 
-### 阶段 3：重写 kernel + storage（原阶段 2+3 合并，2-3 周）
+### 阶段 3：重写 engine+storage → 单 `gasket-core` crate（已完成 ✅）
 
-**目标**：交付 `agent_loop()` + `ExtensionApi`（含 hook）+ 5 个内置 tool + **JSONL storage**。这是整个重构的核心阶段，engine 与 storage 一起重写，因为两者结构性耦合。
+**目标**：交付 `agent_loop()` + `ExtensionApi`（含 hook）+ 5 个内置 tool + **JSONL storage**。
 
-**改动 — engine/kernel**：
-| 改动 | 操作 | 风险 |
+**实际执行方式：推倒重建（非渐进改 engine）**。因为 engine 与 SQLite 结构性耦合、且无外部用户（crates.io 未发布），从零写新 `gasket-core` crate 比在旧 engine 上做手术风险更低。开发期间新 crate 与旧 engine 并存、`cargo build` 始终绿，直到新 core 能跑通才一次性删旧。
+
+**实现（文档 §3-§9 全部落地）**：
+| 模块 | 内容 | 行数 |
 |---|---|---|
-| `engine/src/kernel/{executor,kernel_executor,steppable_executor,tool_executor,request_handler,synthesis}.rs` | 合并为 1 个 `agent_loop.rs` | 低（5 文件做 1 文件的事） |
-| `engine/src/kernel/` 整个目录 | 重命名为 `src/agent_loop.rs` | 中（公开 API 改名） |
-| `engine/src/hooks/{external,vault,wiki_lint,registry,types,mod}.rs` | 替换为 `src/extension/{api,loader,events}.rs` ~400 行 | 中 |
-| `engine/src/external_tools/` 整个模块 | 替换为 `src/extension/loader.rs` ~250 行（cdylib + GASKET_ABI_VERSION） | 中（破坏内部 plugin 协议，无外部用户） |
-| `engine/src/tools/` 30+ 工具 | 缩减到 5 个内置工具 | 低（无外部用户） |
-| `engine/src/session/compactor/mod.rs`（927 行 SQL） | 重写为基于 JSONL 的 token 截断（或 V0.1 简化为固定窗口） | 高（session 核心逻辑） |
+| `types/` | `AgentMessage`(4变体) / `ContentBlock` / `AgentEvent`(~15单向变体) / `AgentContext`(无 metadata) / `AgentLoopConfig` + `StreamFn` / `ToolDefinition`(无 on_update) / `ToolCallVerdict` | ~400 |
+| `agent_loop.rs` | 单外层循环 + before/after tool-call hook 链 + 流式累积。`emit` 是 `FnMut`（host 累积状态） | ~400 |
+| `storage/` | append-only JSONL（无 SQLite/sqlx）：`append_message`/`load_messages` | ~170 |
+| `providers/` | `openai_compat` + `anthropicic` + 共享 SSE 解析（collected-body 解析，真流式留 V0.2）。共 740 行 | ~740 |
+| `tools/` | read/write/edit/bash/list，全单测 | ~600 |
+| `extension/` | `ExtensionApiImpl`（tool + before/after hook 链 + event handlers）+ cdylib loader + `GASKET_ABI_VERSION` 检查 | ~370 |
+| `examples/cli_host.rs` | ~90 行 host，mock 或真实 OpenAI 兼容 | ~90 |
 
-**改动 — 删除非核心 crate**（原阶段 1/2 推迟项）：
-| 改动 | 操作 | 风险 |
-|---|---|---|
-| **`embedding/` 整个 crate** | 删除（engine 24 处引用随重写消除） | 中 |
-| **`broker/` 整个 crate** | 删除（engine/cli 9 处引用随重写消除） | 中 |
-| **`sandbox/` 整个 crate** | 删除（engine/cli 13 处引用随重写消除） | 中 |
-| **`command/` 核心类型 + `channels/` 核心类型** | 内化到 gasket crate（如 `SessionKey`→`session_id: String`），删 crate | 中 |
-| `engine/src/cron/` / `subagents/` / `wiki/` / `heartbeat/` | 移到 examples/ 或删除 | 低 |
+**结果**：
+- gasket-core **3,027 行**（lib），workspace 单 crate
+- **33 tests passed**，`cargo clippy --all-targets -D warnings` 0 warning
+- cli_host mock 模式端到端跑通
+- 无 `sqlx` / SQLite 依赖
 
-**改动 — storage SQLite→JSONL**（原阶段 2）：
-| 改动 | 操作 | 风险 |
-|---|---|---|
-| `storage/src/event_store.rs`（1,255 行） | 删除，session 消息改用 append-only JSONL | 高（engine 16 文件引用） |
-| `storage/src/session_store.rs` | 重写为 `storage/src/jsonl.rs` ~200 行 | 中 |
-| `storage/src/{processor,query,kv_store,maintenance_store,cron_store}.rs` | 删除（功能随 engine 工具缩减而消失） | 中 |
-| `storage/src/migrations/` | 删除（JSONL 无 schema） | 低 |
-| `storage/src/wiki/`（2,584 行） | 删除（wiki 改 ripgrep 文件搜索） | 中 |
-| `storage` 对 `sqlx` 的依赖 | 移除 | 低 |
+**删除（commit `bebb9c9`）**：types/storage/embedding/broker/engine/cli/providers/channels/sandbox/command 共 8 crate + benches，~57k 行。`web/src-tauri` 经核查与旧 crate 解耦，未受影响。
 
-**结果**：engine 从 29,467 行 → ~5,000 行；storage 从 5,156 行 → ~500 行；从 10 crate → 1 crate（gasket）
+**验证标准**（达成情况）：
+- [x] `examples/cli_host` 跑通（mock 模式）
+- [x] 5 个内置工具单元测试通过
+- [x] 无 `sqlx` 依赖
+- [x] `cargo clippy -D warnings` 干净
+- [ ] **真实 LLM 端到端对话**（mock 已验证 plumbing，待 API key）
+- [ ] **plugin hook 接线**（agent_loop 的 before/after 当前是 stub，接 `ExtensionApiImpl` 真实链待 plugin 运行时完善）
+- [ ] permission_gate 示例真正 Block（依赖上一条）
 
-**验证标准**：
-- [ ] `examples/cli_host` 能跑 hello 对话
-- [ ] 5 个内置工具单元测试通过
-- [ ] `agent_loop()` 公开 API 文档完整
-- [ ] `ExtensionApi` 完整 trait 文档（含 hook handler）
-- [ ] permission_gate 示例能真正 Block 危险命令（验证 hook 闭环）
-- [ ] session 消息 JSONL append/load < 10ms（10,000 条内）
-- [ ] 无 `sqlx` 依赖（`cargo tree` 确认）
+**执行中对文档设计的务实修正**：
+1. `ToolFn` 用 `ToolCallCtx` 结构体（替代文档的 5 独立参数，更清晰）
+2. `emit` 用 `FnMut`（非文档的 `Fn`，host 需累积状态）
+3. `run_agent_loop` 是 async fn + emit 回调（非文档的 `EventStream` 类型，Rust 无内置 async generator）
+4. `ContentBlock` newtype 改 struct variant（serde tagged enum 限制）
+5. provider 用 collected-body 解析（真流式留 V0.2）
+6. 新 crate 命名 `gasket-core`（避免与 workspace 目录/旧 crate 冲突，可后续改名 `gasket`）
 
 ### 阶段 4：Plugin 文档 + 5 个示例 plugin（1 周）
 
@@ -1371,7 +1394,7 @@ gasket/                          # 60,737 行
 ```
 v0.10.0  # 阶段 0 baseline
 v0.11.0  # 阶段 1 完成（删除 channel adapters + gateway 子命令）✅
-v0.12.0  # 阶段 2 完成（重写 engine + storage SQLite→JSONL + 删 broker/sandbox/embedding）
+v0.12.0  # 阶段 2 完成（重写 engine+storage → 单 gasket-core crate）✅
 v0.13.0  # 阶段 3 完成（plugin 文档 + 5 examples）
 ```
 
