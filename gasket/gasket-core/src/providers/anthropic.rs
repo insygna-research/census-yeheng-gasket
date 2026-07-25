@@ -80,6 +80,8 @@ impl StreamFn for AnthropicProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
 
+        tracing::debug!(url = %url, model = %model.id, "anthropic request");
+
         Box::pin(async_stream::stream! {
             let resp = match client
                 .post(&url)
@@ -91,6 +93,7 @@ impl StreamFn for AnthropicProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(error = %e, "anthropic request failed");
                     yield StreamChunk::Error(e.to_string());
                     return;
                 }
@@ -99,6 +102,7 @@ impl StreamFn for AnthropicProvider {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
+                tracing::warn!(status = %status, "anthropic non-2xx response");
                 yield StreamChunk::Error(format!("HTTP {status}: {text}"));
                 return;
             }
@@ -135,10 +139,7 @@ fn build_request_body(
     system_prompt: &str,
     tools: &[ToolDefinition],
 ) -> serde_json::Value {
-    let msgs: Vec<_> = messages
-        .iter()
-        .filter_map(convert_message)
-        .collect();
+    let msgs: Vec<_> = messages.iter().filter_map(convert_message).collect();
 
     let mut body = json!({
         "model": model.id,
@@ -179,9 +180,7 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } => {
-                        Some(json!({"type": "text", "text": text}))
-                    }
+                    ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
                     ContentBlock::ToolCall { tool_call: tc } => Some(json!({
                         "type": "tool_use",
                         "id": tc.id,
@@ -330,7 +329,13 @@ mod tests {
     fn parses_message_start_usage() {
         let json = r#"{"type":"message_start","message":{"usage":{"input_tokens":42}}}"#;
         let chunks = parse_anthropic_chunk(json);
-        assert_eq!(chunks, vec![StreamChunk::Usage { input: 42, output: 0 }]);
+        assert_eq!(
+            chunks,
+            vec![StreamChunk::Usage {
+                input: 42,
+                output: 0
+            }]
+        );
     }
 
     #[test]

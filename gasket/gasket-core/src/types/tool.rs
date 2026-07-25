@@ -37,9 +37,7 @@ impl std::fmt::Debug for ToolDefinition {
 /// No `on_update` callback (V0.1 omits streaming tool progress — no consumer
 /// exists among the 5 built-in tools).
 pub type ToolFn = Arc<
-    dyn Fn(
-            ToolCallCtx,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send>>
+    dyn Fn(ToolCallCtx) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send>>
         + Send
         + Sync,
 >;

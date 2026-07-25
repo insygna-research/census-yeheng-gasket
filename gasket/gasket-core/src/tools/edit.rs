@@ -9,8 +9,7 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "edit".into(),
         label: "Edit".into(),
-        description: "Replace old_text with new_text in a file. old_text must be unique."
-            .into(),
+        description: "Replace old_text with new_text in a file. old_text must be unique.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -40,10 +39,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
 
     let count = original.matches(old_text).count();
     if count == 0 {
-        return Ok(ToolResult::error(format!(
-            "old_text not found in {}",
-            path
-        )));
+        return Ok(ToolResult::error(format!("old_text not found in {}", path)));
     }
     if count > 1 {
         return Ok(ToolResult::error(format!(

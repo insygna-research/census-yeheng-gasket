@@ -15,14 +15,17 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use gasket_core::{
-    agent_loop, AgentContext, AgentMessage, ContentBlock, OpenAiCompat,
-    ProviderApi, StreamChunk, StreamFn, ThinkingLevel, UserMessage,
-};
 use futures_util::Stream;
+use gasket_core::{
+    agent_loop, AgentContext, AgentMessage, ContentBlock, OpenAiCompat, ProviderApi, StreamChunk,
+    StreamFn, ThinkingLevel, UserMessage,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "Hello!".into());
 
     let cwd = std::env::current_dir()?;

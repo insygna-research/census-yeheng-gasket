@@ -25,8 +25,12 @@ pub enum AgentEvent {
 
     // ── messages ──
     MessageStart,
-    MessageUpdate { delta: ContentDelta },
-    MessageEnd { message: AssistantMessage },
+    MessageUpdate {
+        delta: ContentDelta,
+    },
+    MessageEnd {
+        message: AssistantMessage,
+    },
 
     // ── tool execution (notification only — interception is via hooks) ──
     ToolExecutionStart {
@@ -41,15 +45,27 @@ pub enum AgentEvent {
     },
 
     // ── LLM calls ──
-    BeforeProviderRequest { model: String },
-    AfterProviderResponse { model: String, response: AssistantMessage },
+    BeforeProviderRequest {
+        model: String,
+    },
+    AfterProviderResponse {
+        model: String,
+        response: AssistantMessage,
+    },
 
     // ── session ──
-    SessionStart { session_id: String, cwd: PathBuf },
-    SessionEnd { session_id: String },
+    SessionStart {
+        session_id: String,
+        cwd: PathBuf,
+    },
+    SessionEnd {
+        session_id: String,
+    },
 
     // ── errors ──
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// A streamed delta. Emitted alongside `MessageUpdate`.

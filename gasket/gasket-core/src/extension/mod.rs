@@ -6,7 +6,7 @@ pub mod api;
 pub mod loader;
 
 pub use api::{
-    AfterToolCallHandler, BeforeToolCallHandler, ExtensionApi, ExtensionApiImpl, ExtensionContext,
-    EventHandler,
+    AfterToolCallHandler, BeforeToolCallHandler, EventHandler, ExtensionApi, ExtensionApiImpl,
+    ExtensionContext,
 };
 pub use loader::{discover_plugins, load_plugin, Plugin, PluginManifest};

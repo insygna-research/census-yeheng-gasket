@@ -9,8 +9,7 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "write".into(),
         label: "Write".into(),
-        description: "Write text content to a file, creating parent directories."
-            .into(),
+        description: "Write text content to a file, creating parent directories.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

@@ -30,9 +30,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let command = ctx.args["command"]
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("command is required".into()))?;
-    let timeout = ctx.args["timeout"]
-        .as_u64()
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout = ctx.args["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_SECS);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = tokio::process::Command::new("cmd");
@@ -55,9 +53,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
             return Ok(ToolResult::error(format!("failed to spawn: {e}")));
         }
         Err(_) => {
-            return Ok(ToolResult::error(format!(
-                "timed out after {timeout}s"
-            )));
+            return Ok(ToolResult::error(format!("timed out after {timeout}s")));
         }
     };
 

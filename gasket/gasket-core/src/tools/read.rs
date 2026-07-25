@@ -12,8 +12,7 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "read".into(),
         label: "Read".into(),
-        description: "Read a UTF-8 text file. Supports offset/limit by line."
-            .into(),
+        description: "Read a UTF-8 text file. Supports offset/limit by line.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -97,11 +96,7 @@ mod tests {
         tokio::fs::write(tmp.path().join("f.txt"), "a\nb\nc")
             .await
             .unwrap();
-        let r = run(
-            serde_json::json!({"path": "f.txt"}),
-            tmp.path(),
-        )
-        .await;
+        let r = run(serde_json::json!({"path": "f.txt"}), tmp.path()).await;
         let text = match &r.content[0] {
             ContentBlock::Text { text } => text.clone(),
             _ => panic!(),

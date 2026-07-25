@@ -111,9 +111,5 @@ pub trait StreamFn: Send + Sync {
         system_prompt: &str,
         tools: &[ToolDefinition],
         signal: Option<Arc<AtomicBool>>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn futures_util::Stream<Item = StreamChunk> + Send,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>>;
 }

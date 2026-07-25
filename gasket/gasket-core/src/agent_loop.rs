@@ -47,10 +47,12 @@ where
     }
 
     emit(AgentEvent::AgentStart);
+    tracing::info!(model = %config.model.id, session = %context.session_id, "agent loop start");
 
     // Single outer loop.
-    for _turn in 0..config.max_turns {
+    for turn in 0..config.max_turns {
         emit(AgentEvent::TurnStart);
+        tracing::info!("agent turn {} start", turn);
 
         // Cooperative abort before each expensive step.
         if is_aborted(&config) {
@@ -58,10 +60,11 @@ where
         }
 
         // 1. Call the LLM.
-        let assistant =
-            stream_assistant_response(&context, &config, &mut emit).await?;
+        let assistant = stream_assistant_response(&context, &config, &mut emit).await?;
         let stop_reason = assistant.stop_reason.clone();
-        context.messages.push(AgentMessage::Assistant(assistant.clone()));
+        context
+            .messages
+            .push(AgentMessage::Assistant(assistant.clone()));
         new_messages.push(AgentMessage::Assistant(assistant.clone()));
 
         // 2. Check termination.
@@ -75,6 +78,7 @@ where
             }
             StopReason::MaxTokens => {
                 // Output was truncated: fail every tool call in this turn.
+                tracing::warn!("assistant output truncated (max_tokens); discarding tool calls");
                 let error_results = fail_all_tool_calls(&assistant);
                 for r in &error_results {
                     context.messages.push(AgentMessage::ToolResult(r.clone()));
@@ -90,8 +94,7 @@ where
         }
 
         // 3. Execute tool calls (serial in V0.1).
-        let tool_results =
-            execute_tool_calls(&context, &assistant, &config, &mut emit).await?;
+        let tool_results = execute_tool_calls(&context, &assistant, &config, &mut emit).await?;
         for r in &tool_results {
             context.messages.push(AgentMessage::ToolResult(r.clone()));
             new_messages.push(AgentMessage::ToolResult(r.clone()));
@@ -103,6 +106,7 @@ where
         });
     }
 
+    tracing::info!("agent loop end");
     emit(AgentEvent::AgentEnd);
     Ok(new_messages)
 }
@@ -135,7 +139,9 @@ fn fail_all_tool_calls(assistant: &AssistantMessage) -> Vec<ToolResultMessage> {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.function.name.clone(),
                 content: vec![ContentBlock::Text {
-                    text: "Error: assistant output was truncated (max_tokens); tool call discarded.".into(),
+                    text:
+                        "Error: assistant output was truncated (max_tokens); tool call discarded."
+                            .into(),
                 }],
                 is_error: true,
                 timestamp: crate::now(),
@@ -143,6 +149,20 @@ fn fail_all_tool_calls(assistant: &AssistantMessage) -> Vec<ToolResultMessage> {
             _ => None,
         })
         .collect()
+}
+
+/// Build an error [`ToolResultMessage`] for a tool call that failed before or
+/// during execution (missing/malformed args, unknown tool, tool-internal
+/// error). The agent loop feeds this back to the LLM so the model can retry,
+/// rather than aborting the whole run.
+fn error_tool_result(tool_call_id: &str, tool_name: &str, message: impl Into<String>) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: tool_call_id.into(),
+        tool_name: tool_name.into(),
+        content: vec![ContentBlock::text(message)],
+        is_error: true,
+        timestamp: crate::now(),
+    }
 }
 
 /// Execute every tool call in `assistant`, running before/after hooks (V0.1:
@@ -171,8 +191,34 @@ where
             break;
         }
 
-        let mut args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-            .unwrap_or(serde_json::Value::Null);
+        // Parse the accumulated tool-call arguments. Empty -> `{}` (a tool may
+        // take no params); malformed JSON -> feed the parse error back to the
+        // LLM as a tool_result so it can retry, instead of silently degrading
+        // to `Null` and crashing inside the tool.
+        let mut args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+            Ok(v) => v,
+            Err(_) if tc.function.arguments.trim().is_empty() => {
+                serde_json::Value::Object(Default::default())
+            }
+            Err(e) => {
+                tracing::warn!(tool = %tc.function.name, error = %e, "malformed tool arguments");
+                let result = error_tool_result(
+                    &tc.id,
+                    &tc.function.name,
+                    format!(
+                        "failed to parse tool arguments as JSON: {e}\nraw arguments: {:?}",
+                        tc.function.arguments
+                    ),
+                );
+                emit(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tc.id.clone(),
+                    result: result.clone(),
+                    is_error: true,
+                });
+                results.push(result);
+                continue;
+            }
+        };
 
         // 1. before_tool_call hook: consult the hook chain if installed.
         //    Block → refuse; Modify → replace args; Allow → proceed.
@@ -182,6 +228,7 @@ where
         };
         match verdict {
             ToolCallVerdict::Block(reason) => {
+                tracing::warn!(tool = %tc.function.name, "tool blocked by before_tool_call hook");
                 let result = ToolResultMessage {
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.function.name.clone(),
@@ -201,21 +248,37 @@ where
             ToolCallVerdict::Allow => {}
         }
 
-        // 2. Locate the tool.
-        let tool = context
-            .tools
-            .iter()
-            .find(|t| t.name == tc.function.name)
-            .ok_or_else(|| AgentError::ToolNotFound(tc.function.name.clone()))?;
+        // 2. Locate the tool. Unknown tool -> error tool_result (the model may
+        //    have hallucinated a name); continue the run.
+        let tool = match context.tools.iter().find(|t| t.name == tc.function.name) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(tool = %tc.function.name, "tool not found");
+                let result = error_tool_result(
+                    &tc.id,
+                    &tc.function.name,
+                    format!("tool not found: {}", tc.function.name),
+                );
+                emit(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tc.id.clone(),
+                    result: result.clone(),
+                    is_error: true,
+                });
+                results.push(result);
+                continue;
+            }
+        };
 
         emit(AgentEvent::ToolExecutionStart {
             tool_call_id: tc.id.clone(),
             tool_name: tc.function.name.clone(),
             args: args.clone(),
         });
+        tracing::info!(tool = %tc.function.name, "tool execute");
 
-        // 3. Execute.
-        let raw = (tool.execute)(ToolCallCtx {
+        // 3. Execute. A tool-internal error becomes an error tool_result fed
+        //    back to the LLM; the run continues instead of aborting.
+        let raw = match (tool.execute)(ToolCallCtx {
             tool_call_id: tc.id.clone(),
             args,
             signal: config.signal.clone().unwrap_or_default(),
@@ -227,7 +290,14 @@ where
             },
         })
         .await
-        .map_err(AgentError::from)?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(tool = %tc.function.name, error = %msg, "tool execute error");
+                crate::types::tool::ToolResult::error(msg)
+            }
+        };
 
         let mut result = ToolResultMessage {
             tool_call_id: tc.id.clone(),
@@ -248,6 +318,7 @@ where
             is_error: result.is_error,
         });
 
+        tracing::info!(tool = %tc.function.name, is_error = result.is_error, "tool done");
         results.push(result);
     }
 
@@ -276,6 +347,7 @@ where
     emit(AgentEvent::BeforeProviderRequest {
         model: config.model.id.clone(),
     });
+    tracing::debug!(model = %config.model.id, "provider request");
 
     let mut stream: Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> =
         (config.stream_fn).stream(
@@ -304,7 +376,11 @@ where
             } => {
                 accumulated.append_tool_call(id.clone(), name.clone(), args_delta.clone());
                 emit(AgentEvent::MessageUpdate {
-                    delta: ContentDelta::ToolCallDelta { id, name, args_delta },
+                    delta: ContentDelta::ToolCallDelta {
+                        id,
+                        name,
+                        args_delta,
+                    },
                 });
             }
             StreamChunk::ThinkingDelta(t) => {
@@ -321,6 +397,7 @@ where
             }
             StreamChunk::Done => break,
             StreamChunk::Error(e) => {
+                tracing::error!(error = %e, "provider stream error");
                 accumulated.stop_reason = StopReason::Error(e);
                 break;
             }
@@ -341,6 +418,7 @@ where
     }
 
     accumulated.usage = usage;
+    tracing::debug!(stop_reason = ?accumulated.stop_reason, "provider response");
     emit(AgentEvent::MessageEnd {
         message: accumulated.clone(),
     });
@@ -360,9 +438,9 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 mod tests {
     use super::*;
     use crate::types::context::{ModelSpec, ProviderApi};
-    use crate::ThinkingLevel;
-    use crate::StreamFn;
     use crate::ExtensionApi;
+    use crate::StreamFn;
+    use crate::ThinkingLevel;
     use futures_util::stream;
     use std::sync::atomic::AtomicBool;
 
@@ -406,7 +484,10 @@ mod tests {
         let config = test_config(vec![
             StreamChunk::TextDelta("Hello".into()),
             StreamChunk::TextDelta(" world".into()),
-            StreamChunk::Usage { input: 3, output: 2 },
+            StreamChunk::Usage {
+                input: 3,
+                output: 2,
+            },
             StreamChunk::Done,
         ]);
         let context = AgentContext {
@@ -430,12 +511,12 @@ mod tests {
 
         assert!(saw_start && saw_end);
         // One assistant message with the full text.
-        let any_assistant = msgs
-            .iter()
-            .any(|m| matches!(m, AgentMessage::Assistant(a) if a
+        let any_assistant = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a) if a
                 .content
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Text { text } if text == "Hello world"))));
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "Hello world")))
+        });
         assert!(any_assistant, "expected accumulated 'Hello world' text");
     }
 
@@ -448,9 +529,9 @@ mod tests {
             description: "echo args".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
-                Box::pin(async move {
-                    Ok(crate::types::tool::ToolResult::text(c.args.to_string()))
-                })
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
             }),
         };
         // Model: tool_call(echo, {"x":1}) -> then plain text "done".
@@ -471,7 +552,9 @@ mod tests {
             session_id: "s2".into(),
         };
 
-        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
 
         // Expect: Assistant(tool_call) + ToolResult(echo output).
         let has_tool_result = msgs.iter().any(|m| {
@@ -479,6 +562,73 @@ mod tests {
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "{\"x\":1}")))
         });
         assert!(has_tool_result, "expected echo tool result");
+    }
+
+    #[tokio::test]
+    async fn loop_assembles_chunked_tool_call() {
+        // Model streams ONE tool call across two deltas: the first carries
+        // id+name, the second (continuation) carries only args with an empty
+        // id - the OpenAI-compat streaming shape. Must assemble into ONE call,
+        // not split into two.
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo args".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+            }),
+        };
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{\"x\":".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                id: String::new(),
+                name: None,
+                args_delta: "1}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        // Each turn replays the same chunked call, so the mock drives max_turns
+        // turns. What matters is that the two deltas assemble into ONE call per
+        // turn with full args - not a split into a named-no-args call plus an
+        // empty-name-with-args call (the pre-fix behavior).
+        let echo_results: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(tr) if tr.tool_name == "echo" => Some(tr.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!echo_results.is_empty(), "expected at least one echo tool result");
+        for tr in &echo_results {
+            let text = match &tr.content[0] {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("expected text content"),
+            };
+            assert!(text.contains("\"x\":1"), "expected assembled args, got: {text}");
+        }
+        // The bug would leak the args fragment into a split empty-name call.
+        let split = msgs
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name.is_empty()));
+        assert!(!split, "chunked args leaked into a split empty-name tool call");
     }
 
     /// A `before_tool_call` handler that blocks the `bash` tool.
@@ -564,7 +714,9 @@ mod tests {
             session_id: "s3".into(),
         };
 
-        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
 
         // The tool was NOT executed — instead we got an error result with the
         // block reason.
@@ -621,7 +773,9 @@ mod tests {
             session_id: "s4".into(),
         };
 
-        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
 
         // Original secret output was replaced by [REDACTED].
         let redacted = msgs.iter().any(|m| {
@@ -634,5 +788,124 @@ mod tests {
         });
         assert!(redacted, "expected redacted result");
         assert!(!leaked, "secret must not appear in output");
+    }
+
+    #[tokio::test]
+    async fn loop_recovers_from_tool_error() {
+        // A tool whose execute returns Err. The loop must feed an error
+        // tool_result back to the LLM and continue, not abort the run.
+        let boom = crate::types::tool::ToolDefinition {
+            name: "boom".into(),
+            label: "Boom".into(),
+            description: "always fails".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move {
+                    Err(crate::error::ToolError::Message("boom".into()))
+                })
+            }),
+        };
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("boom".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![boom],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let has_error_result = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.tool_name == "boom" && tr.is_error
+                && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("boom"))))
+        });
+        assert!(has_error_result, "expected an error tool_result, not a crash");
+    }
+
+    #[tokio::test]
+    async fn loop_handles_malformed_tool_args() {
+        // The model streams malformed argument JSON. The loop must report a
+        // parse error as a tool_result and continue, not crash inside the tool.
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+            }),
+        };
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{\"command\":".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let has_error_result = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.tool_name == "echo" && tr.is_error
+                && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("failed to parse tool arguments"))))
+        });
+        assert!(has_error_result, "expected a parse-error tool_result, not a crash");
+    }
+
+    #[tokio::test]
+    async fn loop_handles_unknown_tool() {
+        // The model calls a tool that was never registered. The loop must
+        // report "tool not found" as a tool_result and continue.
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("ghost".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let has_error_result = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.tool_name == "ghost" && tr.is_error
+                && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("tool not found"))))
+        });
+        assert!(has_error_result, "expected a not-found tool_result, not a crash");
     }
 }

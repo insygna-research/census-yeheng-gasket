@@ -17,8 +17,8 @@ use futures_util::{stream, Stream};
 use gasket_core::extension::BeforeToolCallHandler;
 use gasket_core::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApi,
-    ExtensionApiImpl, ExtensionContext, ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel,
-    ToolCallVerdict, ToolDefinition, ToolResult,
+    ExtensionApiImpl, ExtensionContext, ModelSpec, ProviderApi, StreamChunk, StreamFn,
+    ThinkingLevel, ToolCallVerdict, ToolDefinition, ToolResult,
 };
 
 // ── a mock provider that calls a named tool once, then ends ───────────────
@@ -108,7 +108,13 @@ async fn permission_gate_blocks_bash() {
     // A gate identical to the permission_gate example.
     struct Gate;
     impl BeforeToolCallHandler for Gate {
-        fn call(&self, _id: &str, tool: &str, args: &serde_json::Value, _ctx: &ExtensionContext) -> ToolCallVerdict {
+        fn call(
+            &self,
+            _id: &str,
+            tool: &str,
+            args: &serde_json::Value,
+            _ctx: &ExtensionContext,
+        ) -> ToolCallVerdict {
             if tool == "bash" && args["command"].as_str().unwrap_or("").contains("rm -rf") {
                 ToolCallVerdict::Block("refused".into())
             } else {
@@ -158,7 +164,10 @@ async fn permission_gate_blocks_bash() {
 
     let mut saw_block = false;
     let msgs = gasket_core::run_agent_loop(vec![], agent_ctx, cfg, |ev| {
-        if let AgentEvent::ToolExecutionEnd { result, is_error, .. } = ev {
+        if let AgentEvent::ToolExecutionEnd {
+            result, is_error, ..
+        } = ev
+        {
             if is_error && result.tool_name == "bash" {
                 saw_block = true;
             }

@@ -19,12 +19,18 @@ mod todo_list;
 
 use std::sync::Arc;
 
-use gasket_core::extension::ExtensionApiImpl;
-use gasket_core::{AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel, UserMessage};
 use futures_util::Stream;
+use gasket_core::extension::ExtensionApiImpl;
+use gasket_core::{
+    AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, ModelSpec, ProviderApi, StreamChunk,
+    StreamFn, ThinkingLevel, UserMessage,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let mut api = ExtensionApiImpl::new();
 
     // Plugins populate the api: tools + hook handlers.

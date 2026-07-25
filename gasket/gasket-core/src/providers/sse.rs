@@ -88,9 +88,6 @@ mod tests {
     fn parses_multiple_frames_in_one_buffer() {
         let buf = "data: a\n\ndata: b\n\n";
         let payloads = parse_sse_frame(buf);
-        assert_eq!(
-            payloads,
-            vec![Some("a".to_string()), Some("b".to_string())]
-        );
+        assert_eq!(payloads, vec![Some("a".to_string()), Some("b".to_string())]);
     }
 }

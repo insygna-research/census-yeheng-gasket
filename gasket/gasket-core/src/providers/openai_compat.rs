@@ -74,6 +74,8 @@ impl StreamFn for OpenAiCompat {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
 
+        tracing::debug!(url = %url, model = %model.id, "openai-compat request");
+
         Box::pin(async_stream::stream! {
             let resp = match client
                 .post(&url)
@@ -84,6 +86,7 @@ impl StreamFn for OpenAiCompat {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(error = %e, "openai-compat request failed");
                     yield StreamChunk::Error(e.to_string());
                     return;
                 }
@@ -92,6 +95,7 @@ impl StreamFn for OpenAiCompat {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
+                tracing::warn!(status = %status, "openai-compat non-2xx response");
                 yield StreamChunk::Error(format!("HTTP {status}: {text}"));
                 return;
             }
@@ -167,6 +171,20 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
             let text = collect_text(&a.content);
             if !text.is_empty() {
                 entry["content"] = json!(text);
+            }
+            // DeepSeek-reasoner (and other reasoning models) require the
+            // assistant's `reasoning_content` to be echoed back when continuing
+            // a turn, or the API rejects the request with HTTP 400.
+            let reasoning: String = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !reasoning.is_empty() {
+                entry["reasoning_content"] = json!(reasoning);
             }
             let tool_calls: Vec<_> = a
                 .content
@@ -250,9 +268,20 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
         chunks.push(StreamChunk::TextDelta(content.to_string()));
     }
 
+    // DeepSeek-reasoner and similar reasoning models stream `reasoning_content`
+    // alongside `content`. Capture it as thinking so it can be echoed back on
+    // the next turn (the API rejects requests that drop it with HTTP 400).
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+        chunks.push(StreamChunk::ThinkingDelta(reasoning.to_string()));
+    }
+
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
-            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            let id = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
             let function = tc.get("function");
             let name = function
                 .and_then(|f| f.get("name"))
@@ -293,7 +322,11 @@ mod tests {
         let chunks = parse_openai_chunk(json);
         assert_eq!(chunks.len(), 1);
         match &chunks[0] {
-            StreamChunk::ToolCallDelta { id, name, args_delta } => {
+            StreamChunk::ToolCallDelta {
+                id,
+                name,
+                args_delta,
+            } => {
                 assert_eq!(id, "t1");
                 assert_eq!(name.as_deref(), Some("echo"));
                 assert_eq!(args_delta, "{\"x\":");
@@ -306,7 +339,13 @@ mod tests {
     fn parses_usage_chunk() {
         let json = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         let chunks = parse_openai_chunk(json);
-        assert_eq!(chunks, vec![StreamChunk::Usage { input: 10, output: 5 }]);
+        assert_eq!(
+            chunks,
+            vec![StreamChunk::Usage {
+                input: 10,
+                output: 5
+            }]
+        );
     }
 
     #[test]
@@ -322,5 +361,15 @@ mod tests {
             timestamp: 0,
         });
         assert!(convert_message(&custom).is_none());
+    }
+
+    #[test]
+    fn parses_reasoning_content() {
+        let json = r#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
+        let chunks = parse_openai_chunk(json);
+        assert_eq!(
+            chunks,
+            vec![StreamChunk::ThinkingDelta("thinking...".into())]
+        );
     }
 }

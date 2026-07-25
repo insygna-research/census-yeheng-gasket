@@ -12,8 +12,7 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "list".into(),
         label: "List".into(),
-        description: "List directory entries. Optional recursive + glob pattern."
-            .into(),
+        description: "List directory entries. Optional recursive + glob pattern.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -101,9 +100,7 @@ mod tests {
     async fn lists_top_level() {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
-        tokio::fs::create_dir(tmp.path().join("sub"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir(tmp.path().join("sub")).await.unwrap();
         let r = run(serde_json::json!({}), tmp.path()).await;
         let text = match &r.content[0] {
             ContentBlock::Text { text } => text.clone(),

@@ -156,7 +156,13 @@ impl crate::types::tool::HookChain for ExtensionApiImpl {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> ToolCallVerdict {
-        ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args, &Self::placeholder_ctx())
+        ExtensionApiImpl::before_tool_call(
+            self,
+            tool_call_id,
+            tool_name,
+            args,
+            &Self::placeholder_ctx(),
+        )
     }
 
     fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {
@@ -209,7 +215,13 @@ mod tests {
 
     struct Blocker;
     impl BeforeToolCallHandler for Blocker {
-        fn call(&self, _: &str, _: &str, _: &serde_json::Value, _: &ExtensionContext) -> ToolCallVerdict {
+        fn call(
+            &self,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+            _: &ExtensionContext,
+        ) -> ToolCallVerdict {
             ToolCallVerdict::Block("no".into())
         }
     }
@@ -226,7 +238,12 @@ mod tests {
     fn after_hook_replaces_result() {
         struct Redactor;
         impl AfterToolCallHandler for Redactor {
-            fn call(&self, _: &str, _: &ToolResultMessage, _: &ExtensionContext) -> Option<ToolResultMessage> {
+            fn call(
+                &self,
+                _: &str,
+                _: &ToolResultMessage,
+                _: &ExtensionContext,
+            ) -> Option<ToolResultMessage> {
                 Some(ToolResultMessage {
                     tool_call_id: "id".into(),
                     tool_name: "x".into(),

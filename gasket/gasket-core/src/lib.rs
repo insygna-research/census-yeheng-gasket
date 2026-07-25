@@ -18,16 +18,20 @@ pub mod types;
 
 pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
-pub use storage::JsonlStorage;
-pub use providers::{AnthropicProvider, OpenAiCompat, ProviderConfig, ConfigError};
-pub use tools::built_in_tools;
 pub use extension::{ExtensionApi, ExtensionApiImpl, ExtensionContext, Plugin};
+pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
+pub use storage::JsonlStorage;
+pub use tools::built_in_tools;
 pub use types::context::{
     AgentContext, AgentLoopConfig, ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel,
 };
 pub use types::event::{AgentEvent, ContentDelta};
-pub use types::message::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, UserMessage};
-pub use types::tool::{ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn, ToolResult};
+pub use types::message::{
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, UserMessage,
+};
+pub use types::tool::{
+    ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn, ToolResult,
+};
 
 /// Current monotonically-increasing time in milliseconds since UNIX epoch.
 ///

@@ -76,10 +76,7 @@ impl JsonlStorage {
 
     /// Load all messages for a session, in append order. Returns empty vec for
     /// a session that has never been written.
-    pub async fn load_messages(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<AgentMessage>, AgentError> {
+    pub async fn load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, AgentError> {
         let path = self.messages_path(session_id);
         match tokio::fs::read_to_string(&path).await {
             Ok(contents) => {
@@ -131,7 +128,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = JsonlStorage::new(tmp.path());
 
-        store.append_message("s1", &user_msg("hello")).await.unwrap();
+        store
+            .append_message("s1", &user_msg("hello"))
+            .await
+            .unwrap();
         store
             .append_message("s1", &user_msg("world"))
             .await
@@ -140,8 +140,12 @@ mod tests {
         let loaded = store.load_messages("s1").await.unwrap();
         assert_eq!(loaded.len(), 2);
         // Order preserved.
-        assert!(matches!(&loaded[0], AgentMessage::User(u) if matches!(&u.content[0], ContentBlock::Text { text } if text == "hello")));
-        assert!(matches!(&loaded[1], AgentMessage::User(u) if matches!(&u.content[0], ContentBlock::Text { text } if text == "world")));
+        assert!(
+            matches!(&loaded[0], AgentMessage::User(u) if matches!(&u.content[0], ContentBlock::Text { text } if text == "hello"))
+        );
+        assert!(
+            matches!(&loaded[1], AgentMessage::User(u) if matches!(&u.content[0], ContentBlock::Text { text } if text == "world"))
+        );
     }
 
     #[tokio::test]
@@ -157,7 +161,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = JsonlStorage::new(tmp.path());
         // Session dir does not exist yet.
-        store.append_message("nested/s1", &user_msg("x")).await.unwrap();
+        store
+            .append_message("nested/s1", &user_msg("x"))
+            .await
+            .unwrap();
         let loaded = store.load_messages("nested/s1").await.unwrap();
         assert_eq!(loaded.len(), 1);
     }

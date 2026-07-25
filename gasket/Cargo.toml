@@ -50,19 +50,13 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# OpenTelemetry
-opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["trace", "http-json", "reqwest-client"] }
-tracing-opentelemetry = "0.30"
-
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # Configuration
 dirs = "6"
-directories = "5"
+directories = "6"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -74,10 +68,10 @@ teloxide = { version = "0.17", features = ["rustls"] }
 serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "model", "client"] }
 
 # WebSocket (for Slack)
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 # Token counting
-tiktoken-rs = "0.11"
+tiktoken-rs = "0.12"
 
 # File watcher
 notify = "8"
@@ -86,41 +80,31 @@ notify = "8"
 serde_yaml = "0.9"
 
 # Cron
-cron = "0.15"
+cron = "0.17"
 
 # UUID
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-
-# Internal crates
-gasket-types = { path = "types" }
-gasket-storage = { path = "storage" }
-gasket-embedding = { path = "embedding" }
-gasket-providers = { path = "providers" }
-gasket-channels = { path = "channels" }
-gasket-sandbox = { path = "sandbox" }
-gasket-broker = { path = "broker" }
-gasket-engine = { path = "engine" }
 
 # Async channel primitives
 async-channel = "2"
 
 # Markdown rendering
-termimad = "0.34.1"
+termimad = "0.35"
 
 # HTTP server (for webhooks)
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 
 # Terminal
 colored = "3"
 
 # REPL
-reedline = "0.45"
+reedline = "0.49"
 nu-ansi-term = "0.50"
 
 # Interactive CLI
-dialoguer = "0.11"
+dialoguer = "0.12"
 
 # HTML content extraction (Readability algorithm)
 readability = "0.3"

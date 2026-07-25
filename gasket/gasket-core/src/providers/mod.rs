@@ -58,13 +58,15 @@ impl ProviderConfig {
 
     /// Same as [`from_env`](Self::from_env) but with an injectable lookup -
     /// used by tests to avoid mutating process env.
-    fn from_env_with(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Result<Self, ConfigError> {
+    fn from_env_with(
+        lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Self, ConfigError> {
         let base_url = lookup("GASKET_LLM_BASE_URL")
             .map_err(|_| ConfigError::Missing("GASKET_LLM_BASE_URL"))?;
-        let api_key = lookup("GASKET_LLM_KEY")
-            .map_err(|_| ConfigError::Missing("GASKET_LLM_KEY"))?;
-        let model = lookup("GASKET_LLM_MODEL")
-            .map_err(|_| ConfigError::Missing("GASKET_LLM_MODEL"))?;
+        let api_key =
+            lookup("GASKET_LLM_KEY").map_err(|_| ConfigError::Missing("GASKET_LLM_KEY"))?;
+        let model =
+            lookup("GASKET_LLM_MODEL").map_err(|_| ConfigError::Missing("GASKET_LLM_MODEL"))?;
 
         let generic_proxy = lookup("GASKET_LLM_PROXY").ok();
         let http_proxy = lookup("GASKET_LLM_HTTP_PROXY").ok();
@@ -126,11 +128,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |k: &str| {
-            map.get(k)
-                .cloned()
-                .ok_or(std::env::VarError::NotPresent)
-        }
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
     }
 
     #[test]
@@ -152,7 +150,10 @@ mod tests {
             ("GASKET_LLM_KEY", "sk-test"),
             ("GASKET_LLM_MODEL", "m"),
         ]));
-        assert!(matches!(r, Err(ConfigError::Missing("GASKET_LLM_BASE_URL"))));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Missing("GASKET_LLM_BASE_URL"))
+        ));
     }
 
     #[test]

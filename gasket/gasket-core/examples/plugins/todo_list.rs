@@ -61,9 +61,7 @@ pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
             },
             "required": ["action"]
         }),
-        execute: Arc::new(|ctx: ToolCallCtx| {
-            Box::pin(async move { execute(&ctx).await })
-        }),
+        execute: Arc::new(|ctx: ToolCallCtx| Box::pin(async move { execute(&ctx).await })),
     });
 }
 
@@ -105,14 +103,7 @@ async fn execute(ctx: &ToolCallCtx) -> Result<ToolResult, ToolError> {
                 let body = state
                     .todos
                     .iter()
-                    .map(|t| {
-                        format!(
-                            "{} [{}] {}",
-                            t.id,
-                            if t.done { "x" } else { " " },
-                            t.text
-                        )
-                    })
+                    .map(|t| format!("{} [{}] {}", t.id, if t.done { "x" } else { " " }, t.text))
                     .collect::<Vec<_>>()
                     .join("\n");
                 (body, false)
