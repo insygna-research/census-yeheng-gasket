@@ -4,6 +4,8 @@ pub mod session;
 pub mod permission;
 pub mod printer;
 
+pub use config::{ConfigLoader, HostConfig};
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("config error: {0}")]

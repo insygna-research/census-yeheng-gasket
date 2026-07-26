@@ -64,7 +64,7 @@ impl ProviderConfig {
 
     /// Same as [`from_env`](Self::from_env) but with an injectable lookup -
     /// used by tests to avoid mutating process env.
-    fn from_env_with(
+    pub fn from_env_with(
         lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<Self, ConfigError> {
         let base_url = lookup("GASKET_LLM_BASE_URL")
