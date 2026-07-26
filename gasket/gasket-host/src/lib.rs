@@ -7,6 +7,7 @@ pub mod printer;
 pub use config::{ConfigLoader, HostConfig};
 pub use session::{SessionInfo, SessionManager};
 pub use permission::{Mode, PermissionPolicy, RiskLevel};
+pub use printer::EventPrinter;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
