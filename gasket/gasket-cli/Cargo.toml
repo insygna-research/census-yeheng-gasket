@@ -1,0 +1,16 @@
+[package]
+name = "gasket-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gasket"
+path = "src/main.rs"
+
+[dependencies]
+gasket-host = { workspace = true }
+gasket-core = { workspace = true }
+reedline = { workspace = true }
+tokio = { workspace = true }
+colored = { workspace = true }

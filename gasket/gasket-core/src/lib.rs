@@ -31,7 +31,7 @@ pub use types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, UserMessage,
 };
 pub use types::tool::{
-    ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn, ToolResult,
+    HookChain, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn, ToolResult,
 };
 
 /// Current monotonically-increasing time in milliseconds since UNIX epoch.

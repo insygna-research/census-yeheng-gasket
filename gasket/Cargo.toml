@@ -12,6 +12,8 @@ description = "A lightweight personal AI assistant framework"
 resolver = "2"
 members = [
     "gasket-core",
+    "gasket-host",
+    "gasket-cli",
 ]
 
 [profile.release]
@@ -24,6 +26,10 @@ debug = false
 incremental = false
 
 [workspace.dependencies]
+# Internal crates
+gasket-core = { path = "gasket-core" }
+gasket-host = { path = "gasket-host" }
+
 # Async runtime
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "sync", "time",
@@ -57,6 +63,7 @@ anyhow = "1"
 # Configuration
 dirs = "6"
 directories = "6"
+dotenvy = "0.15"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
