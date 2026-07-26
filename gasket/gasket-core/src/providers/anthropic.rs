@@ -152,10 +152,23 @@ fn build_request_body(
         "stream": true,
     });
     if !system_prompt.is_empty() {
-        body["system"] = json!(system_prompt);
+        // Send system as a content-block array with an ephemeral cache_control
+        // breakpoint. system + tools form the stable prompt prefix; caching it
+        // cuts cached input-token cost ~10x on subsequent turns.
+        body["system"] = json!([{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"}
+        }]);
     }
     if !tools.is_empty() {
-        body["tools"] = json!(tools.iter().map(tool_to_anthropic).collect::<Vec<_>>());
+        let mut tools_arr: Vec<serde_json::Value> =
+            tools.iter().map(tool_to_anthropic).collect();
+        // Breakpoint on the last tool caches the whole tool definition block.
+        if let Some(last) = tools_arr.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["tools"] = json!(tools_arr);
     }
     body
 }
@@ -351,5 +364,33 @@ mod tests {
     #[test]
     fn ignores_malformed_json() {
         assert!(parse_anthropic_chunk("garbage").is_empty());
+    }
+
+    #[test]
+    fn cache_control_marks_system_and_last_tool() {
+        use crate::types::context::{ModelSpec, ProviderApi};
+        let model = ModelSpec {
+            id: "claude".into(),
+            api: ProviderApi::Anthropic,
+            max_tokens: 1024,
+            supports_thinking: false,
+        };
+        let tools = vec![ToolDefinition {
+            name: "t".into(),
+            label: "T".into(),
+            description: "d".into(),
+            parameters: json!({"type": "object"}),
+            execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
+                Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
+            }),
+        }];
+        let body = build_request_body(&model, &[], "sys", &tools);
+        // system is a content-block array with an ephemeral cache breakpoint.
+        let sys = body["system"].as_array().expect("system is array");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[0]["text"], "sys");
+        // the (last) tool carries a cache breakpoint.
+        let tools_arr = body["tools"].as_array().expect("tools is array");
+        assert_eq!(tools_arr[0]["cache_control"]["type"], "ephemeral");
     }
 }

@@ -188,7 +188,21 @@ where
     let mut results = Vec::with_capacity(tool_calls.len());
     for (i, tc) in tool_calls.into_iter().enumerate() {
         if i >= config.max_tool_calls_per_turn {
-            break;
+            // Limit reached: report the dropped call as an error tool_result so
+            // the model sees one result per call instead of a silent gap.
+            let limit = config.max_tool_calls_per_turn;
+            let result = error_tool_result(
+                &tc.id,
+                &tc.function.name,
+                format!("tool call limit reached ({limit} per turn); call dropped"),
+            );
+            emit(AgentEvent::ToolExecutionEnd {
+                tool_call_id: tc.id.clone(),
+                result: result.clone(),
+                is_error: true,
+            });
+            results.push(result);
+            continue;
         }
         // Cooperative abort between tool calls in a batch.
         if is_aborted(config) {
@@ -477,10 +491,17 @@ where
                 });
             }
             StreamChunk::Usage { input, output } => {
-                usage = Some(crate::types::message::Usage {
-                    input_tokens: input,
-                    output_tokens: output,
+                // Merge, don't overwrite: Anthropic sends input tokens in
+                // `message_start` and output tokens in `message_delta` as two
+                // separate Usage chunks. Overwriting would zero input on the
+                // second. Both OpenAI (one combined chunk) and Anthropic
+                // (complementary partials) sum correctly.
+                let u = usage.get_or_insert(crate::types::message::Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
                 });
+                u.input_tokens += input;
+                u.output_tokens += output;
             }
             StreamChunk::Done => break,
             StreamChunk::Error(e) => {
@@ -563,7 +584,6 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
-            api_key: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
             hooks: None,
@@ -786,7 +806,6 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
-            api_key: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
@@ -846,7 +865,6 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
-            api_key: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
@@ -1041,7 +1059,6 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
-            api_key: None,
             signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
@@ -1230,5 +1247,66 @@ mod tests {
         });
         assert_eq!(text_deltas, 1, "mid-stream error must not retry (would re-emit content)");
         assert!(errored, "mid-stream error should surface as stop_reason::Error");
+    }
+
+    #[tokio::test]
+    async fn over_limit_tool_calls_reported_not_silent() {
+        // max_tool_calls_per_turn = 1, but the model emits 2 calls. The second
+        // must come back as an error tool_result (not a silent gap).
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+            }),
+        };
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta { id: "t1".into(), name: Some("echo".into()), args_delta: "{}".into() },
+            StreamChunk::ToolCallDelta { id: "t2".into(), name: Some("echo".into()), args_delta: "{}".into() },
+            StreamChunk::Done,
+        ]);
+        config.max_tool_calls_per_turn = 1;
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        // t2 must surface as an error tool_result mentioning the limit.
+        let dropped = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr)
+                if tr.is_error && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("tool call limit"))))
+        });
+        assert!(dropped, "over-limit call must be reported as an error, not dropped silently");
+    }
+
+    #[tokio::test]
+    async fn usage_merges_across_chunks() {
+        // Two complementary Usage chunks (Anthropic shape: input then output).
+        // Final usage must hold both, not just the last one.
+        let config = test_config(vec![
+            StreamChunk::Usage { input: 42, output: 0 },
+            StreamChunk::Usage { input: 0, output: 7 },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let merged = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a)
+                if a.usage.as_ref().is_some_and(|u| u.input_tokens == 42 && u.output_tokens == 7))
+        });
+        assert!(merged, "usage must merge input+output across chunks");
     }
 }

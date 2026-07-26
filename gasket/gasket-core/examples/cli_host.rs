@@ -86,7 +86,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thinking_level: tunables.thinking_level,
         max_turns: tunables.max_turns,
         max_tool_calls_per_turn: tunables.max_tool_calls_per_turn,
-        api_key: None,
         signal: Some(Arc::new(AtomicBool::new(false))),
         stream_fn,
         hooks: None,

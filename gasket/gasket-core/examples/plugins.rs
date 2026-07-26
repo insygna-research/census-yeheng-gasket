@@ -64,7 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thinking_level: ThinkingLevel::Off,
         max_turns: 5,
         max_tool_calls_per_turn: 5,
-        api_key: None,
         signal: None,
         stream_fn: Arc::new(MockThatCallsHello),
         // The before/after hooks plugins registered are now live.

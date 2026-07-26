@@ -33,10 +33,13 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let path = ctx.args["path"]
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("path is required".into()))?;
-    let offset = ctx.args["offset"].as_u64().unwrap_or(0) as usize;
+    let offset = ctx.args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = ctx.args["limit"].as_u64().map(|l| l as usize);
 
-    let full = ctx.ctx.cwd.join(path);
+    let full = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
+        Ok(p) => p,
+        Err(msg) => return Ok(ToolResult::error(msg)),
+    };
     let bytes = tokio::fs::read(&full).await?;
     if bytes.len() > MAX_BYTES {
         return Ok(ToolResult::error(format!(
@@ -47,7 +50,8 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let lines: Vec<&str> = text.lines().collect();
-    let start = offset.min(lines.len());
+    // `offset` is 1-based (default 1 = first line); convert to a 0-based index.
+    let start = offset.saturating_sub(1).min(lines.len());
     let end = match limit {
         Some(l) => (start + l).min(lines.len()),
         None => lines.len(),
@@ -114,8 +118,9 @@ mod tests {
         tokio::fs::write(tmp.path().join("f.txt"), "1\n2\n3\n4\n5")
             .await
             .unwrap();
+        // offset is 1-based: offset=2 starts at line 2. limit=2 -> lines 2,3.
         let r = run(
-            serde_json::json!({"path": "f.txt", "offset": 1, "limit": 2}),
+            serde_json::json!({"path": "f.txt", "offset": 2, "limit": 2}),
             tmp.path(),
         )
         .await;
@@ -150,5 +155,26 @@ mod tests {
         .await
         .unwrap();
         assert!(r.is_error);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "x")
+            .await
+            .unwrap();
+        // `..` that would go above cwd -> rejected.
+        let r = run(
+            serde_json::json!({"path": "../../etc/passwd"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(r.is_error, "path escape must be rejected");
+        // absolute path -> rejected.
+        let r = run(serde_json::json!({"path": "/etc/passwd"}), tmp.path()).await;
+        assert!(r.is_error, "absolute path must be rejected");
+        // legitimate path still works.
+        let r = run(serde_json::json!({"path": "f.txt"}), tmp.path()).await;
+        assert!(!r.is_error, "normal path must still work");
     }
 }

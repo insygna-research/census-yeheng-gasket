@@ -31,7 +31,6 @@ pub struct AgentLoopConfig {
     pub max_turns: usize,
     /// Hard ceiling on tool calls executed within a single turn. Default 20.
     pub max_tool_calls_per_turn: usize,
-    pub api_key: Option<String>,
     /// Cooperative abort: when set to true, the loop exits at the next safe point.
     pub signal: Option<Arc<AtomicBool>>,
     /// The LLM call entry point. Injected by the host so the loop is

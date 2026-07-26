@@ -17,8 +17,6 @@ pub enum AgentError {
     Serde(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("aborted")]
-    Aborted,
 }
 
 /// Error returned by a tool's `execute` closure.

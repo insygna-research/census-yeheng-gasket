@@ -67,7 +67,6 @@ fn hello_config(tools: Vec<ToolDefinition>) -> (AgentContext, AgentLoopConfig) {
         thinking_level: ThinkingLevel::Off,
         max_turns: 1,
         max_tool_calls_per_turn: 5,
-        api_key: None,
         signal: None,
         stream_fn: Arc::new(CallToolOnce {
             tool: "hello".into(),
@@ -154,7 +153,6 @@ async fn permission_gate_blocks_bash() {
         thinking_level: ThinkingLevel::Off,
         max_turns: 1,
         max_tool_calls_per_turn: 5,
-        api_key: None,
         signal: None,
         stream_fn: Arc::new(CallToolOnce {
             tool: "bash".into(),

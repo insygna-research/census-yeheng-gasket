@@ -33,7 +33,10 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("content is required".into()))?;
 
-    let full = ctx.ctx.cwd.join(path);
+    let full = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
+        Ok(p) => p,
+        Err(msg) => return Ok(ToolResult::error(msg)),
+    };
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

@@ -43,7 +43,10 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("new_text is required".into()))?;
 
-    let full = ctx.ctx.cwd.join(path);
+    let full = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
+        Ok(p) => p,
+        Err(msg) => return Ok(ToolResult::error(msg)),
+    };
     let original = tokio::fs::read_to_string(&full).await?;
 
     let count = original.matches(old_text).count();
@@ -79,8 +82,12 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         }
     };
 
-    // Atomic write via temp file + rename.
-    let tmp = full.with_extension("gasket-tmp");
+    // Atomic write via temp file + rename. Append a suffix (rather than
+    // `with_extension`, which would drop the original extension and let
+    // `Cargo.toml` and `Cargo.lock` collide on `Cargo.gasket-tmp`).
+    let mut tmp_os = full.clone().into_os_string();
+    tmp_os.push(".gasket-tmp");
+    let tmp = std::path::PathBuf::from(tmp_os);
     tokio::fs::write(&tmp, &updated).await?;
     tokio::fs::rename(&tmp, &full).await?;
 
