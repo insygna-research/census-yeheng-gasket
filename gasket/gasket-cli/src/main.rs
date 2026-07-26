@@ -1,11 +1,10 @@
 //! gasket CLI REPL: 组装 gasket-host 模块 + run_agent_loop，交互式终端 agent。
 use std::io::{self, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gasket_core::{
-    built_in_tools, run_agent_loop, AgentContext, AgentLoopConfig, AgentMessage, AnthropicProvider,
-    ContentBlock, ModelSpec, OpenAiCompat, ProviderApi, StreamFn, ThinkingLevel, UserMessage,
+    built_in_tools, run_agent_loop, AgentContext, AgentMessage, ContentBlock, UserMessage,
 };
 use gasket_host::{ConfigLoader, EventPrinter, Mode, PermissionPolicy, SessionManager};
 use reedline::{DefaultPrompt, Reedline, Signal};
@@ -45,33 +44,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let system_prompt = "You are a helpful, concise assistant.".to_string();
 
-    let stream_fn: Arc<dyn StreamFn> = match host_cfg.provider.api {
-        ProviderApi::OpenAiCompat => Arc::new(OpenAiCompat::from_config(&host_cfg.provider)),
-        ProviderApi::Anthropic => Arc::new(AnthropicProvider::from_config(&host_cfg.provider)),
-    };
-    let config = AgentLoopConfig {
-        model: ModelSpec {
-            id: host_cfg.provider.model.clone(),
-            api: host_cfg.provider.api,
-            max_tokens: host_cfg.tunables.max_tokens,
-            supports_thinking: host_cfg.tunables.thinking_level != ThinkingLevel::Off,
-        },
-        thinking_level: host_cfg.tunables.thinking_level,
-        max_turns: host_cfg.tunables.max_turns,
-        max_tool_calls_per_turn: host_cfg.tunables.max_tool_calls_per_turn,
-        signal: Some(Arc::new(AtomicBool::new(false))),
-        stream_fn,
-        hooks: Some(policy.clone()),
-        retry: host_cfg.tunables.retry.clone(),
-    };
+    // Cooperative-abort signal: a Ctrl-C during LLM streaming (cooked tty mode)
+    // sets this and the agent loop exits at the next safe point, returning the
+    // partial transcript. Spawned once; the loop re-arms after each Ctrl-C so
+    // every press is honored. At the prompt (raw mode) Ctrl-C is a key event
+    // handled by reedline, not a SIGINT, so it doesn't fire here.
+    let signal = Arc::new(AtomicBool::new(false));
+    {
+        let s = signal.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break; // handler could not be installed; give up quietly
+                }
+                s.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    let config = host_cfg.build_loop_config(
+        host_cfg.tunables.max_turns,
+        Some(signal.clone()),
+        Some(policy.clone()),
+    );
 
     let mut rl = Reedline::create();
     let prompt = DefaultPrompt::default();
-    loop {
-        let line = match rl.read_line(&prompt) {
-            Ok(Signal::Success(s)) => s,
-            _ => break,
-        };
+    while let Ok(Signal::Success(line)) = rl.read_line(&prompt) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -93,6 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_id: session.current_id().to_string(),
         };
         let mut printer = EventPrinter::new(io::stdout());
+        // Clear any abort left over from a prior run before starting this one.
+        signal.store(false, Ordering::Relaxed);
         match run_agent_loop(vec![user_msg], context, config.clone(), |ev| {
             printer.on_event(&ev);
         })

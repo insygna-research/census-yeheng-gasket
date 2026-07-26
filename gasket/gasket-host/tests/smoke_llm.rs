@@ -15,8 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use gasket_core::{
-    built_in_tools, run_agent_loop, AgentContext, AgentLoopConfig, AgentMessage, AnthropicProvider,
-    ContentBlock, ModelSpec, OpenAiCompat, ProviderApi, StreamFn, ThinkingLevel, UserMessage,
+    built_in_tools, run_agent_loop, AgentContext, AgentMessage, ContentBlock, UserMessage,
 };
 use gasket_host::{ConfigLoader, EventPrinter, Mode, PermissionPolicy};
 
@@ -27,28 +26,12 @@ use gasket_host::{ConfigLoader, EventPrinter, Mode, PermissionPolicy};
 async fn end_to_end_basic_chat() {
     let cfg = ConfigLoader::load().expect("GASKET_LLM_* must be set");
 
-    let stream_fn: Arc<dyn StreamFn> = match cfg.provider.api {
-        ProviderApi::OpenAiCompat => Arc::new(OpenAiCompat::from_config(&cfg.provider)),
-        ProviderApi::Anthropic => Arc::new(AnthropicProvider::from_config(&cfg.provider)),
-    };
-
     // FullAuto 模式，避免 approver 阻塞（无 stdin）。
-    let policy = Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false));
-    let config = AgentLoopConfig {
-        model: ModelSpec {
-            id: cfg.provider.model.clone(),
-            api: cfg.provider.api,
-            max_tokens: cfg.tunables.max_tokens,
-            supports_thinking: cfg.tunables.thinking_level != ThinkingLevel::Off,
-        },
-        thinking_level: cfg.tunables.thinking_level,
-        max_turns: 3,
-        max_tool_calls_per_turn: cfg.tunables.max_tool_calls_per_turn,
-        signal: Some(Arc::new(AtomicBool::new(false))),
-        stream_fn,
-        hooks: Some(policy.clone()),
-        retry: cfg.tunables.retry.clone(),
-    };
+    let config = cfg.build_loop_config(
+        3,
+        Some(Arc::new(AtomicBool::new(false))),
+        Some(Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false))),
+    );
 
     let user_msg = AgentMessage::User(UserMessage {
         content: vec![ContentBlock::text("Reply with exactly: pong")],
@@ -93,26 +76,11 @@ async fn end_to_end_basic_chat() {
 async fn end_to_end_tool_call() {
     let cfg = ConfigLoader::load().expect("GASKET_LLM_* must be set");
 
-    let stream_fn: Arc<dyn StreamFn> = match cfg.provider.api {
-        ProviderApi::OpenAiCompat => Arc::new(OpenAiCompat::from_config(&cfg.provider)),
-        ProviderApi::Anthropic => Arc::new(AnthropicProvider::from_config(&cfg.provider)),
-    };
-    let policy = Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false));
-    let config = AgentLoopConfig {
-        model: ModelSpec {
-            id: cfg.provider.model.clone(),
-            api: cfg.provider.api,
-            max_tokens: cfg.tunables.max_tokens,
-            supports_thinking: cfg.tunables.thinking_level != ThinkingLevel::Off,
-        },
-        thinking_level: cfg.tunables.thinking_level,
-        max_turns: 3,
-        max_tool_calls_per_turn: cfg.tunables.max_tool_calls_per_turn,
-        signal: Some(Arc::new(AtomicBool::new(false))),
-        stream_fn,
-        hooks: Some(policy.clone()),
-        retry: cfg.tunables.retry.clone(),
-    };
+    let config = cfg.build_loop_config(
+        3,
+        Some(Arc::new(AtomicBool::new(false))),
+        Some(Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false))),
+    );
 
     let user_msg = AgentMessage::User(UserMessage {
         content: vec![ContentBlock::text(

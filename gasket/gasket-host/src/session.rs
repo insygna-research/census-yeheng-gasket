@@ -65,9 +65,12 @@ impl SessionManager {
     pub async fn list(&self) -> Result<Vec<SessionInfo>, crate::HostError> {
         let root = self.storage.base_dir_clone();
         let mut out = Vec::new();
-        let mut rd = tokio::fs::read_dir(&root)
-            .await
-            .map_err(|e| crate::HostError::Session(e.to_string()))?;
+        // Fresh install: ~/.gasket/sessions doesn't exist yet -> no sessions.
+        let mut rd = match tokio::fs::read_dir(&root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(crate::HostError::Session(e.to_string())),
+        };
         while let Some(entry) = rd
             .next_entry()
             .await
@@ -77,23 +80,21 @@ impl SessionManager {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            let mtime = entry
-                .metadata()
+            // mtime comes from messages.jsonl, NOT the session dir: appending to
+            // an existing file updates the file's mtime but leaves the dir's
+            // untouched, so dir mtime would freeze at first write.
+            let path = self.storage.messages_path(&id);
+            let mtime = tokio::fs::metadata(&path)
                 .await
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            let msg_count = self
-                .storage
-                .load_messages(&id)
-                .await
-                .map(|v| v.len())
-                .unwrap_or(0);
-            out.push(SessionInfo {
-                id,
-                mtime,
-                msg_count,
-            });
+            // Count lines without serde-parsing the whole transcript.
+            let msg_count = match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
+                Err(_) => 0,
+            };
+            out.push(SessionInfo { id, mtime, msg_count });
         }
         Ok(out)
     }
@@ -152,6 +153,38 @@ mod tests {
         let msgs = pick.resume_last().await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(pick.current_id(), "new");
+    }
+
+    #[tokio::test]
+    async fn resume_last_uses_latest_message_mtime() {
+        // Regression: dir mtime freezes at first write, so a session that gets
+        // a *second* append after another session was created must still win.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut a = SessionManager::with_root(tmp.path().to_path_buf());
+        a.current_id = "a".into();
+        a.append(&[user_msg("a1")]).await.unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut b = SessionManager::with_root(tmp.path().to_path_buf());
+        b.current_id = "b".into();
+        b.append(&[user_msg("b1")]).await.unwrap();
+
+        // a receives a later message -> a is the most recently active session.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        a.append(&[user_msg("a2")]).await.unwrap();
+
+        let mut pick = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = pick.resume_last().await.unwrap();
+        assert_eq!(pick.current_id(), "a");
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_on_missing_root_is_empty() {
+        // Fresh install: sessions dir doesn't exist yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().join("nope"));
+        assert!(sm.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
