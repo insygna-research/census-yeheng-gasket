@@ -9,12 +9,15 @@ pub mod sse;
 pub use anthropic::AnthropicProvider;
 pub use openai_compat::OpenAiCompat;
 
+use crate::types::context::ProviderApi;
+
 /// Connection + model config for an LLM provider, read from environment.
 ///
 /// Recognized env vars (all optional unless noted):
 /// - `GASKET_LLM_BASE_URL` - provider base URL (e.g. `https://api.deepseek.com/v1`)
 /// - `GASKET_LLM_KEY`      - API key (auth bearer / x-api-key)
 /// - `GASKET_LLM_MODEL`    - model id to call
+/// - `GASKET_LLM_API`      - `openai` (default) or `anthropic` - wire protocol
 /// - `GASKET_LLM_PROXY`    - proxy used for BOTH http and https (fallback)
 /// - `GASKET_LLM_HTTP_PROXY`  - proxy for http requests (overrides GASKET_LLM_PROXY for http)
 /// - `GASKET_LLM_HTTPS_PROXY` - proxy for https requests (overrides GASKET_LLM_PROXY for https)
@@ -23,6 +26,9 @@ pub use openai_compat::OpenAiCompat;
 /// fills in for whichever scheme has no explicit proxy.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
+    /// Wire protocol the provider speaks. Determines which provider impl to
+    /// build and how auth headers are sent.
+    pub api: ProviderApi,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -67,6 +73,10 @@ impl ProviderConfig {
             lookup("GASKET_LLM_KEY").map_err(|_| ConfigError::Missing("GASKET_LLM_KEY"))?;
         let model =
             lookup("GASKET_LLM_MODEL").map_err(|_| ConfigError::Missing("GASKET_LLM_MODEL"))?;
+        let api = match lookup("GASKET_LLM_API").ok().as_deref() {
+            Some("anthropic") => ProviderApi::Anthropic,
+            _ => ProviderApi::OpenAiCompat,
+        };
 
         let generic_proxy = lookup("GASKET_LLM_PROXY").ok();
         let http_proxy = lookup("GASKET_LLM_HTTP_PROXY").ok();
@@ -75,6 +85,7 @@ impl ProviderConfig {
         let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
 
         Ok(Self {
+            api,
             base_url,
             api_key,
             model,
@@ -142,6 +153,19 @@ mod tests {
         assert_eq!(cfg.base_url, "https://api.x.com/v1");
         assert_eq!(cfg.api_key, "sk-test");
         assert_eq!(cfg.model, "gpt-4o-mini");
+        assert_eq!(cfg.api, ProviderApi::OpenAiCompat); // default when GASKET_LLM_API unset
+    }
+
+    #[test]
+    fn api_selects_anthropic() {
+        let cfg = ProviderConfig::from_env_with(&fake_env(&[
+            ("GASKET_LLM_BASE_URL", "https://api.anthropic.com/v1"),
+            ("GASKET_LLM_KEY", "sk-test"),
+            ("GASKET_LLM_MODEL", "claude-sonnet"),
+            ("GASKET_LLM_API", "anthropic"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.api, ProviderApi::Anthropic);
     }
 
     #[test]

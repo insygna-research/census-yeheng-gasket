@@ -74,6 +74,7 @@ fn hello_config(tools: Vec<ToolDefinition>) -> (AgentContext, AgentLoopConfig) {
             args: serde_json::json!({"name": "Ada"}),
         }),
         hooks: None,
+        retry: gasket_core::RetryPolicy::default(),
     };
     (ctx, cfg)
 }
@@ -160,6 +161,7 @@ async fn permission_gate_blocks_bash() {
             args: serde_json::json!({"command": "rm -rf /tmp/x"}),
         }),
         hooks: Some(Arc::new(api) as Arc<dyn gasket_core::types::tool::HookChain>),
+        retry: gasket_core::RetryPolicy::default(),
     };
 
     let mut saw_block = false;

@@ -23,7 +23,8 @@ pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig
 pub use storage::JsonlStorage;
 pub use tools::built_in_tools;
 pub use types::context::{
-    AgentContext, AgentLoopConfig, ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel,
+    AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,
+    StreamFn, ThinkingLevel,
 };
 pub use types::event::{AgentEvent, ContentDelta};
 pub use types::message::{

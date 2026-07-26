@@ -348,11 +348,84 @@ async fn stream_assistant_response<E>(
 where
     E: FnMut(AgentEvent),
 {
-    emit(AgentEvent::BeforeProviderRequest {
-        model: config.model.id.clone(),
-    });
-    tracing::debug!(model = %config.model.id, "provider request");
+    let max_retries = config.retry.max_retries;
+    let mut attempt: usize = 0;
+    loop {
+        attempt += 1;
+        emit(AgentEvent::BeforeProviderRequest {
+            model: config.model.id.clone(),
+        });
+        tracing::debug!(model = %config.model.id, attempt, "provider request");
 
+        match attempt_stream_once(context, config, &mut *emit).await {
+            StreamAttempt::Done(accumulated) => {
+                tracing::debug!(stop_reason = ?accumulated.stop_reason, "provider response");
+                emit(AgentEvent::MessageEnd {
+                    message: accumulated.clone(),
+                });
+                emit(AgentEvent::AfterProviderResponse {
+                    model: config.model.id.clone(),
+                    response: accumulated.clone(),
+                });
+                return Ok(accumulated);
+            }
+            StreamAttempt::Errored {
+                error,
+                emitted_content,
+            } => {
+                // Only retry when nothing was emitted to the host yet (so the
+                // retry is invisible) and the signal isn't already aborting.
+                let can_retry = !emitted_content
+                    && attempt <= max_retries
+                    && !is_aborted(config);
+                if can_retry {
+                    let delay = backoff_ms(attempt, &config.retry);
+                    tracing::warn!(
+                        attempt,
+                        max_retries,
+                        delay_ms = delay,
+                        error = %error,
+                        "provider stream error, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+                let mut msg = AssistantMessage::new(&config.model.id);
+                msg.stop_reason = StopReason::Error(error);
+                tracing::debug!(stop_reason = ?msg.stop_reason, "provider response (errored)");
+                emit(AgentEvent::MessageEnd {
+                    message: msg.clone(),
+                });
+                emit(AgentEvent::AfterProviderResponse {
+                    model: config.model.id.clone(),
+                    response: msg.clone(),
+                });
+                return Ok(msg);
+            }
+        }
+    }
+}
+
+/// Outcome of one streaming attempt.
+enum StreamAttempt {
+    /// Stream completed (normally or via abort). Carries the accumulated message.
+    Done(AssistantMessage),
+    /// Stream errored. `emitted_content` tells the caller whether any content
+    /// delta was already sent to the host - if so, retrying would duplicate it.
+    Errored { error: String, emitted_content: bool },
+}
+
+/// Run one streaming attempt: accumulate chunks into an [`AssistantMessage`],
+/// emitting `MessageUpdate` for each delta. Returns [`StreamAttempt::Done`] on
+/// normal completion (or abort), or [`StreamAttempt::Errored`] on a stream error.
+async fn attempt_stream_once<E>(
+    context: &AgentContext,
+    config: &AgentLoopConfig,
+    emit: &mut E,
+) -> StreamAttempt
+where
+    E: FnMut(AgentEvent),
+{
     let mut stream: Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> =
         (config.stream_fn).stream(
             &config.model,
@@ -364,6 +437,7 @@ where
 
     let mut accumulated = AssistantMessage::new(&config.model.id);
     let mut usage = None;
+    let mut emitted_content = false;
 
     while let Some(chunk) = stream.next().await {
         // Cooperative abort: stop accumulating as soon as the signal is set.
@@ -374,6 +448,7 @@ where
         }
         match chunk {
             StreamChunk::TextDelta(t) => {
+                emitted_content = true;
                 accumulated.append_text(&t);
                 emit(AgentEvent::MessageUpdate {
                     delta: ContentDelta::TextDelta(t),
@@ -384,6 +459,7 @@ where
                 name,
                 args_delta,
             } => {
+                emitted_content = true;
                 accumulated.append_tool_call(id.clone(), name.clone(), args_delta.clone());
                 emit(AgentEvent::MessageUpdate {
                     delta: ContentDelta::ToolCallDelta {
@@ -394,6 +470,7 @@ where
                 });
             }
             StreamChunk::ThinkingDelta(t) => {
+                emitted_content = true;
                 accumulated.append_thinking(&t);
                 emit(AgentEvent::MessageUpdate {
                     delta: ContentDelta::ThinkingDelta(t),
@@ -408,8 +485,10 @@ where
             StreamChunk::Done => break,
             StreamChunk::Error(e) => {
                 tracing::error!(error = %e, "provider stream error");
-                accumulated.stop_reason = StopReason::Error(e);
-                break;
+                return StreamAttempt::Errored {
+                    error: e,
+                    emitted_content,
+                };
             }
         }
     }
@@ -429,16 +508,18 @@ where
     }
 
     accumulated.usage = usage;
-    tracing::debug!(stop_reason = ?accumulated.stop_reason, "provider response");
-    emit(AgentEvent::MessageEnd {
-        message: accumulated.clone(),
-    });
-    emit(AgentEvent::AfterProviderResponse {
-        model: config.model.id.clone(),
-        response: accumulated.clone(),
-    });
+    StreamAttempt::Done(accumulated)
+}
 
-    Ok(accumulated)
+/// Exponential backoff for retry `attempt` (1-based): `initial * 2^(attempt-1)`,
+/// capped at `max`. Returns 0 when `initial` is 0 (no delay).
+fn backoff_ms(attempt: usize, policy: &crate::types::context::RetryPolicy) -> u64 {
+    if policy.initial_delay_ms == 0 {
+        return 0;
+    }
+    let shift = attempt.saturating_sub(1).min(10);
+    let base = policy.initial_delay_ms.saturating_mul(1u64 << shift);
+    base.min(policy.max_delay_ms)
 }
 
 // Keep the boxed-future type name available for clarity in signatures above.
@@ -486,6 +567,7 @@ mod tests {
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
             hooks: None,
+            retry: crate::RetryPolicy::off(),
         }
     }
 
@@ -715,6 +797,7 @@ mod tests {
                 StreamChunk::Done,
             ])),
             hooks: Some(std::sync::Arc::new(api)),
+            retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -774,6 +857,7 @@ mod tests {
                 StreamChunk::Done,
             ])),
             hooks: Some(std::sync::Arc::new(api)),
+            retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -961,6 +1045,7 @@ mod tests {
             signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
+            retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1043,5 +1128,107 @@ mod tests {
             .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "echo"));
         assert!(ran_set_abort, "first tool should have executed before abort");
         assert!(!ran_echo, "second tool must not execute after abort");
+    }
+
+    /// A mock that errors `failures` times, then replays `success`. Shares a
+    /// call counter across attempts (StreamFn is `&self`).
+    struct FlakyStream {
+        failures: usize,
+        success: Vec<StreamChunk>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl StreamFn for FlakyStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[crate::types::tool::ToolDefinition],
+            _signal: Option<std::sync::Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.failures {
+                Box::pin(stream::iter(vec![StreamChunk::Error("transient".into())]))
+            } else {
+                Box::pin(stream::iter(self.success.clone()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_retries_transient_provider_error() {
+        // First two attempts error before any content; third succeeds. With
+        // max_retries=2 the run must recover and produce the success text.
+        let mut config = test_config(vec![]);
+        config.stream_fn = std::sync::Arc::new(FlakyStream {
+            failures: 2,
+            success: vec![StreamChunk::TextDelta("ok".into()), StreamChunk::Done],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        config.retry = crate::RetryPolicy {
+            max_retries: 2,
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+        };
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+        let ok = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a)
+                if a.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "ok")))
+        });
+        assert!(ok, "expected retry to recover and produce 'ok'");
+    }
+
+    #[tokio::test]
+    async fn loop_does_not_retry_after_content_emitted() {
+        // Stream emits text then errors mid-stream. Retry must NOT fire (would
+        // duplicate emitted content); the error surfaces as stop_reason::Error.
+        let mut config = test_config(vec![
+            StreamChunk::TextDelta("partial".into()),
+            StreamChunk::Error("mid-stream boom".into()),
+        ]);
+        config.retry = crate::RetryPolicy {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+        };
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+        let mut text_deltas = 0u32;
+        let msgs = run_agent_loop(vec![], context, config, |ev| {
+            if matches!(
+                ev,
+                AgentEvent::MessageUpdate {
+                    delta: ContentDelta::TextDelta(_)
+                }
+            ) {
+                text_deltas += 1;
+            }
+        })
+        .await
+        .unwrap();
+        let errored = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a)
+                if matches!(a.stop_reason, StopReason::Error(_)))
+        });
+        assert_eq!(text_deltas, 1, "mid-stream error must not retry (would re-emit content)");
+        assert!(errored, "mid-stream error should surface as stop_reason::Error");
     }
 }

@@ -47,7 +47,8 @@ impl JsonlStorage {
         self.base_dir.join(session_id)
     }
 
-    fn messages_path(&self, session_id: &str) -> PathBuf {
+    /// Path to a session's `messages.jsonl` (whether or not it exists yet).
+    pub fn messages_path(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id).join("messages.jsonl")
     }
 
@@ -71,6 +72,35 @@ impl JsonlStorage {
         let line = serde_json::to_string(msg)?;
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
+        Ok(())
+    }
+
+    /// Append a batch of messages in order. Creates the session directory once
+    /// and writes all lines to a single open file handle. Hosts call this after
+    /// a run to persist the returned `Vec<AgentMessage>` transcript.
+    pub async fn append_messages(
+        &self,
+        session_id: &str,
+        msgs: &[AgentMessage],
+    ) -> Result<(), AgentError> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let path = self.messages_path(session_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        for msg in msgs {
+            let line = serde_json::to_string(msg)?;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
         Ok(())
     }
 
@@ -146,6 +176,30 @@ mod tests {
         assert!(
             matches!(&loaded[1], AgentMessage::User(u) if matches!(&u.content[0], ContentBlock::Text { text } if text == "world"))
         );
+    }
+
+    #[tokio::test]
+    async fn append_messages_batch_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlStorage::new(tmp.path());
+        let batch = vec![user_msg("a"), user_msg("b"), user_msg("c")];
+        store.append_messages("s1", &batch).await.unwrap();
+
+        let loaded = store.load_messages("s1").await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(
+            store.messages_path("s1"),
+            tmp.path().join("s1").join("messages.jsonl")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_messages_empty_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlStorage::new(tmp.path());
+        store.append_messages("s1", &[]).await.unwrap();
+        // No file created for an empty batch.
+        assert!(!store.messages_path("s1").exists());
     }
 
     #[tokio::test]

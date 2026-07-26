@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_fn: Arc::new(MockThatCallsHello),
         // The before/after hooks plugins registered are now live.
         hooks: Some(Arc::new(api)),
+        retry: gasket_core::RetryPolicy::default(),
     };
 
     let msgs = gasket_core::agent_loop(vec![user_msg], context, config).await?;
