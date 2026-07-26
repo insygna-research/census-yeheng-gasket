@@ -23,6 +23,9 @@ pub fn tool() -> ToolDefinition {
 }
 
 async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+    if ctx.aborted() {
+        return Ok(ToolResult::error("aborted".to_string()));
+    }
     let path = ctx.args["path"]
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("path is required".into()))?;

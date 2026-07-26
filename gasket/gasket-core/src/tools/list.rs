@@ -1,6 +1,12 @@
 //! `list` tool — list directory entries, optionally recursive with a glob.
+//!
+//! Walking is `.gitignore`-aware (via the `ignore` crate) and always prunes
+//! build/VCS/dependency trees ([`ALWAYS_IGNORE`]) so tool output stays bounded
+//! even when those dirs aren't gitignored.
 
 use std::sync::Arc;
+
+use ignore::WalkBuilder;
 
 use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
@@ -8,11 +14,16 @@ use crate::ContentBlock;
 /// Cap the number of entries returned so tool output stays bounded.
 const MAX_ENTRIES: usize = 2000;
 
+/// Directories always pruned, even when not in `.gitignore`: VCS metadata,
+/// Rust/Cargo build output, JS dependency trees. Pruned at the directory level
+/// so we never descend into them (`target/` alone can hold thousands of files).
+const ALWAYS_IGNORE: &[&str] = &[".git", "target", "node_modules"];
+
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "list".into(),
         label: "List".into(),
-        description: "List directory entries. Optional recursive + glob pattern.".into(),
+        description: "List directory entries (gitignore-aware). Optional recursive + glob pattern.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -26,6 +37,9 @@ pub fn tool() -> ToolDefinition {
 }
 
 async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+    if ctx.aborted() {
+        return Ok(ToolResult::error("aborted".to_string()));
+    }
     let path = ctx.args["path"].as_str().unwrap_or(".");
     let recursive = ctx.args["recursive"].as_bool().unwrap_or(false);
     let pattern = ctx.args["pattern"].as_str();
@@ -35,17 +49,37 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         return Ok(ToolResult::error(format!("path not found: {}", path)));
     }
 
-    let mut entries: Vec<String> = Vec::new();
-    let walker = if recursive {
-        walkdir::WalkDir::new(&base)
-    } else {
-        walkdir::WalkDir::new(&base).max_depth(1)
-    };
-
     let glob_pat = pattern.and_then(|p| glob::Pattern::new(p).ok());
-    for entry in walker.into_iter().filter_map(|e| e.ok()) {
+
+    let mut builder = WalkBuilder::new(&base);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .filter_entry(|entry| {
+            // Prune always-ignore dirs at the directory level (see ALWAYS_IGNORE).
+            entry.file_type().is_none_or(|ft| {
+                !ft.is_dir()
+                    || entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| !ALWAYS_IGNORE.contains(&name))
+                        .unwrap_or(true)
+            })
+        });
+    if !recursive {
+        builder.max_depth(Some(1));
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    for entry in builder.build().filter_map(|e| e.ok()) {
         if entries.len() >= MAX_ENTRIES {
             break;
+        }
+        if ctx.aborted() {
+            return Ok(ToolResult::error("aborted".to_string()));
         }
         let rel = entry
             .path()
@@ -61,7 +95,11 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
                 continue;
             }
         }
-        let suffix = if entry.file_type().is_dir() { "/" } else { "" };
+        let suffix = if entry.file_type().is_some_and(|t| t.is_dir()) {
+            "/"
+        } else {
+            ""
+        };
         entries.push(format!("{}{}", rel, suffix));
     }
 
@@ -96,16 +134,20 @@ mod tests {
         .unwrap()
     }
 
+    fn text_of(r: &ToolResult) -> String {
+        match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
     #[tokio::test]
     async fn lists_top_level() {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
         tokio::fs::create_dir(tmp.path().join("sub")).await.unwrap();
         let r = run(serde_json::json!({}), tmp.path()).await;
-        let text = match &r.content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            _ => panic!(),
-        };
+        let text = text_of(&r);
         assert!(text.contains("a.rs"));
         assert!(text.contains("sub/"));
     }
@@ -123,11 +165,44 @@ mod tests {
             tmp.path(),
         )
         .await;
-        let text = match &r.content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            _ => panic!(),
-        };
+        let text = text_of(&r);
         assert!(text.contains("b.txt"));
         assert!(!text.contains("a.rs"));
+    }
+
+    #[tokio::test]
+    async fn prunes_target_dir() {
+        // target/ must be pruned even with no .gitignore.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("keep.rs"), "").await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("target/debug"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("target/debug/junk.o"), "")
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"recursive": true}), tmp.path()).await;
+        let text = text_of(&r);
+        assert!(text.contains("keep.rs"));
+        assert!(!text.contains("target"), "target/ leaked into output: {text}");
+    }
+
+    #[tokio::test]
+    async fn respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The `ignore` crate applies `.gitignore` only inside a git repo. An
+        // empty `.git` marker is enough to establish the repo root.
+        tokio::fs::create_dir(tmp.path().join(".git")).await.unwrap();
+        tokio::fs::write(tmp.path().join(".gitignore"), "*.log\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
+        tokio::fs::write(tmp.path().join("noisy.log"), "")
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({}), tmp.path()).await;
+        let text = text_of(&r);
+        assert!(text.contains("a.rs"));
+        assert!(!text.contains("noisy.log"), "gitignored file leaked: {text}");
     }
 }

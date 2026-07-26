@@ -27,6 +27,9 @@ pub fn tool() -> ToolDefinition {
 }
 
 async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+    if ctx.aborted() {
+        return Ok(ToolResult::error("aborted".to_string()));
+    }
     let path = ctx.args["path"]
         .as_str()
         .ok_or_else(|| crate::error::ToolError::Message("path is required".into()))?;
@@ -124,5 +127,28 @@ mod tests {
         assert!(text.contains("3"));
         assert!(!text.contains("1\t"));
         assert!(!text.contains("4"));
+    }
+
+    #[tokio::test]
+    async fn aborts_on_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "secret")
+            .await
+            .unwrap();
+        let t = tool();
+        let r = (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args: serde_json::json!({"path": "f.txt"}),
+            signal: Arc::new(AtomicBool::new(true)),
+            ctx: ToolContext {
+                cwd: tmp.path().to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(r.is_error);
     }
 }

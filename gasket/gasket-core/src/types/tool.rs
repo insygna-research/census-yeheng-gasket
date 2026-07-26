@@ -51,6 +51,15 @@ pub struct ToolCallCtx {
     pub ctx: ToolContext,
 }
 
+impl ToolCallCtx {
+    /// True if the caller has requested this invocation be cancelled. Tools
+    /// should check this at entry and inside long loops, returning promptly
+    /// (e.g. an "aborted" error) when set.
+    pub fn aborted(&self) -> bool {
+        self.signal.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Context passed into a tool. `state_dir` is this plugin's **private** state
 /// directory (`~/.gasket/tool_state/{plugin}/`); the tool reads/writes its own
 /// files there.

@@ -42,11 +42,15 @@ uuid = { workspace = true }
 # Home/config dir lookup
 dirs = { workspace = true }
 
-# File walking (list tool)
-walkdir = "2"
+# Gitignore-aware directory walking (list + grep tools). Bundles `walkdir` +
+# `globset`, so we no longer depend on `walkdir` directly.
+ignore = "0.4"
 
 # Glob matching (list tool)
 glob = "0.3"
+
+# Regex matching (grep tool)
+regex = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

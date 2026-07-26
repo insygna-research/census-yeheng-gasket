@@ -81,6 +81,10 @@ impl StreamFn for AnthropicProvider {
         let api_key = self.api_key.clone();
 
         tracing::debug!(url = %url, model = %model.id, "anthropic request");
+        tracing::debug!(
+            request_body = %serde_json::to_string(&body).unwrap_or_default(),
+            "anthropic request body"
+        );
 
         Box::pin(async_stream::stream! {
             let resp = match client

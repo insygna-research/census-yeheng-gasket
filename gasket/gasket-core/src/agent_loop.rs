@@ -190,6 +190,10 @@ where
         if i >= config.max_tool_calls_per_turn {
             break;
         }
+        // Cooperative abort between tool calls in a batch.
+        if is_aborted(config) {
+            break;
+        }
 
         // Parse the accumulated tool-call arguments. Empty -> `{}` (a tool may
         // take no params); malformed JSON -> feed the parse error back to the
@@ -362,6 +366,12 @@ where
     let mut usage = None;
 
     while let Some(chunk) = stream.next().await {
+        // Cooperative abort: stop accumulating as soon as the signal is set.
+        if is_aborted(config) {
+            tracing::info!("provider stream aborted");
+            accumulated.stop_reason = StopReason::Aborted;
+            break;
+        }
         match chunk {
             StreamChunk::TextDelta(t) => {
                 accumulated.append_text(&t);
@@ -405,7 +415,8 @@ where
     }
 
     // If the model emitted tool calls, the turn continues; otherwise it ended.
-    if accumulated.stop_reason != StopReason::Error(String::new()) {
+    // Preserve an explicit Abort set during streaming so the outer loop stops.
+    if accumulated.stop_reason != StopReason::Aborted {
         accumulated.stop_reason = if accumulated
             .content
             .iter()
@@ -907,5 +918,130 @@ mod tests {
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("tool not found"))))
         });
         assert!(has_error_result, "expected a not-found tool_result, not a crash");
+    }
+
+    /// A mock that flips the abort signal on when streaming starts, then yields
+    /// a text delta + Done. Exercises the in-stream abort check.
+    struct FlipOnStream;
+    impl StreamFn for FlipOnStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[crate::types::tool::ToolDefinition],
+            signal: Option<std::sync::Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            if let Some(s) = signal {
+                s.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Box::pin(stream::iter(vec![
+                StreamChunk::TextDelta("partial".into()),
+                StreamChunk::Done,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_aborts_during_stream() {
+        // The signal flips during streaming (the mock sets it when stream() is
+        // called), so the top-of-turn guard doesn't fire first. The stream must
+        // stop after the first chunk and carry StopReason::Aborted.
+        let config = AgentLoopConfig {
+            model: ModelSpec {
+                id: "test".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 1024,
+                supports_thinking: false,
+            },
+            thinking_level: ThinkingLevel::Off,
+            max_turns: 5,
+            max_tool_calls_per_turn: 5,
+            api_key: None,
+            signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
+            stream_fn: std::sync::Arc::new(FlipOnStream),
+            hooks: None,
+        };
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let aborted = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a) if a.stop_reason == StopReason::Aborted)
+        });
+        assert!(aborted, "expected an assistant message with stop_reason Aborted");
+    }
+
+    #[tokio::test]
+    async fn loop_aborts_mid_tool_batch() {
+        // Two tool calls in one turn. The first (`set_abort`) flips the signal;
+        // the second (`echo`) must NOT execute.
+        let set_abort = crate::types::tool::ToolDefinition {
+            name: "set_abort".into(),
+            label: "SetAbort".into(),
+            description: "sets abort".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move {
+                    c.signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(crate::types::tool::ToolResult::text("flipped"))
+                })
+            }),
+        };
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+            }),
+        };
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("set_abort".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                id: "t2".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        config.signal =
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![set_abort, echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let ran_set_abort = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "set_abort")
+        });
+        let ran_echo = msgs
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "echo"));
+        assert!(ran_set_abort, "first tool should have executed before abort");
+        assert!(!ran_echo, "second tool must not execute after abort");
     }
 }
