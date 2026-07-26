@@ -14,3 +14,4 @@ gasket-core = { workspace = true }
 reedline = { workspace = true }
 tokio = { workspace = true }
 colored = { workspace = true }
+serde_json = { workspace = true }
