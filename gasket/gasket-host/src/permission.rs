@@ -29,9 +29,12 @@ pub enum RiskLevel {
     High,
 }
 
+/// 工具审批闭包：`(tool_name, args) -> 是否允许`。
+pub type Approver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
+
 pub struct PermissionPolicy {
     mode: AtomicU8,
-    approver: Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>,
+    approver: Approver,
 }
 
 impl PermissionPolicy {
@@ -68,12 +71,7 @@ impl PermissionPolicy {
 }
 
 impl HookChain for PermissionPolicy {
-    fn before_tool_call(
-        &self,
-        _id: &str,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> ToolCallVerdict {
+    fn before_tool_call(&self, _id: &str, name: &str, args: &serde_json::Value) -> ToolCallVerdict {
         let risk = Self::risk_of(name);
         match (self.mode(), risk) {
             (Mode::FullAuto, _) => ToolCallVerdict::Allow,
@@ -104,19 +102,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn approver(
-        allow: bool,
-    ) -> (
-        Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>,
-        Arc<AtomicUsize>,
-    ) {
+    fn approver(allow: bool) -> (Approver, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let f: Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync> =
-            Arc::new(move |_n, _a| {
-                c.fetch_add(1, Ordering::SeqCst);
-                allow
-            });
+        let f: Approver = Arc::new(move |_n, _a| {
+            c.fetch_add(1, Ordering::SeqCst);
+            allow
+        });
         (f, calls)
     }
 

@@ -21,10 +21,14 @@ impl<W: Write> EventPrinter<W> {
                 ContentDelta::ThinkingDelta(_) => {}
                 ContentDelta::ToolCallDelta { .. } => {}
             },
-            AgentEvent::ToolExecutionStart { tool_name, args, .. } => {
+            AgentEvent::ToolExecutionStart {
+                tool_name, args, ..
+            } => {
                 let _ = writeln!(self.out, "\n-> {tool_name} {}", args);
             }
-            AgentEvent::ToolExecutionEnd { result, is_error, .. } => {
+            AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } => {
                 let first = result
                     .content
                     .iter()
@@ -39,7 +43,11 @@ impl<W: Write> EventPrinter<W> {
             }
             AgentEvent::AfterProviderResponse { response, .. } => {
                 if let Some(u) = &response.usage {
-                    let _ = writeln!(self.out, "\n[in: {}, out: {}]", u.input_tokens, u.output_tokens);
+                    let _ = writeln!(
+                        self.out,
+                        "\n[in: {}, out: {}]",
+                        u.input_tokens, u.output_tokens
+                    );
                 }
             }
             AgentEvent::TurnEnd { .. } => {
@@ -65,7 +73,6 @@ mod tests {
         p.on_event(&AgentEvent::MessageUpdate {
             delta: ContentDelta::TextDelta(" there".into()),
         });
-        drop(p);
         assert_eq!(String::from_utf8(buf).unwrap(), "Hi there");
     }
 
@@ -84,7 +91,6 @@ mod tests {
             model: "m".into(),
             response: msg,
         });
-        drop(p);
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("in: 42") && s.contains("out: 7"));
     }
