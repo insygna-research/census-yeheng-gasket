@@ -137,7 +137,10 @@ fn fuzzy_locate(original: &str, old_text: &str) -> Fuzzy {
             let end_char = norm_file[..end_byte].chars().count(); // exclusive
             let orig_start = map[start_char];
             let last_off = map[end_char - 1];
-            let last_len = original[last_off..].chars().next().map_or(0, |c| c.len_utf8());
+            let last_len = original[last_off..]
+                .chars()
+                .next()
+                .map_or(0, |c| c.len_utf8());
             Fuzzy::Unique(orig_start, last_off + last_len)
         }
         n => Fuzzy::Many(n),

@@ -78,24 +78,18 @@ impl AssistantMessage {
     /// (and `name`) on every delta after the first. When `id` is empty we
     /// therefore append to the most recent tool call instead of matching by id
     /// - this holds for sequential streaming (the common case). Truly
-    /// parallel/interleaved tool calls would need index-based tracking.
+    ///   parallel/interleaved tool calls would need index-based tracking.
     pub fn append_tool_call(&mut self, id: String, name: Option<String>, args_delta: String) {
         let target = if id.is_empty() {
-            self.content
-                .iter_mut()
-                .rev()
-                .find_map(|b| match b {
-                    ContentBlock::ToolCall { tool_call: tc } => Some(tc),
-                    _ => None,
-                })
+            self.content.iter_mut().rev().find_map(|b| match b {
+                ContentBlock::ToolCall { tool_call: tc } => Some(tc),
+                _ => None,
+            })
         } else {
-            self.content
-                .iter_mut()
-                .rev()
-                .find_map(|b| match b {
-                    ContentBlock::ToolCall { tool_call: tc } if tc.id == id => Some(tc),
-                    _ => None,
-                })
+            self.content.iter_mut().rev().find_map(|b| match b {
+                ContentBlock::ToolCall { tool_call: tc } if tc.id == id => Some(tc),
+                _ => None,
+            })
         };
 
         match target {

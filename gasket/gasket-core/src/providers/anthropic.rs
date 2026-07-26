@@ -162,8 +162,7 @@ fn build_request_body(
         }]);
     }
     if !tools.is_empty() {
-        let mut tools_arr: Vec<serde_json::Value> =
-            tools.iter().map(tool_to_anthropic).collect();
+        let mut tools_arr: Vec<serde_json::Value> = tools.iter().map(tool_to_anthropic).collect();
         // Breakpoint on the last tool caches the whole tool definition block.
         if let Some(last) = tools_arr.last_mut() {
             last["cache_control"] = json!({"type": "ephemeral"});

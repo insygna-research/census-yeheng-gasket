@@ -155,7 +155,11 @@ fn fail_all_tool_calls(assistant: &AssistantMessage) -> Vec<ToolResultMessage> {
 /// during execution (missing/malformed args, unknown tool, tool-internal
 /// error). The agent loop feeds this back to the LLM so the model can retry,
 /// rather than aborting the whole run.
-fn error_tool_result(tool_call_id: &str, tool_name: &str, message: impl Into<String>) -> ToolResultMessage {
+fn error_tool_result(
+    tool_call_id: &str,
+    tool_name: &str,
+    message: impl Into<String>,
+) -> ToolResultMessage {
     ToolResultMessage {
         tool_call_id: tool_call_id.into(),
         tool_name: tool_name.into(),
@@ -389,9 +393,7 @@ where
             } => {
                 // Only retry when nothing was emitted to the host yet (so the
                 // retry is invisible) and the signal isn't already aborting.
-                let can_retry = !emitted_content
-                    && attempt <= max_retries
-                    && !is_aborted(config);
+                let can_retry = !emitted_content && attempt <= max_retries && !is_aborted(config);
                 if can_retry {
                     let delay = backoff_ms(attempt, &config.retry);
                     tracing::warn!(
@@ -426,7 +428,10 @@ enum StreamAttempt {
     Done(AssistantMessage),
     /// Stream errored. `emitted_content` tells the caller whether any content
     /// delta was already sent to the host - if so, retrying would duplicate it.
-    Errored { error: String, emitted_content: bool },
+    Errored {
+        error: String,
+        emitted_content: bool,
+    },
 }
 
 /// Run one streaming attempt: accumulate chunks into an [`AssistantMessage`],
@@ -689,7 +694,9 @@ mod tests {
             description: "echo args".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
-                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
             }),
         };
         let config = test_config(vec![
@@ -729,19 +736,28 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!echo_results.is_empty(), "expected at least one echo tool result");
+        assert!(
+            !echo_results.is_empty(),
+            "expected at least one echo tool result"
+        );
         for tr in &echo_results {
             let text = match &tr.content[0] {
                 ContentBlock::Text { text } => text.clone(),
                 _ => panic!("expected text content"),
             };
-            assert!(text.contains("\"x\":1"), "expected assembled args, got: {text}");
+            assert!(
+                text.contains("\"x\":1"),
+                "expected assembled args, got: {text}"
+            );
         }
         // The bug would leak the args fragment into a split empty-name call.
         let split = msgs
             .iter()
             .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name.is_empty()));
-        assert!(!split, "chunked args leaked into a split empty-name tool call");
+        assert!(
+            !split,
+            "chunked args leaked into a split empty-name tool call"
+        );
     }
 
     /// A `before_tool_call` handler that blocks the `bash` tool.
@@ -913,9 +929,7 @@ mod tests {
             description: "always fails".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|_c: ToolCallCtx| {
-                Box::pin(async move {
-                    Err(crate::error::ToolError::Message("boom".into()))
-                })
+                Box::pin(async move { Err(crate::error::ToolError::Message("boom".into())) })
             }),
         };
         let config = test_config(vec![
@@ -944,7 +958,10 @@ mod tests {
                 if tr.tool_name == "boom" && tr.is_error
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("boom"))))
         });
-        assert!(has_error_result, "expected an error tool_result, not a crash");
+        assert!(
+            has_error_result,
+            "expected an error tool_result, not a crash"
+        );
     }
 
     #[tokio::test]
@@ -957,7 +974,9 @@ mod tests {
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
-                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
             }),
         };
         let config = test_config(vec![
@@ -986,7 +1005,10 @@ mod tests {
                 if tr.tool_name == "echo" && tr.is_error
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("failed to parse tool arguments"))))
         });
-        assert!(has_error_result, "expected a parse-error tool_result, not a crash");
+        assert!(
+            has_error_result,
+            "expected a parse-error tool_result, not a crash"
+        );
     }
 
     #[tokio::test]
@@ -1019,7 +1041,10 @@ mod tests {
                 if tr.tool_name == "ghost" && tr.is_error
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("tool not found"))))
         });
-        assert!(has_error_result, "expected a not-found tool_result, not a crash");
+        assert!(
+            has_error_result,
+            "expected a not-found tool_result, not a crash"
+        );
     }
 
     /// A mock that flips the abort signal on when streaming starts, then yields
@@ -1077,10 +1102,13 @@ mod tests {
             .await
             .unwrap();
 
-        let aborted = msgs.iter().any(|m| {
-            matches!(m, AgentMessage::Assistant(a) if a.stop_reason == StopReason::Aborted)
-        });
-        assert!(aborted, "expected an assistant message with stop_reason Aborted");
+        let aborted = msgs.iter().any(
+            |m| matches!(m, AgentMessage::Assistant(a) if a.stop_reason == StopReason::Aborted),
+        );
+        assert!(
+            aborted,
+            "expected an assistant message with stop_reason Aborted"
+        );
     }
 
     #[tokio::test]
@@ -1105,7 +1133,9 @@ mod tests {
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
-                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
             }),
         };
         let mut config = test_config(vec![
@@ -1121,8 +1151,9 @@ mod tests {
             },
             StreamChunk::Done,
         ]);
-        config.signal =
-            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        config.signal = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
 
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1137,13 +1168,16 @@ mod tests {
             .await
             .unwrap();
 
-        let ran_set_abort = msgs.iter().any(|m| {
-            matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "set_abort")
-        });
+        let ran_set_abort = msgs
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "set_abort"));
         let ran_echo = msgs
             .iter()
             .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "echo"));
-        assert!(ran_set_abort, "first tool should have executed before abort");
+        assert!(
+            ran_set_abort,
+            "first tool should have executed before abort"
+        );
         assert!(!ran_echo, "second tool must not execute after abort");
     }
 
@@ -1163,9 +1197,7 @@ mod tests {
             _tools: &[crate::types::tool::ToolDefinition],
             _signal: Option<std::sync::Arc<AtomicBool>>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
-            let n = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < self.failures {
                 Box::pin(stream::iter(vec![StreamChunk::Error("transient".into())]))
             } else {
@@ -1245,8 +1277,14 @@ mod tests {
             matches!(m, AgentMessage::Assistant(a)
                 if matches!(a.stop_reason, StopReason::Error(_)))
         });
-        assert_eq!(text_deltas, 1, "mid-stream error must not retry (would re-emit content)");
-        assert!(errored, "mid-stream error should surface as stop_reason::Error");
+        assert_eq!(
+            text_deltas, 1,
+            "mid-stream error must not retry (would re-emit content)"
+        );
+        assert!(
+            errored,
+            "mid-stream error should surface as stop_reason::Error"
+        );
     }
 
     #[tokio::test]
@@ -1259,12 +1297,22 @@ mod tests {
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
-                Box::pin(async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) })
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
             }),
         };
         let mut config = test_config(vec![
-            StreamChunk::ToolCallDelta { id: "t1".into(), name: Some("echo".into()), args_delta: "{}".into() },
-            StreamChunk::ToolCallDelta { id: "t2".into(), name: Some("echo".into()), args_delta: "{}".into() },
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                id: "t2".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
             StreamChunk::Done,
         ]);
         config.max_tool_calls_per_turn = 1;
@@ -1276,13 +1324,18 @@ mod tests {
             env: Default::default(),
             session_id: "s".into(),
         };
-        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
         // t2 must surface as an error tool_result mentioning the limit.
         let dropped = msgs.iter().any(|m| {
             matches!(m, AgentMessage::ToolResult(tr)
                 if tr.is_error && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("tool call limit"))))
         });
-        assert!(dropped, "over-limit call must be reported as an error, not dropped silently");
+        assert!(
+            dropped,
+            "over-limit call must be reported as an error, not dropped silently"
+        );
     }
 
     #[tokio::test]
@@ -1290,8 +1343,14 @@ mod tests {
         // Two complementary Usage chunks (Anthropic shape: input then output).
         // Final usage must hold both, not just the last one.
         let config = test_config(vec![
-            StreamChunk::Usage { input: 42, output: 0 },
-            StreamChunk::Usage { input: 0, output: 7 },
+            StreamChunk::Usage {
+                input: 42,
+                output: 0,
+            },
+            StreamChunk::Usage {
+                input: 0,
+                output: 7,
+            },
             StreamChunk::Done,
         ]);
         let context = AgentContext {
@@ -1302,7 +1361,9 @@ mod tests {
             env: Default::default(),
             session_id: "s".into(),
         };
-        let msgs = run_agent_loop(vec![], context, config, |_| {}).await.unwrap();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
         let merged = msgs.iter().any(|m| {
             matches!(m, AgentMessage::Assistant(a)
                 if a.usage.as_ref().is_some_and(|u| u.input_tokens == 42 && u.output_tokens == 7))

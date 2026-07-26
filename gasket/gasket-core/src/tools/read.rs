@@ -164,11 +164,7 @@ mod tests {
             .await
             .unwrap();
         // `..` that would go above cwd -> rejected.
-        let r = run(
-            serde_json::json!({"path": "../../etc/passwd"}),
-            tmp.path(),
-        )
-        .await;
+        let r = run(serde_json::json!({"path": "../../etc/passwd"}), tmp.path()).await;
         assert!(r.is_error, "path escape must be rejected");
         // absolute path -> rejected.
         let r = run(serde_json::json!({"path": "/etc/passwd"}), tmp.path()).await;

@@ -16,6 +16,12 @@ pub struct SessionManager {
     current_id: String,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::with_root(JsonlStorage::default_root().base_dir_clone())
@@ -25,7 +31,10 @@ impl SessionManager {
     pub fn with_root(root: PathBuf) -> Self {
         let storage = JsonlStorage::new(root);
         let current_id = uuid::Uuid::new_v4().to_string();
-        Self { storage, current_id }
+        Self {
+            storage,
+            current_id,
+        }
     }
 
     pub fn current_id(&self) -> &str {
@@ -80,7 +89,11 @@ impl SessionManager {
                 .await
                 .map(|v| v.len())
                 .unwrap_or(0);
-            out.push(SessionInfo { id, mtime, msg_count });
+            out.push(SessionInfo {
+                id,
+                mtime,
+                msg_count,
+            });
         }
         Ok(out)
     }

@@ -23,7 +23,8 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "list".into(),
         label: "List".into(),
-        description: "List directory entries (gitignore-aware). Optional recursive + glob pattern.".into(),
+        description: "List directory entries (gitignore-aware). Optional recursive + glob pattern."
+            .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -174,7 +175,9 @@ mod tests {
     async fn prunes_target_dir() {
         // target/ must be pruned even with no .gitignore.
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("keep.rs"), "").await.unwrap();
+        tokio::fs::write(tmp.path().join("keep.rs"), "")
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(tmp.path().join("target/debug"))
             .await
             .unwrap();
@@ -184,7 +187,10 @@ mod tests {
         let r = run(serde_json::json!({"recursive": true}), tmp.path()).await;
         let text = text_of(&r);
         assert!(text.contains("keep.rs"));
-        assert!(!text.contains("target"), "target/ leaked into output: {text}");
+        assert!(
+            !text.contains("target"),
+            "target/ leaked into output: {text}"
+        );
     }
 
     #[tokio::test]
@@ -192,7 +198,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // The `ignore` crate applies `.gitignore` only inside a git repo. An
         // empty `.git` marker is enough to establish the repo root.
-        tokio::fs::create_dir(tmp.path().join(".git")).await.unwrap();
+        tokio::fs::create_dir(tmp.path().join(".git"))
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join(".gitignore"), "*.log\n")
             .await
             .unwrap();
@@ -203,6 +211,9 @@ mod tests {
         let r = run(serde_json::json!({}), tmp.path()).await;
         let text = text_of(&r);
         assert!(text.contains("a.rs"));
-        assert!(!text.contains("noisy.log"), "gitignored file leaked: {text}");
+        assert!(
+            !text.contains("noisy.log"),
+            "gitignored file leaked: {text}"
+        );
     }
 }

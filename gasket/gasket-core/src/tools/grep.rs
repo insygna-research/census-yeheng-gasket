@@ -27,7 +27,9 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "grep".into(),
         label: "Grep".into(),
-        description: "Search file contents by regex (ripgrep when available). Returns path:line:match.".into(),
+        description:
+            "Search file contents by regex (ripgrep when available). Returns path:line:match."
+                .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -149,9 +151,7 @@ async fn grep_rg(
     // Exit 0 = matches, 1 = no matches, 2+ = error.
     if let Some(code) = output.status.code() {
         if code >= 2 {
-            return Err(String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .to_string());
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
     }
 
@@ -294,7 +294,14 @@ mod tests {
             .unwrap();
         let re = Regex::new("beta").unwrap();
         let glob = None;
-        let (matches, aborted) = grep_builtin(&re, tmp.path(), "a.txt", glob, 100, &Arc::new(AtomicBool::new(false)));
+        let (matches, aborted) = grep_builtin(
+            &re,
+            tmp.path(),
+            "a.txt",
+            glob,
+            100,
+            &Arc::new(AtomicBool::new(false)),
+        );
         assert!(!aborted);
         assert_eq!(matches, vec!["a.txt:2:beta".to_string()]);
     }
