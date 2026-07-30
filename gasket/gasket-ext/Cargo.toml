@@ -1,0 +1,11 @@
+[package]
+name = "gasket-ext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional in-process extension crates for gasket (register via ExtensionApi)"
+
+[dependencies]
+gasket-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -33,9 +33,6 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 async-stream = "0.3"
 
-# cdylib plugin loading
-libloading = "0.9"
-
 # IDs
 uuid = { workspace = true }
 
@@ -58,3 +55,5 @@ tracing-subscriber = { workspace = true }
 tempfile = "3"
 # .env loading for example hosts (the library itself stays process-env-only).
 dotenvy = "0.15"
+# Example host uses the real extension crate (same register shape as production).
+gasket-ext = { path = "../gasket-ext" }

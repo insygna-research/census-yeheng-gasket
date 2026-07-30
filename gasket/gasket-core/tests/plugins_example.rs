@@ -1,27 +1,13 @@
-//! Integration test: the example plugins work end-to-end against the agent
-//! loop (mock provider).
-//!
-//! This is the "proof the examples are correct" layer: it registers the
-//! example plugins' tools/hooks into a real `ExtensionApiImpl`, wires the hook
-//! chain into `AgentLoopConfig`, and asserts the agent loop produces the
-//! expected tool results.
-//!
-//! The example plugin source lives in `examples/plugins/` (not in the lib
-//! path), so the tool/handler definitions are reconstructed here to the same
-//! spec. `agent_loop::tests::before_hook_blocks_tool` already covers the
-//! permission_gate path against the real loop.
+//! Integration: `gasket-ext` register shapes against the agent loop (mock).
 
 use std::sync::Arc;
 
 use futures_util::{stream, Stream};
-use gasket_core::extension::BeforeToolCallHandler;
 use gasket_core::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApi,
-    ExtensionApiImpl, ExtensionContext, ModelSpec, ProviderApi, StreamChunk, StreamFn,
-    ThinkingLevel, ToolCallVerdict, ToolDefinition, ToolResult,
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApiImpl,
+    ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel, ToolDefinition,
 };
 
-// ── a mock provider that calls a named tool once, then ends ───────────────
 struct CallToolOnce {
     tool: String,
     args: serde_json::Value,
@@ -48,7 +34,12 @@ impl StreamFn for CallToolOnce {
     }
 }
 
-fn hello_config(tools: Vec<ToolDefinition>) -> (AgentContext, AgentLoopConfig) {
+#[tokio::test]
+async fn hello_extension_greets() {
+    let mut api = ExtensionApiImpl::new();
+    gasket_ext::hello::register(&mut api);
+    let tools = std::mem::take(&mut api.tools);
+
     let ctx = AgentContext {
         system_prompt: "".into(),
         messages: vec![],
@@ -75,26 +66,7 @@ fn hello_config(tools: Vec<ToolDefinition>) -> (AgentContext, AgentLoopConfig) {
         hooks: None,
         retry: gasket_core::RetryPolicy::default(),
     };
-    (ctx, cfg)
-}
 
-#[tokio::test]
-async fn hello_plugin_greets() {
-    let mut api = ExtensionApiImpl::new();
-    // Same tool the hello example registers.
-    api.register_tool(ToolDefinition {
-        name: "hello".into(),
-        label: "Hello".into(),
-        description: "greet".into(),
-        parameters: serde_json::json!({"type": "object"}),
-        execute: Arc::new(|c| {
-            Box::pin(async move {
-                let name = c.args["name"].as_str().unwrap_or("world");
-                Ok(ToolResult::text(format!("Hello, {}!", name)))
-            })
-        }),
-    });
-    let (ctx, cfg) = hello_config(std::mem::take(&mut api.tools));
     let msgs = gasket_core::agent_loop(vec![], ctx, cfg).await.unwrap();
     let greeted = msgs.iter().any(|m| {
         matches!(m, AgentMessage::ToolResult(tr) if tr.content.iter()
@@ -105,34 +77,17 @@ async fn hello_plugin_greets() {
 
 #[tokio::test]
 async fn permission_gate_blocks_bash() {
-    // A gate identical to the permission_gate example.
-    struct Gate;
-    impl BeforeToolCallHandler for Gate {
-        fn call(
-            &self,
-            _id: &str,
-            tool: &str,
-            args: &serde_json::Value,
-            _ctx: &ExtensionContext,
-        ) -> ToolCallVerdict {
-            if tool == "bash" && args["command"].as_str().unwrap_or("").contains("rm -rf") {
-                ToolCallVerdict::Block("refused".into())
-            } else {
-                ToolCallVerdict::Allow
-            }
-        }
-    }
-
     let mut api = ExtensionApiImpl::new();
-    api.register_before_tool_call(Box::new(Gate));
+    gasket_ext::permission_gate::register(&mut api);
 
-    // A bash tool that would run if not blocked.
     let bash = ToolDefinition {
         name: "bash".into(),
         label: "Bash".into(),
         description: "shell".into(),
         parameters: serde_json::json!({"type": "object"}),
-        execute: Arc::new(|_| Box::pin(async { Ok(ToolResult::text("RAN")) })),
+        execute: Arc::new(|_| {
+            Box::pin(async { Ok(gasket_core::ToolResult::text("RAN")) })
+        }),
     };
 
     let agent_ctx = AgentContext {
@@ -177,7 +132,6 @@ async fn permission_gate_blocks_bash() {
     .unwrap();
 
     assert!(saw_block, "bash should have been blocked");
-    // And the dangerous command must NOT have produced a "RAN" result.
     let ran = msgs.iter().any(|m| {
         matches!(m, AgentMessage::ToolResult(tr) if tr.content.iter()
             .any(|b| matches!(b, ContentBlock::Text { text } if text == "RAN")))

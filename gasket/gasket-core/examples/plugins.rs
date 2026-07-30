@@ -1,21 +1,8 @@
-//! Example host that loads the 3 example plugins in-process and runs a turn.
+//! Example host: link `gasket-ext` in-process and run one turn (mock provider).
 //!
-//! This is the runnable demonstration of the plugins in `examples/plugins/`.
-//! It does NOT load cdylibs (that path is covered by `loader` unit tests);
-//! instead it calls each plugin's `register` directly into an
-//! `ExtensionApiImpl`, wires the hook chain into `AgentLoopConfig`, and runs
-//! the agent loop with a mock provider.
-//!
-//! Real hosts would use `gasket_core::extension::discover_plugins` +
-//! `load_plugin` to load `.so`/`.dylib` files instead — same effect, different
-//! loading mechanism.
-
-#[path = "plugins/hello.rs"]
-mod hello;
-#[path = "plugins/permission_gate.rs"]
-mod permission_gate;
-#[path = "plugins/todo_list.rs"]
-mod todo_list;
+//! ```bash
+//! cargo run -p gasket-core --example plugins
+//! ```
 
 use std::sync::Arc;
 
@@ -32,14 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let mut api = ExtensionApiImpl::new();
+    gasket_ext::register_all(&mut api);
 
-    // Plugins populate the api: tools + hook handlers.
-    hello::register(&mut api);
-    todo_list::register(&mut api);
-    permission_gate::register(&mut api);
-
-    // The tools plugins registered go into the context; the hook chain goes
-    // into the config.
     let context = AgentContext {
         system_prompt: "You are a helpful assistant.".into(),
         messages: vec![],
@@ -66,14 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tool_calls_per_turn: 5,
         signal: None,
         stream_fn: Arc::new(MockThatCallsHello),
-        // The before/after hooks plugins registered are now live.
         hooks: Some(Arc::new(api)),
         retry: gasket_core::RetryPolicy::default(),
     };
 
     let msgs = gasket_core::agent_loop(vec![user_msg], context, config).await?;
 
-    // Print whatever the (mocked) assistant produced.
     for m in &msgs {
         if let AgentMessage::Assistant(a) = m {
             for b in &a.content {
@@ -93,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A mock provider that emits a single `hello` tool call, then a summary.
 struct MockThatCallsHello;
 impl StreamFn for MockThatCallsHello {
     fn stream(

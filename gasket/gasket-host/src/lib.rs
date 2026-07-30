@@ -1,10 +1,16 @@
-//! gasket-host - 可复用的 host 层（配置/session/权限/事件渲染）。
+//! gasket-host - 可复用的 host 层（配置/session/权限/事件渲染/压缩/外部工具）。
+pub mod compact;
 pub mod config;
+pub mod external_tool;
+pub mod hooks;
 pub mod permission;
 pub mod printer;
 pub mod session;
 
+pub use compact::{compact_by_count, max_messages_from_env, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig};
+pub use external_tool::{commands_from_env, load_all as load_external_tools, ExternalToolBridge};
+pub use hooks::HookStack;
 pub use permission::{Mode, PermissionPolicy, RiskLevel};
 pub use printer::EventPrinter;
 pub use session::{SessionInfo, SessionManager};

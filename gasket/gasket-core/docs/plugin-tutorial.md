@@ -1,71 +1,67 @@
-# Writing a gasket Plugin
+# Writing a gasket Extension Crate
 
-A **plugin** extends the agent without touching its core. gasket's agent loop
-(`agent_loop`) is fixed; everything else — extra tools, command policies,
-audit logging — is a plugin that registers capabilities via the `ExtensionApi`.
-
-This tutorial walks through three real plugins (source in `examples/plugins/`):
-a tool, a stateful tool, and a policy hook. Each is <100 lines.
-
----
-
-## What a plugin is
-
-A plugin is a Rust crate compiled as a `cdylib` that exports one entry point:
+An **extension** adds tools or hooks without changing `agent_loop`. It is a
+normal Rust crate (workspace / path dependency) that exports:
 
 ```rust
-#[no_mangle]
-pub extern "C" fn register(api: &mut dyn ExtensionApi) {
-    // call api.register_tool / api.register_before_tool_call / ...
+pub fn register(api: &mut dyn ExtensionApi) {
+    // api.register_tool / register_before_tool_call / ...
 }
 ```
 
-The host loads it with `gasket_core::extension::load_plugin`, which:
+The **host binary** is the composition root: it calls each linked crate's
+`register` at startup, often behind Cargo features. There is **no** `.so`
+loading, no ABI version, no hot-unload.
 
-1. reads the `manifest.toml` next to the `.so`/`.dylib`,
-2. checks `gasket_abi_version` matches the host's `GASKET_ABI_VERSION` (currently `1`),
-3. calls `register`, letting the plugin wire itself in.
+Official examples: workspace crate **`gasket-ext`** (`hello`, `todo`,
+`permission_gate`). CLI: `cargo run -p gasket-cli --features ext`.
 
-That's the entire plugin protocol. No JSON-RPC, no subprocess, no serialization
-of calls — the plugin runs **in-process**, calling the agent's real types
-directly. The trade-off (see §5.1.1 of the refactor plan): a plugin must be
-compiled with the **same toolchain and dependency versions** as the host. This
-is the cdylib honesty contract.
+Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep`) live in
+`gasket-core` and are not extension crates.
 
-> For development and tests you don't need the cdylib dance — call a plugin's
-> `register(&mut api)` directly. The `examples/plugins.rs` host does exactly
-> this. The cdylib path is only for distributing a plugin as a loadable file.
+---
+
+## Host wiring
+
+```rust
+let mut api = ExtensionApiImpl::new();
+gasket_ext::register_all(&mut api); // or hello::register / todo::register
+
+let mut tools = gasket_core::built_in_tools();
+tools.extend(std::mem::take(&mut api.tools));
+
+let config = AgentLoopConfig {
+    hooks: Some(Arc::new(api)), // if hooks were registered
+    // ...
+};
+```
+
+Optional capabilities = optional **dependencies + features**, then recompile.
+That is the static-world substitute for a plugin marketplace.
 
 ---
 
 ## The `ExtensionApi` surface
 
-Everything a plugin can do is one of these methods on `&mut impl ExtensionApi`:
-
-| Method | What it does | Example plugin |
+| Method | What it does | Example |
 |---|---|---|
 | `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello`, `todo_list` |
-| `register_before_tool_call(handler)` | intercept a call before it runs (block / modify args) | `permission_gate` |
-| `register_after_tool_call(handler)` | rewrite a tool's result (redact, compress) | — |
-| `register_event_handler(handler)` | observe events (audit, persist) | — |
-| `send_message(msg)` | inject a message into the session | — |
+| `register_before_tool_call(handler)` | block / modify args before run | `permission_gate` |
+| `register_after_tool_call(handler)` | rewrite tool result | — |
+| `register_event_handler(handler)` | observe events | — |
+| `send_message(msg)` | queue a message for the host | — |
+| `current_messages()` | read session snapshot (host-filled) | — |
 
-**Events vs hooks are type-separated.** `register_event_handler` handlers
-return nothing — they observe. `register_before_tool_call` handlers return a
-`ToolCallVerdict` (`Allow` / `Block(reason)` / `Modify(args)`) that controls
-agent flow. The two cannot be confused at the type level. See §3.2 / §3.5 of
-the refactor plan.
+**Events vs hooks are type-separated.** Event handlers only observe.
+`before_tool_call` returns `ToolCallVerdict` (`Allow` / `Block` / `Modify`).
 
 ---
 
-## Example 1: `hello` — the minimum plugin
+## Example 1: `hello` — minimum extension
 
-Source: `examples/plugins/hello.rs` (~45 lines).
+Source: `gasket-ext/src/hello.rs`.
 
 ```rust
-use std::sync::Arc;
-use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolResult};
-
 pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
     api.register_tool(ToolDefinition {
         name: "hello".into(),
@@ -88,166 +84,80 @@ pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
 }
 ```
 
-Notes:
-
-- `parameters` is a raw JSON Schema. The host validates args before calling
-  `execute`; your tool gets them already-parsed in `ctx.args`.
-- `execute` is `Arc<dyn Fn(ToolCallCtx) -> BoxFuture<ToolResult>>`. The `Arc`
-  lets the agent share it across turns.
-- `details` is **plugin-private** — the agent never reads it. Use it for data
-  only your plugin cares about.
+- `parameters` is JSON Schema.
+- `details` is extension-private; the agent never reads it.
 
 ---
 
-## Example 2: `todo_list` — plugin-private state
+## Example 2: `todo` — private state files
 
-Source: `examples/plugins/todo_list.rs` (~140 lines).
+Source: `gasket-ext/src/todo.rs`.
 
-The key idea: **a plugin keeps its own state in its own files**, not in any
-agent-owned shared map. Each tool call receives a `ToolContext` with a private
-`state_dir`:
+State lives under `ToolContext.state_dir`
+(`~/.gasket/tool_state/<session_id>/<tool_name>/`), not in a shared map.
 
-```
-~/.gasket/tool_state/<session_id>/<tool_name>/todos.json
+---
+
+## Example 3: `permission_gate` — policy hook
+
+Source: `gasket-ext/src/permission_gate.rs`.
+
+`before_tool_call` can `Block` dangerous `bash` patterns; the loop skips
+execution and returns the reason to the model as an error tool result.
+
+Note: production CLI already uses `gasket_host::PermissionPolicy` as a
+`HookChain`. This example shows the same idea via `ExtensionApi`.
+
+---
+
+## Optional Cargo feature pattern
+
+```toml
+# gasket-cli already wires this:
+gasket-ext = { workspace = true, optional = true }
+[features]
+ext = ["dep:gasket-ext"]
 ```
 
 ```rust
-fn load(ctx: &gasket_core::ToolContext) -> State {
-    std::fs::read(ctx.state_dir.join("todos.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+#[cfg(feature = "ext")]
+{
+    gasket_ext::hello::register(&mut api);
+    gasket_ext::todo::register(&mut api);
 }
 ```
 
-This replaces the old "shared metadata HashMap" pattern. Benefits:
-
-- **typed**: your `State` struct, not `serde_json::Value` with key collisions.
-- **isolated**: no other plugin can clobber your keys.
-- **agent-agnostic**: the agent core never touches it.
-
-The full example supports `add` / `list` / `toggle` / `clear` and persists
-after each mutation.
+Do **not** split built-in tools into per-tool features.
 
 ---
 
-## Example 3: `permission_gate` — block dangerous commands
+## Run the examples
 
-Source: `examples/plugins/permission_gate.rs` (~45 lines).
-
-A `before_tool_call` hook runs before **every** tool call and can refuse it:
-
-```rust
-impl BeforeToolCallHandler for DangerousCommandGate {
-    fn call(&self, _id: &str, tool_name: &str, args: &serde_json::Value, _ctx: &ExtensionContext)
-        -> ToolCallVerdict
-    {
-        if tool_name == "bash" {
-            let cmd = args["command"].as_str().unwrap_or("");
-            if cmd.contains("rm -rf") || cmd.contains("sudo ") {
-                return ToolCallVerdict::Block("Refused: dangerous pattern.".into());
-            }
-        }
-        ToolCallVerdict::Allow
-    }
-}
-
-pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
-    api.register_before_tool_call(Box::new(DangerousCommandGate));
-}
+```bash
+cargo run -p gasket-core --example plugins
+cargo test -p gasket-core --test plugins_example
 ```
-
-When the model asks to run `bash` with `rm -rf`, the agent loop sees `Block`:
-it **skips execution entirely** and sends the block reason back to the model as
-an error tool result. The model then reacts (asks the user, picks a safer
-command). No dangerous command ever runs.
-
-The three verdicts:
-
-- `Allow` — proceed.
-- `Block(reason)` — refuse; `reason` becomes the tool result the model sees.
-- `Modify(new_args)` — replace the args, then execute.
-
-Multiple `before_tool_call` handlers combine: the first `Block` wins; otherwise
-the last `Modify` wins.
 
 ---
 
-## Building a plugin as a cdylib
+## External tools (non-Rust)
 
-For distribution, a plugin is its own crate:
-
-```toml
-# Cargo.toml
-[package]
-name = "hello-plugin"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-gasket-core = { path = "../../gasket-core" }
-serde_json = "1"
-```
-
-```toml
-# manifest.toml (next to the built .so/.dylib)
-name = "hello"
-version = "0.1.0"
-gasket_abi_version = 1
-description = "A greeting plugin"
-```
+For any language, host spawns a long-lived process and speaks JSONL on stdio
+(`gasket_host::ExternalToolBridge`). Example: `examples/external_echo.py`.
 
 ```bash
-cargo build --release
-# produces target/release/libhello.so (or .dylib / .dll)
+export GASKET_EXTERNAL_TOOLS="python3 path/to/external_echo.py"
+# in REPL: /reload-tools  # kill + re-list (in-process Rust extensions do not reload)
 ```
 
-Drop the built library + its `manifest.toml` into `~/.gasket/plugins/hello/`.
-The host's `discover_plugins` finds it on next start, `load_plugin` checks the
-ABI version, and calls `register`.
-
-### The ABI honesty contract
-
-`gasket_abi_version` is **independent of the crate semantic version**. It bumps
-whenever a struct layout, enum discriminant, or trait vtable changes. A plugin
-built against ABI version `1` loads into a host at ABI `1`; against ABI `2` it
-is refused. This is the only thing preventing memory corruption from a layout
-mismatch — there is no stable Rust cdylib ABI otherwise.
-
-Concretely: **rebuild your plugin whenever you upgrade gasket-core**, with the
-same `rustc` and the same major versions of shared dependencies (`tokio`,
-`reqwest`, `serde`). If you need cross-language or independently-versioned
-plugins, that is the use case for a subprocess + JSON-RPC design (not V0.1).
-
----
-
-## Running the example plugins
-
-The `plugins` example loads all three in-process (no cdylib) and runs one turn
-against a mock provider:
-
-```bash
-cargo run --example plugins
-```
-
-The integration test `tests/plugins_example.rs` proves the examples are correct
-against the real agent loop:
-
-```bash
-cargo test --test plugins_example
-```
+Protocol: `{"op":"list"}` / `{"op":"call",...}` — one JSON object per line.
+Does **not** expose `ExtensionApi` over the wire.
 
 ---
 
 ## Summary
 
-- A plugin is one `register(&mut ExtensionApi)` function.
-- Register tools (`register_tool`), policies (`register_before_tool_call`), or
-  observers (`register_event_handler`).
-- Keep state in `ToolContext.state_dir`, not in any shared map.
-- Distribute as a cdylib + `manifest.toml` with a matching `gasket_abi_version`.
-
-See `gasket-refactor-plan.md` §3.5 / §5 for the full API reference.
+- Extension = `pub fn register(&mut dyn ExtensionApi)` in a normal Rust crate.
+- Host links crates and calls `register` (features optional).
+- Built-ins stay in core; no cdylib, no ABI handshake, no unload.
+- Non-Rust tools: stdio JSONL external process + optional `/reload-tools`.

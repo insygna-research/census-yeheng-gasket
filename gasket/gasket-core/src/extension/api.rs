@@ -1,6 +1,7 @@
-//! `ExtensionApi` trait + `ExtensionApiImpl` — how plugins touch the agent.
+//! `ExtensionApi` trait + `ExtensionApiImpl` — how extension crates register.
 //!
-//! See `gasket-refactor-plan.md` §3.5.
+//! Host/cli composition root calls `ext::register(&mut api)` for each linked
+//! extension crate. See `docs/plugin-tutorial.md`.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -43,7 +44,7 @@ pub trait AfterToolCallHandler: Send + Sync {
 /// A single-direction event handler.
 pub type EventHandler = Arc<dyn Fn(&AgentEvent, &ExtensionContext) + Send + Sync>;
 
-/// The surface a plugin uses to register capabilities with the agent.
+/// The surface an extension crate uses to register capabilities with the agent.
 ///
 /// **Events vs hooks are type-separated**: `register_event_handler` handlers
 /// return nothing (pure observation); `register_before_tool_call` /
@@ -62,17 +63,14 @@ pub trait ExtensionApi: Send + Sync {
     /// Subscribe to single-direction events (observation only).
     fn register_event_handler(&mut self, handler: EventHandler);
 
-    /// Send a message into the current session (e.g. a notification).
+    /// Queue a message for the host to inject into the session.
     fn send_message(&mut self, msg: AgentMessage);
 
-    /// Read-only snapshot of current session messages.
+    /// Read-only snapshot of current session messages (host may fill this).
     fn current_messages(&self) -> &[AgentMessage];
-
-    /// The ABI version the host was built with (see `loader`).
-    fn api_version(&self) -> &'static str;
 }
 
-/// Concrete registry holding everything plugins have registered.
+/// Concrete registry holding everything extension crates have registered.
 #[derive(Default)]
 pub struct ExtensionApiImpl {
     pub tools: Vec<ToolDefinition>,
@@ -132,7 +130,7 @@ impl ExtensionApiImpl {
         }
     }
 
-    /// Drain messages plugins asked to send.
+    /// Drain messages extensions asked to send.
     pub fn drain_outbound(&mut self) -> Vec<AgentMessage> {
         std::mem::take(&mut self.outbound)
     }
@@ -193,10 +191,6 @@ impl ExtensionApi for ExtensionApiImpl {
 
     fn current_messages(&self) -> &[AgentMessage] {
         &self.messages
-    }
-
-    fn api_version(&self) -> &'static str {
-        crate::extension::loader::GASKET_ABI_VERSION_STR
     }
 }
 

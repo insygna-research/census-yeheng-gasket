@@ -1,14 +1,4 @@
-//! Example plugin: `todo` tool — plugin-private state via files.
-//!
-//! Demonstrates the pattern that REPLACES the old shared-metadata HashMap:
-//! a plugin stores its own state in its private `ToolContext.state_dir`
-//! (`~/.gasket/tool_state/<session>/<plugin>/`), not in any agent-owned
-//! shared map. The agent core never touches this; the plugin reads/writes
-//! its own file.
-//!
-//! This is the V0.1 answer to "how does a plugin keep state across calls":
-//! your own file, typed by your own struct. No global key/value namespace,
-//! no races with other plugins, no `as_str().unwrap()` on a `Value`.
+//! `todo` tool — private state under `ToolContext.state_dir`.
 
 use std::sync::Arc;
 
@@ -29,7 +19,6 @@ struct State {
     next_id: u64,
 }
 
-/// Read this session's todo state, or start empty.
 fn load(ctx: &gasket_core::ToolContext) -> State {
     let path = ctx.state_dir.join("todos.json");
     std::fs::read(&path)
@@ -38,7 +27,6 @@ fn load(ctx: &gasket_core::ToolContext) -> State {
         .unwrap_or_default()
 }
 
-/// Persist todo state. Best-effort: creates the dir, ignores write errors.
 fn save(ctx: &gasket_core::ToolContext, state: &State) {
     let _ = std::fs::create_dir_all(&ctx.state_dir);
     if let Ok(bytes) = serde_json::to_vec(state) {
@@ -46,8 +34,7 @@ fn save(ctx: &gasket_core::ToolContext, state: &State) {
     }
 }
 
-/// Register the `todo` tool.
-pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
+pub fn register(api: &mut dyn ExtensionApi) {
     api.register_tool(ToolDefinition {
         name: "todo".into(),
         label: "Todo".into(),
@@ -96,7 +83,6 @@ async fn execute(ctx: &ToolCallCtx) -> Result<ToolResult, ToolError> {
             ("Cleared all todos.".into(), false)
         }
         _ => {
-            // list (also the default)
             if state.todos.is_empty() {
                 ("(no todos)".into(), false)
             } else {

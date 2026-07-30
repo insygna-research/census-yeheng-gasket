@@ -4,10 +4,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gasket_core::{
-    built_in_tools, run_agent_loop, AgentContext, AgentMessage, ContentBlock, UserMessage,
+    built_in_tools, run_agent_loop, AgentContext, AgentMessage, ContentBlock, ToolDefinition,
+    UserMessage,
 };
-use gasket_host::{ConfigLoader, EventPrinter, Mode, PermissionPolicy, SessionManager};
+use gasket_host::{
+    commands_from_env, compact_by_count, load_external_tools, max_messages_from_env, ConfigLoader,
+    EventPrinter, HookStack, Mode, PermissionPolicy, SessionManager,
+};
 use reedline::{DefaultPrompt, Reedline, Signal};
+
+/// In-process extensions behind feature `ext`: tools + optional hook chain
+/// (`permission_gate`). Without the feature, empty tools / no extra hooks.
+fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn gasket_core::HookChain>>) {
+    #[cfg(feature = "ext")]
+    {
+        use gasket_core::ExtensionApiImpl;
+        let mut api = ExtensionApiImpl::new();
+        gasket_ext::register_all(&mut api);
+        let tools = std::mem::take(&mut api.tools);
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(api);
+        return (tools, Some(hooks));
+    }
+    #[cfg(not(feature = "ext"))]
+    (Vec::new(), None)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let policy = Arc::new(PermissionPolicy::new(mode, stdin_approver));
+    let compact_max = max_messages_from_env();
+    let (ext_tools, ext_hooks) = load_inprocess_ext();
+    if !ext_tools.is_empty() {
+        eprintln!("(in-process ext tools: {})", ext_tools.len());
+    }
+    let mut extra_tools = load_external_from_env().await;
     let cwd = std::env::current_dir()?;
     let system_prompt = "You are a helpful, concise assistant.".to_string();
 
@@ -61,10 +87,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // ext gate first (pattern block), then permission mode/approver.
+    let hooks: Arc<dyn gasket_core::HookChain> = {
+        let mut stack = HookStack::new(Vec::new());
+        if let Some(h) = ext_hooks {
+            stack.push(h);
+        }
+        stack.push(policy.clone());
+        Arc::new(stack)
+    };
     let config = host_cfg.build_loop_config(
         host_cfg.tunables.max_turns,
         Some(signal.clone()),
-        Some(policy.clone()),
+        Some(hooks),
     );
 
     let mut rl = Reedline::create();
@@ -75,17 +110,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('/') {
-            handle_slash(cmd, &mut session, &mut history, &policy).await;
+            handle_slash(cmd, &mut session, &mut history, &policy, &mut extra_tools).await;
             continue;
         }
         let user_msg = AgentMessage::User(UserMessage {
             content: vec![ContentBlock::text(line.to_string())],
             timestamp: gasket_core::now(),
         });
+        // Shrink working memory only; JSONL on disk stays append-only full log.
+        history = compact_by_count(&history, compact_max);
+        let mut tools = built_in_tools();
+        tools.extend(ext_tools.iter().cloned());
+        tools.extend(extra_tools.iter().cloned());
         let context = AgentContext {
             system_prompt: system_prompt.clone(),
             messages: history.clone(),
-            tools: built_in_tools(),
+            tools,
             cwd: cwd.clone(),
             env: std::env::vars().collect(),
             session_id: session.current_id().to_string(),
@@ -117,11 +157,29 @@ fn stdin_approver(name: &str, _args: &serde_json::Value) -> bool {
     s.trim().eq_ignore_ascii_case("y")
 }
 
+async fn load_external_from_env() -> Vec<ToolDefinition> {
+    let cmds = commands_from_env();
+    if cmds.is_empty() {
+        return Vec::new();
+    }
+    match load_external_tools(&cmds).await {
+        Ok(t) => {
+            eprintln!("(external tools: {} from {} command(s))", t.len(), cmds.len());
+            t
+        }
+        Err(e) => {
+            eprintln!("(external tools load failed: {e})");
+            Vec::new()
+        }
+    }
+}
+
 async fn handle_slash(
     cmd: &str,
     session: &mut SessionManager,
     history: &mut Vec<AgentMessage>,
     policy: &Arc<PermissionPolicy>,
+    extra_tools: &mut Vec<ToolDefinition>,
 ) {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
@@ -164,8 +222,12 @@ async fn handle_slash(
             }
             Err(e) => println!("(list: {e})"),
         },
+        Some("reload-tools") => {
+            *extra_tools = load_external_from_env().await;
+            println!("(reloaded {} external tool(s))", extra_tools.len());
+        }
         Some("help") => println!(
-            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto>  /sessions  /exit"
+            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto>  /sessions  /reload-tools  /exit"
         ),
         _ => println!("unknown command; /help"),
     }

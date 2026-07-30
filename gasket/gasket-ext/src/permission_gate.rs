@@ -1,21 +1,10 @@
-//! Example plugin: `permission_gate` — block dangerous commands.
-//!
-//! Demonstrates `register_before_tool_call`: a hook that runs before every
-//! tool call and can Block it. This is the canonical "policy" plugin.
-//!
-//! When the model tries to call `bash` with `rm -rf`, `sudo`, or `chmod 777`,
-//! this plugin returns `Block` — the agent loop (see `agent_loop::execute_tool_calls`)
-//! skips execution and sends the block reason back to the model as an error
-//! tool result. The model then reacts (asks the user, picks a safer command,
-//! etc.). No dangerous command ever runs.
+//! Block dangerous bash patterns via `before_tool_call`.
 
 use gasket_core::extension::BeforeToolCallHandler;
 use gasket_core::{ExtensionApi, ToolCallVerdict};
 
-/// A gate that blocks bash commands matching dangerous patterns.
 struct DangerousCommandGate;
 
-/// Substrings that mark a bash command as too dangerous to auto-run.
 const BLOCKED_PATTERNS: &[&str] = &["rm -rf", "sudo ", "chmod 777", "mkfs", ":(){:|:&};:"];
 
 impl BeforeToolCallHandler for DangerousCommandGate {
@@ -41,11 +30,6 @@ impl BeforeToolCallHandler for DangerousCommandGate {
     }
 }
 
-/// Install the gate.
-pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
+pub fn register(api: &mut dyn ExtensionApi) {
     api.register_before_tool_call(Box::new(DangerousCommandGate));
 }
-
-// cdylib entry point omitted here (this example builds 3 plugins into one
-// binary; a `#[no_mangle]` symbol would clash). See `plugins/hello.rs` for the
-// standalone-crate cdylib pattern.

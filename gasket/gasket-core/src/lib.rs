@@ -1,12 +1,8 @@
 //! gasket-core — a pi-style pluggable agent core.
 //!
-//! A single `agent_loop` function plus an `ExtensionApi` trait. Everything else
-//! (CLI / TUI / channels / sandbox / wiki) is a host or plugin concern.
-//!
-//! See `gasket-refactor-plan.md` §3-§9 for the design.
-//!
-//! Stage 3a: skeleton. Module-level re-exports are added as each module is
-//! implemented in stages 3b-3g.
+//! A single `agent_loop` function plus an `ExtensionApi` trait. Extra tools and
+//! hooks come from in-process Rust extension crates that call `register` at
+//! host startup (optionally behind Cargo features). No dynamic library loading.
 
 pub mod agent_loop;
 pub mod error;
@@ -18,7 +14,7 @@ pub mod types;
 
 pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
-pub use extension::{ExtensionApi, ExtensionApiImpl, ExtensionContext, Plugin};
+pub use extension::{ExtensionApi, ExtensionApiImpl, ExtensionContext};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
 pub use storage::JsonlStorage;
 pub use tools::built_in_tools;
