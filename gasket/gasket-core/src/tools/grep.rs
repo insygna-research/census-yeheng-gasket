@@ -66,6 +66,13 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         Err(e) => return Ok(ToolResult::error(format!("invalid regex: {e}"))),
     };
 
+    // Validate before searching: `path` is later joined onto cwd by both the
+    // rg and builtin engines without further checks, so reject `..`/absolute/
+    // symlink escapes here.
+    if let Err(msg) = super::resolve_within_cwd(&ctx.ctx.cwd, path) {
+        return Ok(ToolResult::error(msg));
+    }
+
     let glob_pat = glob.and_then(|p| glob::Pattern::new(p).ok());
 
     // rg is fast and gitignore-aware; use it when present, else walk in-process.
@@ -266,6 +273,23 @@ mod tests {
             ContentBlock::Text { text } => text.clone(),
             _ => panic!("expected text content"),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            serde_json::json!({"pattern": "x", "path": "../"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(r.is_error, "`..` escape must be rejected");
+        let r = run(
+            serde_json::json!({"pattern": "x", "path": "/etc"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(r.is_error, "absolute path must be rejected");
     }
 
     #[tokio::test]

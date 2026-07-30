@@ -45,7 +45,10 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let recursive = ctx.args["recursive"].as_bool().unwrap_or(false);
     let pattern = ctx.args["pattern"].as_str();
 
-    let base = ctx.ctx.cwd.join(path);
+    let base = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
+        Ok(p) => p,
+        Err(msg) => return Ok(ToolResult::error(msg)),
+    };
     if !base.exists() {
         return Ok(ToolResult::error(format!("path not found: {}", path)));
     }
@@ -151,6 +154,15 @@ mod tests {
         let text = text_of(&r);
         assert!(text.contains("a.rs"));
         assert!(text.contains("sub/"));
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(serde_json::json!({"path": "../"}), tmp.path()).await;
+        assert!(r.is_error, "`..` escape must be rejected");
+        let r = run(serde_json::json!({"path": "/etc"}), tmp.path()).await;
+        assert!(r.is_error, "absolute path must be rejected");
     }
 
     #[tokio::test]

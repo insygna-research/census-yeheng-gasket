@@ -46,7 +46,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     };
     cmd.current_dir(&ctx.ctx.cwd);
     cmd.env_clear();
-    cmd.envs(&ctx.ctx.env);
+    // Don't leak gasket's own config/secrets (e.g. GASKET_LLM_KEY) into
+    // commands the model asks to run.
+    cmd.envs(ctx.ctx.env.iter().filter(|(k, _)| !k.starts_with("GASKET_")));
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -142,5 +144,38 @@ mod tests {
             _ => panic!(),
         };
         assert!(text.contains("exit 3") || text.contains("[exit"));
+    }
+
+    #[tokio::test]
+    async fn does_not_leak_gasket_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tool();
+        let mut env = std::collections::HashMap::new();
+        env.insert("GASKET_LLM_KEY".to_string(), "sk-secret".to_string());
+        env.insert("KEEP_ME".to_string(), "visible".to_string());
+        let cmd = if cfg!(target_os = "windows") {
+            "echo %GASKET_LLM_KEY%%KEEP_ME%"
+        } else {
+            "echo $GASKET_LLM_KEY$KEEP_ME"
+        };
+        let r = (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args: serde_json::json!({"command": cmd}),
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: tmp.path().to_path_buf(),
+                env,
+                session_id: "s".into(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+        })
+        .await
+        .unwrap();
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(!text.contains("sk-secret"), "leaked secret, got: {text}");
+        assert!(text.contains("visible"), "non-secret env dropped: {text}");
     }
 }

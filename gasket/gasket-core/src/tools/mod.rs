@@ -26,9 +26,9 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
 }
 
 /// Resolve `requested` against `cwd`, rejecting any `..` or absolute component
-/// that would escape `cwd`. Lexical only (no symlink resolution) - enough to
-/// stop `../../etc/passwd`-style traversal without requiring the target file to
-/// exist (so `write` can still create new files).
+/// that would escape `cwd`, and re-checking the symlink-resolved target so a
+/// symlink inside `cwd` can't point outside it (lexical `..`-checking alone
+/// doesn't catch that).
 pub(crate) fn resolve_within_cwd(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
     let cwd_canon = cwd
         .canonicalize()
@@ -50,5 +50,89 @@ pub(crate) fn resolve_within_cwd(cwd: &Path, requested: &str) -> Result<PathBuf,
             }
         }
     }
-    Ok(resolved)
+
+    // The target (or, if it doesn't exist yet, its nearest existing ancestor)
+    // may be reached through a symlink that leads outside cwd. Canonicalize
+    // that ancestor and re-check, then re-append the not-yet-existing tail.
+    let (existing, tail) = nearest_existing_ancestor(&resolved);
+    let existing_canon = existing
+        .canonicalize()
+        .map_err(|e| format!("path not accessible: {e}"))?;
+    if !existing_canon.starts_with(&cwd_canon) {
+        return Err(format!("path escapes working directory: {requested}"));
+    }
+    // `.join` on an empty `tail` still appends a stray trailing separator
+    // (turning a file path into a dir-looking one), so skip it when empty.
+    if tail.as_os_str().is_empty() {
+        Ok(existing_canon)
+    } else {
+        Ok(existing_canon.join(tail))
+    }
+}
+
+/// Walk `path` up to the nearest ancestor that exists on disk. Returns that
+/// ancestor plus the (necessarily non-existent, so symlink-free) remainder.
+fn nearest_existing_ancestor(path: &Path) -> (PathBuf, PathBuf) {
+    let mut current = path.to_path_buf();
+    let mut names = Vec::new();
+    while !current.exists() {
+        let Some(name) = current.file_name() else {
+            break; // reached the root without finding an existing component
+        };
+        names.push(name.to_os_string());
+        current.pop();
+    }
+    // `names` was collected leaf-to-root; rebuild root-to-leaf. Pushing onto
+    // an empty PathBuf via `.join("")` would add a stray trailing separator,
+    // so accumulate with `push` instead.
+    let mut tail = PathBuf::new();
+    for name in names.into_iter().rev() {
+        tail.push(name);
+    }
+    (current, tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_lexical_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_within_cwd(tmp.path(), "../../etc/passwd").is_err());
+        assert!(resolve_within_cwd(tmp.path(), "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn allows_path_within_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        let resolved = resolve_within_cwd(tmp.path(), "f.txt").unwrap();
+        assert_eq!(resolved, tmp.path().canonicalize().unwrap().join("f.txt"));
+    }
+
+    #[test]
+    fn allows_new_file_in_existing_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let resolved = resolve_within_cwd(tmp.path(), "sub/new.txt").unwrap();
+        assert_eq!(
+            resolved,
+            tmp.path().canonicalize().unwrap().join("sub/new.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        // A symlink inside cwd pointing outside it must not let a request
+        // through, even though the lexical (no `..`) check alone would allow it.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
+
+        let r = resolve_within_cwd(tmp.path(), "escape/secret.txt");
+        assert!(r.is_err(), "symlink escape must be rejected, got {r:?}");
+    }
 }

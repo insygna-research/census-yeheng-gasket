@@ -251,13 +251,7 @@ where
         match verdict {
             ToolCallVerdict::Block(reason) => {
                 tracing::warn!(tool = %tc.function.name, "tool blocked by before_tool_call hook");
-                let result = ToolResultMessage {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.function.name.clone(),
-                    content: vec![ContentBlock::Text { text: reason }],
-                    is_error: true,
-                    timestamp: crate::now(),
-                };
+                let result = error_tool_result(&tc.id, &tc.function.name, reason);
                 emit(AgentEvent::ToolExecutionEnd {
                     tool_call_id: tc.id.clone(),
                     result: result.clone(),
