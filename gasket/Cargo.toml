@@ -15,6 +15,7 @@ members = [
     "gasket-host",
     "gasket-cli",
     "gasket-ext",
+    "gasket-gateway",
 ]
 
 [profile.release]

@@ -1,0 +1,27 @@
+[package]
+name = "gasket-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebSocket gateway server for gasket web UI"
+
+[[bin]]
+name = "gasket-gateway"
+path = "src/main.rs"
+
+[dependencies]
+gasket-core = { workspace = true }
+gasket-host = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+dashmap = { workspace = true }
+dotenvy = { workspace = true }
+tokio-util = { workspace = true }
