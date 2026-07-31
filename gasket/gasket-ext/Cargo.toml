@@ -9,3 +9,7 @@ description = "Optional in-process extension crates for gasket (register via Ext
 gasket-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tracing = { workspace = true }
+urlencoding = "2.1"
+dom_query = "0.28"
