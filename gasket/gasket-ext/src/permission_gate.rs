@@ -13,7 +13,6 @@ impl BeforeToolCallHandler for DangerousCommandGate {
         _tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
-        _ctx: &gasket_core::ExtensionContext,
     ) -> ToolCallVerdict {
         if tool_name != "bash" {
             return ToolCallVerdict::Allow;

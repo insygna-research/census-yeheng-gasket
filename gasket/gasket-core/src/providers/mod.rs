@@ -1,6 +1,4 @@
 //! LLM providers - OpenAI-compatible + Anthropic.
-//!
-//! See `gasket-refactor-plan.md` §8.
 
 pub mod anthropic;
 pub mod openai_compat;

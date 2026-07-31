@@ -7,7 +7,4 @@
 
 pub mod api;
 
-pub use api::{
-    AfterToolCallHandler, BeforeToolCallHandler, EventHandler, ExtensionApi, ExtensionApiImpl,
-    ExtensionContext,
-};
+pub use api::{AfterToolCallHandler, BeforeToolCallHandler, ExtensionApi, ExtensionApiImpl};

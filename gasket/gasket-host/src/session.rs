@@ -11,6 +11,10 @@ pub struct SessionInfo {
     pub msg_count: usize,
 }
 
+/// Cursor semantics: `new()` generates the initial `current_id`; only
+/// `new` / `resume` / `clear` change it; `append` always writes to the
+/// current id. A fresh manager that was never resumed writes a brand-new
+/// session — callers that want an existing session MUST `resume` first.
 pub struct SessionManager {
     storage: JsonlStorage,
     current_id: String,
@@ -94,7 +98,11 @@ impl SessionManager {
                 Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
                 Err(_) => 0,
             };
-            out.push(SessionInfo { id, mtime, msg_count });
+            out.push(SessionInfo {
+                id,
+                mtime,
+                msg_count,
+            });
         }
         Ok(out)
     }

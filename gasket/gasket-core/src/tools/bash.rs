@@ -48,7 +48,12 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     cmd.env_clear();
     // Don't leak gasket's own config/secrets (e.g. GASKET_LLM_KEY) into
     // commands the model asks to run.
-    cmd.envs(ctx.ctx.env.iter().filter(|(k, _)| !k.starts_with("GASKET_")));
+    cmd.envs(
+        ctx.ctx
+            .env
+            .iter()
+            .filter(|(k, _)| !k.starts_with("GASKET_")),
+    );
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 

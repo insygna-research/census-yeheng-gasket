@@ -1,6 +1,4 @@
 //! Built-in tools: read / write / edit / bash / list / grep.
-//!
-//! See `gasket-refactor-plan.md` §7.
 
 pub mod bash;
 pub mod edit;

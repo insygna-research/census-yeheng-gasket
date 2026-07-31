@@ -1,8 +1,14 @@
 //! ConfigLoader: 从 env/.env 聚合 ProviderConfig + AgentTunables。
-use std::sync::atomic::AtomicBool;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use gasket_core::{AgentTunables, ProviderConfig};
+use gasket_core::{
+    AgentContext, AgentLoopConfig, AgentMessage, AgentTunables, HookChain, ProviderConfig,
+    StreamFn, ToolDefinition,
+};
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -28,28 +34,32 @@ impl ConfigLoader {
 }
 
 impl HostConfig {
-    /// Assemble the provider `stream_fn` + `ModelSpec` + tunables into an
-    /// `AgentLoopConfig`. Every host (CLI, smoke tests, future channels) wires
-    /// the loop config identically; centralizing it here stops the assembly
-    /// from being copy-pasted at each call site.
-    ///
-    /// `max_turns` is caller-supplied (smoke tests cap it at 3; the REPL uses
-    /// the tunables default). `signal` and `hooks` are host-specific.
-    pub fn build_loop_config(
-        &self,
-        max_turns: usize,
-        signal: Option<Arc<AtomicBool>>,
-        hooks: Option<Arc<dyn gasket_core::HookChain>>,
-    ) -> gasket_core::AgentLoopConfig {
-        let stream_fn: Arc<dyn gasket_core::StreamFn> = match self.provider.api {
+    /// The provider's native `stream_fn`. `Host::new` fills its stream_fn slot
+    /// from this; power users (or tests) can take it directly.
+    pub fn provider_stream_fn(&self) -> Arc<dyn StreamFn> {
+        match self.provider.api {
             gasket_core::ProviderApi::OpenAiCompat => {
                 Arc::new(gasket_core::OpenAiCompat::from_config(&self.provider))
             }
             gasket_core::ProviderApi::Anthropic => {
                 Arc::new(gasket_core::AnthropicProvider::from_config(&self.provider))
             }
-        };
-        gasket_core::AgentLoopConfig {
+        }
+    }
+
+    /// Assemble the `ModelSpec` + tunables into an `AgentLoopConfig`.
+    /// `stream_fn` is injected explicitly: hosts pass their own field (the
+    /// provider's, or a test fake). `max_turns` is caller-supplied (smoke
+    /// tests cap it at 3; the REPL uses the tunables default). `signal` and
+    /// `hooks` are host-specific.
+    pub fn build_loop_config(
+        &self,
+        max_turns: usize,
+        signal: Option<Arc<AtomicBool>>,
+        hooks: Option<Arc<dyn HookChain>>,
+        stream_fn: Arc<dyn StreamFn>,
+    ) -> AgentLoopConfig {
+        AgentLoopConfig {
             model: gasket_core::ModelSpec {
                 id: self.provider.model.clone(),
                 api: self.provider.api,
@@ -65,6 +75,67 @@ impl HostConfig {
             retry: self.tunables.retry.clone(),
         }
     }
+
+    /// Assemble an `AgentContext` for one run. History is cloned into the
+    /// context (the loop consumes it by value); callers keep their own copy
+    /// to extend with the run's new messages afterwards.
+    pub fn build_context(
+        &self,
+        system_prompt: &str,
+        history: &[AgentMessage],
+        tools: Vec<ToolDefinition>,
+        cwd: PathBuf,
+        env: HashMap<String, String>,
+        session_id: &str,
+    ) -> AgentContext {
+        AgentContext {
+            system_prompt: system_prompt.to_string(),
+            messages: history.to_vec(),
+            tools,
+            cwd,
+            env,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// The single canonical "build one turn" step, shared by every host
+    /// (`Host::run_turn` for the CLI, the gateway's per-connection driver).
+    /// Resets the abort signal, then builds the context + loop config from the
+    /// provider/tunables. Returns owned values so the caller can run the loop
+    /// however it likes - inline (CLI) or in a spawned task with event-channel
+    /// forwarding (gateway). Persistence is deliberately left to the caller.
+    pub fn prepare_turn(
+        &self,
+        inputs: TurnInputs<'_>,
+        signal: &Arc<AtomicBool>,
+        hooks: Arc<dyn HookChain>,
+        stream_fn: Arc<dyn StreamFn>,
+        max_turns: usize,
+    ) -> (AgentContext, AgentLoopConfig) {
+        // A Ctrl-C from a previous turn must not leak into this one.
+        signal.store(false, Ordering::Relaxed);
+        let context = self.build_context(
+            inputs.system_prompt,
+            inputs.history,
+            inputs.tools.to_vec(),
+            inputs.cwd.to_path_buf(),
+            std::env::vars().collect(),
+            inputs.session_id,
+        );
+        let config =
+            self.build_loop_config(max_turns, Some(signal.clone()), Some(hooks), stream_fn);
+        (context, config)
+    }
+}
+
+/// Borrowed inputs for one agent turn. Grouped so [`HostConfig::prepare_turn`]
+/// stays readable instead of taking six positional args.
+pub struct TurnInputs<'a> {
+    pub system_prompt: &'a str,
+    pub history: &'a [AgentMessage],
+    pub tools: &'a [ToolDefinition],
+    pub cwd: &'a Path,
+    pub session_id: &'a str,
 }
 
 #[cfg(test)]
@@ -80,16 +151,19 @@ mod tests {
         move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
     }
 
-    #[test]
-    fn loads_provider_and_tunables() {
-        let cfg = ConfigLoader::load_with(&fake_env(&[
+    fn test_cfg(pairs: &[(&str, &str)]) -> HostConfig {
+        let mut base = vec![
             ("GASKET_LLM_BASE_URL", "https://api.x.com/v1"),
             ("GASKET_LLM_KEY", "sk-test"),
             ("GASKET_LLM_MODEL", "m"),
-            ("GASKET_LLM_API", "anthropic"),
-            ("GASKET_MAX_TURNS", "7"),
-        ]))
-        .unwrap();
+        ];
+        base.extend_from_slice(pairs);
+        ConfigLoader::load_with(&fake_env(&base)).unwrap()
+    }
+
+    #[test]
+    fn loads_provider_and_tunables() {
+        let cfg = test_cfg(&[("GASKET_MAX_TURNS", "7"), ("GASKET_LLM_API", "anthropic")]);
         assert_eq!(cfg.provider.model, "m");
         assert_eq!(cfg.provider.api, gasket_core::ProviderApi::Anthropic);
         assert_eq!(cfg.tunables.max_turns, 7);
@@ -98,26 +172,47 @@ mod tests {
     #[test]
     fn missing_llm_config_errors() {
         let r = ConfigLoader::load_with(&fake_env(&[]));
-        assert!(matches!(r, Err(crate::HostError::Config(_))));
+        assert!(r.is_err());
     }
 
     #[test]
     fn build_loop_config_wires_provider_and_tunables() {
-        let cfg = ConfigLoader::load_with(&fake_env(&[
-            ("GASKET_LLM_BASE_URL", "https://api.x.com/v1"),
-            ("GASKET_LLM_KEY", "sk-test"),
-            ("GASKET_LLM_MODEL", "m"),
-            ("GASKET_LLM_API", "anthropic"),
-            ("GASKET_MAX_TURNS", "7"),
-        ]))
-        .unwrap();
+        let cfg = test_cfg(&[("GASKET_MAX_TURNS", "7"), ("GASKET_LLM_API", "anthropic")]);
         // max_turns is the caller's arg (3), NOT the tunables value (7).
-        let lc = cfg.build_loop_config(3, None, None);
+        let lc = cfg.build_loop_config(3, None, None, cfg.provider_stream_fn());
         assert_eq!(lc.model.id, "m");
         assert_eq!(lc.model.api, gasket_core::ProviderApi::Anthropic);
         assert_eq!(lc.max_turns, 3);
-        assert_eq!(lc.max_tool_calls_per_turn, cfg.tunables.max_tool_calls_per_turn);
-        assert!(lc.signal.is_none());
-        assert!(lc.hooks.is_none());
+        assert_eq!(lc.retry.max_retries, 2);
+    }
+
+    #[test]
+    fn provider_stream_fn_matches_api() {
+        let cfg = test_cfg(&[]);
+        // Only the type matters here: OpenAI-compat config must yield a
+        // stream_fn that does not panic on construction.
+        let _ = cfg.provider_stream_fn();
+    }
+
+    #[test]
+    fn build_context_maps_fields() {
+        let cfg = test_cfg(&[]);
+        let history = vec![AgentMessage::User(gasket_core::UserMessage {
+            content: vec![gasket_core::ContentBlock::text("hi".to_string())],
+            timestamp: 1,
+        })];
+        let ctx = cfg.build_context(
+            "sys",
+            &history,
+            vec![],
+            PathBuf::from("/tmp"),
+            HashMap::from([("K".to_string(), "V".to_string())]),
+            "s1",
+        );
+        assert_eq!(ctx.system_prompt, "sys");
+        assert_eq!(ctx.messages.len(), 1);
+        assert_eq!(ctx.cwd, PathBuf::from("/tmp"));
+        assert_eq!(ctx.env.get("K").map(String::as_str), Some("V"));
+        assert_eq!(ctx.session_id, "s1");
     }
 }

@@ -14,9 +14,9 @@ pub mod types;
 
 pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
-pub use extension::{ExtensionApi, ExtensionApiImpl, ExtensionContext};
+pub use extension::{ExtensionApi, ExtensionApiImpl};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
-pub use storage::JsonlStorage;
+pub use storage::{is_valid_session_id, JsonlStorage};
 pub use tools::built_in_tools;
 pub use types::context::{
     AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,

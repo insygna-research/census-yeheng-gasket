@@ -53,8 +53,12 @@ impl<W: Write> EventPrinter<W> {
             AgentEvent::TurnEnd { .. } => {
                 let _ = writeln!(self.out);
             }
+            AgentEvent::Error { message } => {
+                let _ = writeln!(self.out, "\n[error] {message}");
+            }
             _ => {}
         }
+        let _ = self.out.flush();
     }
 }
 
@@ -74,6 +78,29 @@ mod tests {
             delta: ContentDelta::TextDelta(" there".into()),
         });
         assert_eq!(String::from_utf8(buf).unwrap(), "Hi there");
+    }
+
+    #[test]
+    fn error_event_renders() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        p.on_event(&AgentEvent::Error {
+            message: "boom".into(),
+        });
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("[error] boom"));
+    }
+
+    #[test]
+    fn flush_after_every_event() {
+        // Vec<u8> flush is a no-op, but the call path must run without panic
+        // and leave the buffer intact (pipes rely on the flush to drain).
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        p.on_event(&AgentEvent::MessageUpdate {
+            delta: ContentDelta::TextDelta("x".into()),
+        });
+        assert_eq!(String::from_utf8(buf).unwrap(), "x");
     }
 
     #[test]

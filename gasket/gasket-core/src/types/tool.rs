@@ -1,6 +1,4 @@
 //! `ToolDefinition` / `ToolFn` / `ToolContext` / `ToolResult` + hook verdicts.
-//!
-//! See `gasket-refactor-plan.md` §3.4 / §3.5.
 
 use std::collections::HashMap;
 use std::future::Future;

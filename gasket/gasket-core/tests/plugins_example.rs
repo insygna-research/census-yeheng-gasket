@@ -85,9 +85,7 @@ async fn permission_gate_blocks_bash() {
         label: "Bash".into(),
         description: "shell".into(),
         parameters: serde_json::json!({"type": "object"}),
-        execute: Arc::new(|_| {
-            Box::pin(async { Ok(gasket_core::ToolResult::text("RAN")) })
-        }),
+        execute: Arc::new(|_| Box::pin(async { Ok(gasket_core::ToolResult::text("RAN")) })),
     };
 
     let agent_ctx = AgentContext {

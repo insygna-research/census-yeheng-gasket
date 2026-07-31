@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
+use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolError, ToolResult};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{info, warn};
-use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolError, ToolResult};
 
 // ── Search result abstraction ────────────────────────────────────────────
 
@@ -101,9 +101,10 @@ async fn search_duckduckgo(
 
     check_status(&response, "DuckDuckGo").await?;
 
-    let html = response.text().await.map_err(|e| {
-        ToolError::Message(format!("DuckDuckGo response read failed: {}", e))
-    })?;
+    let html = response
+        .text()
+        .await
+        .map_err(|e| ToolError::Message(format!("DuckDuckGo response read failed: {}", e)))?;
 
     parse_duckduckgo_html(&html, count)
 }
@@ -203,8 +204,13 @@ async fn search_brave(
         count
     );
 
-    let resp: BraveSearchResponse =
-        send_get(client, &url, Some(("X-Subscription-Token", api_key)), "Brave").await?;
+    let resp: BraveSearchResponse = send_get(
+        client,
+        &url,
+        Some(("X-Subscription-Token", api_key)),
+        "Brave",
+    )
+    .await?;
 
     Ok(resp
         .web
@@ -375,9 +381,10 @@ async fn send_get<T: serde::de::DeserializeOwned>(
         req = req.header(key, value);
     }
 
-    let response = req.send().await.map_err(|e| {
-        ToolError::Message(format!("{} API request failed: {}", provider_name, e))
-    })?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| ToolError::Message(format!("{} API request failed: {}", provider_name, e)))?;
 
     check_status(&response, provider_name).await?;
 
@@ -405,9 +412,10 @@ async fn send_post_json<T: serde::de::DeserializeOwned>(
         req = req.header(key, value);
     }
 
-    let response = req.send().await.map_err(|e| {
-        ToolError::Message(format!("{} API request failed: {}", provider_name, e))
-    })?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| ToolError::Message(format!("{} API request failed: {}", provider_name, e)))?;
 
     check_status(&response, provider_name).await?;
 
@@ -419,10 +427,7 @@ async fn send_post_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-async fn check_status(
-    response: &reqwest::Response,
-    provider_name: &str,
-) -> Result<(), ToolError> {
+async fn check_status(response: &reqwest::Response, provider_name: &str) -> Result<(), ToolError> {
     if !response.status().is_success() {
         return Err(ToolError::Message(format!(
             "{} API error (status {})",
@@ -592,4 +597,166 @@ pub fn register(api: &mut dyn ExtensionApi) {
             })
         }),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Vendor JSON shape contracts ──────────────────────────────
+    // Each test pins the serde field mapping against a canned response in the
+    // vendor's real shape. A vendor renaming a field fails here, not in prod.
+
+    #[test]
+    fn serper_response_maps_fields() {
+        let resp: SerperSearchResponse = serde_json::from_str(
+            r#"{"organic":[{"title":"Rust Lang","snippet":"A language","link":"https://rust-lang.org"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.organic.len(), 1);
+        assert_eq!(resp.organic[0].title, "Rust Lang");
+        assert_eq!(resp.organic[0].snippet, "A language");
+        assert_eq!(resp.organic[0].link, "https://rust-lang.org");
+    }
+
+    #[test]
+    fn serpapi_response_optional_snippet() {
+        let resp: SerpApiSearchResponse = serde_json::from_str(
+            r#"{"organic_results":[{"title":"T","link":"https://t.example"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.organic_results.len(), 1);
+        assert_eq!(resp.organic_results[0].snippet, None);
+        assert_eq!(resp.organic_results[0].title, "T");
+        assert_eq!(resp.organic_results[0].link, "https://t.example");
+    }
+
+    #[test]
+    fn brave_response_maps_fields() {
+        let resp: BraveSearchResponse = serde_json::from_str(
+            r#"{"web":{"results":[{"title":"B","description":"D","url":"https://b.example"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.web.results.len(), 1);
+        assert_eq!(resp.web.results[0].title, "B");
+        assert_eq!(resp.web.results[0].description, "D");
+        assert_eq!(resp.web.results[0].url, "https://b.example");
+    }
+
+    #[test]
+    fn tavily_response_maps_fields() {
+        let resp: TavilySearchResponse = serde_json::from_str(
+            r#"{"results":[{"title":"V","content":"C","url":"https://v.example"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].title, "V");
+        assert_eq!(resp.results[0].content, "C");
+        assert_eq!(resp.results[0].url, "https://v.example");
+    }
+
+    #[test]
+    fn exa_response_optional_fields() {
+        let resp: ExaSearchResponse =
+            serde_json::from_str(r#"{"results":[{"url":"https://e.example"}]}"#).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].title, None);
+        assert_eq!(resp.results[0].text, None);
+        assert_eq!(resp.results[0].url, "https://e.example");
+    }
+
+    #[test]
+    fn firecrawl_response_optional_fields() {
+        let resp: FirecrawlSearchResponse =
+            serde_json::from_str(r#"{"data":[{"url":"https://f.example"}]}"#).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].title, None);
+        assert_eq!(resp.data[0].description, None);
+        assert_eq!(resp.data[0].url, "https://f.example");
+    }
+
+    // ── DuckDuckGo HTML parsing ──────────────────────────────────
+
+    fn ddg_fixture() -> &'static str {
+        r#"<html><body>
+          <div class="result">
+            <h2 class="result__title">
+              <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=abc">Example Page</a>
+            </h2>
+            <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage">The example snippet.</a>
+          </div>
+          <div class="result">
+            <h2 class="result__title">
+              <a class="result__a" href="https://plain.example.org/direct">Plain Link</a>
+            </h2>
+            <a class="result__snippet" href="https://plain.example.org/direct">Second snippet.</a>
+          </div>
+          <div class="result">
+            <h2 class="result__title"><span>No Link Here</span></h2>
+          </div>
+        </body></html>"#
+    }
+
+    #[test]
+    fn parse_duckduckgo_html_extracts_results() {
+        let hits = parse_duckduckgo_html(ddg_fixture(), 10).unwrap();
+        assert_eq!(hits.len(), 2, "the link-less result must be skipped");
+        assert_eq!(hits[0].title, "Example Page");
+        assert_eq!(hits[0].url, "https://example.com/page");
+        assert_eq!(hits[0].snippet, "The example snippet.");
+        assert_eq!(hits[1].title, "Plain Link");
+        assert_eq!(hits[1].url, "https://plain.example.org/direct");
+    }
+
+    #[test]
+    fn parse_duckduckgo_html_respects_count() {
+        let hits = parse_duckduckgo_html(ddg_fixture(), 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Example Page");
+    }
+
+    #[test]
+    fn extract_duckduckgo_url_decodes_uddg() {
+        assert_eq!(
+            extract_duckduckgo_url(
+                "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&rut=x"
+            ),
+            "https://example.com/a?b=1"
+        );
+        // Plain https link passes through untouched.
+        assert_eq!(
+            extract_duckduckgo_url("https://plain.example.org/direct"),
+            "https://plain.example.org/direct"
+        );
+        // Protocol-relative link gets https:.
+        assert_eq!(
+            extract_duckduckgo_url("//protocol.example.org"),
+            "https://protocol.example.org"
+        );
+        assert_eq!(extract_duckduckgo_url(""), "");
+    }
+
+    // ── Output formatting ────────────────────────────────────────
+
+    #[test]
+    fn format_hits_empty() {
+        assert_eq!(format_hits(&[]), "No results found.");
+    }
+
+    #[test]
+    fn format_hits_truncates_long_snippets() {
+        let long = "x".repeat(400);
+        let out = format_hits(&[SearchHit {
+            title: "T".into(),
+            snippet: long.clone(),
+            url: "https://u".into(),
+        }]);
+        assert!(
+            out.contains("..."),
+            "long snippet must be truncated with ellipsis"
+        );
+        assert!(!out.contains(&long), "full snippet must not appear");
+        assert!(out.contains("1. **T**"));
+        assert!(out.contains("https://u"));
+    }
 }

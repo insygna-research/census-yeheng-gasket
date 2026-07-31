@@ -1,6 +1,4 @@
 //! The agent loop — single outer loop: LLM call → tool calls → repeat.
-//!
-//! See `gasket-refactor-plan.md` §4.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -757,13 +755,7 @@ mod tests {
     /// A `before_tool_call` handler that blocks the `bash` tool.
     struct BlockBash;
     impl crate::extension::BeforeToolCallHandler for BlockBash {
-        fn call(
-            &self,
-            _id: &str,
-            tool_name: &str,
-            _args: &serde_json::Value,
-            _ctx: &crate::ExtensionContext,
-        ) -> ToolCallVerdict {
+        fn call(&self, _id: &str, tool_name: &str, _args: &serde_json::Value) -> ToolCallVerdict {
             if tool_name == "bash" {
                 ToolCallVerdict::Block("blocked by policy".into())
             } else {
@@ -779,7 +771,6 @@ mod tests {
             &self,
             _id: &str,
             _result: &crate::ToolResultMessage,
-            _ctx: &crate::ExtensionContext,
         ) -> Option<crate::ToolResultMessage> {
             Some(crate::ToolResultMessage {
                 tool_call_id: "t1".into(),

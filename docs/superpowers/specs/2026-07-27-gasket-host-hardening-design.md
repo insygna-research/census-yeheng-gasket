@@ -1,9 +1,9 @@
 # gasket-host 夯实设计（查漏补缺）
 
-- 日期：2026-07-27
-- 状态：**Draft for Review**（含 Linus review 4 条修订，待批准）
+- 日期：2026-07-27（2026-07-31 实施完毕）
+- 状态：**已实施**——`Host`/`run_turn`/`install_ctrl_c`、FakeStream + 3 集成测试、printer `Error` 分支 + flush、`HostError::Agent`、C4/C5 文档化全部落地；CLI/smoke 已迁移到 `Host`。原「待批准」评审意见已采纳。
 - 范围：加固既有 `gasket-host` crate（config / session / permission / printer），新增一个 `Host` 编排结构 + 一套确定性集成测试地基
-- 关联：[`docs/superpowers/specs/2026-07-26-a2a-host-design.md`](./2026-07-26-a2a-host-design.md) §1.1 指出"gasket-host 尚未稳定"是 a2a 不依赖它的原因；本设计正是补这个缺口，让 `Host` 成为未来 a2a `TaskFactory` 可包的稳定调用点
+- 关联：a2a 尚无 spec/实现（被引用的 `2026-07-26-a2a-host-design.md` 从未存在）；本设计不依赖它，`Host` 的形状为未来 a2a `TaskFactory` 预留，但不做接线
 
 ---
 
@@ -310,13 +310,13 @@ CI 每个 PR：`cargo build --release` 无 warning、`cargo test -p gasket-host`
 
 ## 9. Review 检查清单
 
-- [ ] **Host 不持 printer、渲染走 `on_event` 回调**——认可？（B1 地基，a2a 可复用）
-- [ ] **`run_turn` 失败不持久化**、history 由调用方 extend——认可？
+- [x] **Host 不持 printer、渲染走 `on_event` 回调**——已实施（B1 地基，a2a 可复用）
+- [x] **`run_turn` 失败不持久化**、history 由调用方 extend——已实施（注：core 对可见错误返回 `stop_reason::Error` 而非 `Err`，因此失败路径实际由 `?` 结构保证，`host_error_surfaces_and_persists` 钉住了真实语义）
 - [x] **`build_loop_config` 单方法带 `stream_fn`（删 `_with` 与无参重载）+ `provider_stream_fn`**——内部 breaking，无外部 userspace（Linus review #3，已采纳）
 - [x] **fake 放 `tests/common/`、不开 feature、`futures-util` 仅 dev-dep、脚本耗尽 panic**——（Linus review #1，已采纳）
 - [x] **`HostError` 删 `Io`、只留 `Agent`**——（Linus review #2，已采纳）
-- [x] **`host_failure_no_persist` 用 `GASKET_RETRY_MAX=0`（retry off）**——（Linus review #1，已采纳）
-- [ ] **C5/C4 选文档化不改签名**、`HostError` 保留 `Session(String)`——认可这个不彻底？
-- [ ] **范围砍 A1/C4重做/A3/K3**——认可？
+- [x] **`host_failure_no_persist` 用 `GASKET_RETRY_MAX=0`（retry off）**——（Linus review #1，已采纳；测试按 core 实际语义改名 `host_error_surfaces_and_persists`）
+- [x] **C5/C4 选文档化不改签名**、`HostError` 保留 `Session(String)`——已实施
+- [x] **范围砍 A1/C4重做/A3/K3**——已确认
 
-> Next step：本 spec 批准（Linus review 已完成，4 条修订已回填）→ `docs/superpowers/plans/2026-07-27-gasket-host-hardening.md` → 启动实施阶段 1。
+> 实施记录（2026-07-31）：本 spec 未走 plans 流程，直接按第 7 节顺序实施。`run_turn` 的 history 参数在实施中改为 `&[AgentMessage]`（loop 不修改调用方状态，`&mut` 是多余的）；`Host::new` 的 policy 参数改为 `Arc<PermissionPolicy>`（CLI 需在同一实例上做 `/mode` 与 hook 栈共享）。

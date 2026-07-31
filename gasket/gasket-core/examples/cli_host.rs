@@ -1,7 +1,7 @@
 //! Minimal host: read user input, run the agent loop, print streamed tokens.
 //!
 //! Demonstrates "use gasket to do something" - the full extent of wiring a
-//! host needs. See `gasket-refactor-plan.md` §9.
+//! host needs.
 //!
 //! Config via env (load a `.env` with `dotenvy`, or export these):
 //!   GASKET_LLM_BASE_URL - provider base URL (e.g. https://api.deepseek.com/v1)

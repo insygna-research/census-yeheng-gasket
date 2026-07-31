@@ -1,15 +1,12 @@
-//! gasket CLI REPL: 组装 gasket-host 模块 + run_agent_loop，交互式终端 agent。
+//! gasket CLI REPL: 持一个 Host，每行调一次 run_turn，交互式终端 agent。
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use gasket_core::{
-    built_in_tools, run_agent_loop, AgentContext, AgentMessage, ContentBlock, ToolDefinition,
-    UserMessage,
-};
+use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
 use gasket_host::{
-    commands_from_env, compact_by_count, load_external_tools, max_messages_from_env, ConfigLoader,
-    EventPrinter, HookStack, Mode, PermissionPolicy, SessionManager,
+    commands_from_env, compact_by_count, install_ctrl_c, load_external_tools,
+    max_messages_from_env, ConfigLoader, EventPrinter, HookStack, Host, Mode, PermissionPolicy,
+    SessionManager,
 };
 use reedline::{DefaultPrompt, Reedline, Signal};
 
@@ -23,10 +20,21 @@ fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn gasket_core::Hoo
         gasket_ext::register_all(&mut api);
         let tools = std::mem::take(&mut api.tools);
         let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(api);
-        return (tools, Some(hooks));
+        (tools, Some(hooks))
     }
     #[cfg(not(feature = "ext"))]
     (Vec::new(), None)
+}
+
+/// built-in + in-process ext + external tools, in that precedence order.
+fn assemble_tools(
+    ext_tools: &[ToolDefinition],
+    extra_tools: &[ToolDefinition],
+) -> Vec<ToolDefinition> {
+    let mut tools = gasket_core::built_in_tools();
+    tools.extend(ext_tools.iter().cloned());
+    tools.extend(extra_tools.iter().cloned());
+    tools
 }
 
 #[tokio::main]
@@ -60,47 +68,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let policy = Arc::new(PermissionPolicy::new(mode, stdin_approver));
     let compact_max = max_messages_from_env();
     let (ext_tools, ext_hooks) = load_inprocess_ext();
     if !ext_tools.is_empty() {
         eprintln!("(in-process ext tools: {})", ext_tools.len());
     }
-    let mut extra_tools = load_external_from_env().await;
-    let cwd = std::env::current_dir()?;
-    let system_prompt = "You are a helpful, concise assistant.".to_string();
+    let extra_tools = load_external_from_env().await;
+
+    // ext gate first (pattern block), then permission mode/approver.
+    let policy = Arc::new(PermissionPolicy::new(mode, stdin_approver));
+    let mut hook_stack = HookStack::new(Vec::new());
+    if let Some(h) = ext_hooks {
+        hook_stack.push(h);
+    }
+    hook_stack.push(policy.clone());
+
+    let mut host = Host::new(
+        host_cfg,
+        session,
+        policy,
+        "You are a helpful, concise assistant.".to_string(),
+        assemble_tools(&ext_tools, &extra_tools),
+    )
+    .with_hooks(Arc::new(hook_stack));
 
     // Cooperative-abort signal: a Ctrl-C during LLM streaming (cooked tty mode)
     // sets this and the agent loop exits at the next safe point, returning the
-    // partial transcript. Spawned once; the loop re-arms after each Ctrl-C so
-    // every press is honored. At the prompt (raw mode) Ctrl-C is a key event
-    // handled by reedline, not a SIGINT, so it doesn't fire here.
-    let signal = Arc::new(AtomicBool::new(false));
-    {
-        let s = signal.clone();
-        tokio::spawn(async move {
-            loop {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    break; // handler could not be installed; give up quietly
-                }
-                s.store(true, Ordering::Relaxed);
-            }
-        });
-    }
-    // ext gate first (pattern block), then permission mode/approver.
-    let hooks: Arc<dyn gasket_core::HookChain> = {
-        let mut stack = HookStack::new(Vec::new());
-        if let Some(h) = ext_hooks {
-            stack.push(h);
-        }
-        stack.push(policy.clone());
-        Arc::new(stack)
-    };
-    let config = host_cfg.build_loop_config(
-        host_cfg.tunables.max_turns,
-        Some(signal.clone()),
-        Some(hooks),
-    );
+    // partial transcript. Every press is honored; run_turn re-arms the flag.
+    // At the prompt (raw mode) Ctrl-C is a key event handled by reedline, not
+    // a SIGINT, so it doesn't fire here.
+    install_ctrl_c(host.signal().clone());
 
     let mut rl = Reedline::create();
     let prompt = DefaultPrompt::default();
@@ -110,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('/') {
-            handle_slash(cmd, &mut session, &mut history, &policy, &mut extra_tools).await;
+            handle_slash(cmd, &mut host, &mut history, &ext_tools).await;
             continue;
         }
         let user_msg = AgentMessage::User(UserMessage {
@@ -119,29 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         // Shrink working memory only; JSONL on disk stays append-only full log.
         history = compact_by_count(&history, compact_max);
-        let mut tools = built_in_tools();
-        tools.extend(ext_tools.iter().cloned());
-        tools.extend(extra_tools.iter().cloned());
-        let context = AgentContext {
-            system_prompt: system_prompt.clone(),
-            messages: history.clone(),
-            tools,
-            cwd: cwd.clone(),
-            env: std::env::vars().collect(),
-            session_id: session.current_id().to_string(),
-        };
         let mut printer = EventPrinter::new(io::stdout());
-        // Clear any abort left over from a prior run before starting this one.
-        signal.store(false, Ordering::Relaxed);
-        match run_agent_loop(vec![user_msg], context, config.clone(), |ev| {
-            printer.on_event(&ev);
-        })
-        .await
+        match host
+            .run_turn(user_msg, &history, |ev| {
+                printer.on_event(&ev);
+            })
+            .await
         {
-            Ok(new_msgs) => {
-                history.extend(new_msgs.iter().cloned());
-                let _ = session.append(&new_msgs).await;
-            }
+            Ok(new_msgs) => history.extend(new_msgs),
             Err(e) => eprintln!("\n(run error: {e})"),
         }
         let _ = io::stdout().flush();
@@ -164,7 +146,11 @@ async fn load_external_from_env() -> Vec<ToolDefinition> {
     }
     match load_external_tools(&cmds).await {
         Ok(t) => {
-            eprintln!("(external tools: {} from {} command(s))", t.len(), cmds.len());
+            eprintln!(
+                "(external tools: {} from {} command(s))",
+                t.len(),
+                cmds.len()
+            );
             t
         }
         Err(e) => {
@@ -176,22 +162,21 @@ async fn load_external_from_env() -> Vec<ToolDefinition> {
 
 async fn handle_slash(
     cmd: &str,
-    session: &mut SessionManager,
+    host: &mut Host,
     history: &mut Vec<AgentMessage>,
-    policy: &Arc<PermissionPolicy>,
-    extra_tools: &mut Vec<ToolDefinition>,
+    ext_tools: &[ToolDefinition],
 ) {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("exit") | Some("quit") => std::process::exit(0),
         Some("clear") => {
-            session.clear();
+            host.session_mut().clear();
             history.clear();
             println!("(new session)");
         }
         Some("mode") => match parts.next().and_then(Mode::parse) {
             Some(m) => {
-                policy.set_mode(m);
+                host.policy().set_mode(m);
                 println!("(mode -> {m:?})");
             }
             None => println!("usage: /mode <suggest|auto-edit|full-auto>"),
@@ -199,19 +184,23 @@ async fn handle_slash(
         Some("resume") => {
             let arg = parts.next().unwrap_or("last");
             let r = if arg == "last" {
-                session.resume_last().await
+                host.session_mut().resume_last().await
             } else {
-                session.resume(arg).await
+                host.session_mut().resume(arg).await
             };
             match r {
                 Ok(m) => {
                     *history = m;
-                    println!("(resumed {} with {} msgs)", session.current_id(), history.len());
+                    println!(
+                        "(resumed {} with {} msgs)",
+                        host.session().current_id(),
+                        history.len()
+                    );
                 }
                 Err(e) => println!("(resume: {e})"),
             }
         }
-        Some("sessions") => match session.list().await {
+        Some("sessions") => match host.session().list().await {
             Ok(list) => {
                 if list.is_empty() {
                     println!("(no sessions)");
@@ -223,8 +212,9 @@ async fn handle_slash(
             Err(e) => println!("(list: {e})"),
         },
         Some("reload-tools") => {
-            *extra_tools = load_external_from_env().await;
-            println!("(reloaded {} external tool(s))", extra_tools.len());
+            let extra = load_external_from_env().await;
+            host.set_tools(assemble_tools(ext_tools, &extra));
+            println!("(reloaded {} external tool(s))", extra.len());
         }
         Some("help") => println!(
             "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto>  /sessions  /reload-tools  /exit"

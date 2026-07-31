@@ -243,7 +243,9 @@ pub fn commands_from_env() -> Vec<Vec<String>> {
     commands_from(&|k| std::env::var(k))
 }
 
-pub fn commands_from(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Vec<Vec<String>> {
+pub fn commands_from(
+    lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Vec<Vec<String>> {
     let Ok(raw) = lookup("GASKET_EXTERNAL_TOOLS") else {
         return Vec::new();
     };
@@ -266,14 +268,10 @@ fn shell_words(s: &str) -> Vec<&str> {
 }
 
 /// Spawn every command from env/list; collect tools. Failures are returned per command.
-pub async fn load_all(
-    commands: &[Vec<String>],
-) -> Result<Vec<ToolDefinition>, ExternalToolError> {
+pub async fn load_all(commands: &[Vec<String>]) -> Result<Vec<ToolDefinition>, ExternalToolError> {
     let mut tools = Vec::new();
     for cmd in commands {
-        let (program, args) = cmd
-            .split_first()
-            .ok_or(ExternalToolError::Empty)?;
+        let (program, args) = cmd.split_first().ok_or(ExternalToolError::Empty)?;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (_bridge, defs) = ExternalToolBridge::spawn(program, &arg_refs).await?;
         // Bridge lives inside each tool's execute Arc; drop tools → kill child.
@@ -370,7 +368,10 @@ for line in sys.stdin:
             }
         });
         assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0], vec!["python3".to_string(), "/tmp/a.py".to_string()]);
+        assert_eq!(
+            cmds[0],
+            vec!["python3".to_string(), "/tmp/a.py".to_string()]
+        );
         assert_eq!(cmds[1], vec!["./bin/x".to_string()]);
     }
 }

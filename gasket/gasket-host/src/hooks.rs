@@ -49,11 +49,7 @@ impl HookChain for HookStack {
         }
     }
 
-    fn after_tool_call(
-        &self,
-        tool_call_id: &str,
-        result: &ToolResultMessage,
-    ) -> ToolResultMessage {
+    fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {
         let mut current = result.clone();
         for chain in &self.chains {
             current = chain.after_tool_call(tool_call_id, &current);
@@ -69,12 +65,7 @@ mod tests {
 
     struct BlockBash;
     impl HookChain for BlockBash {
-        fn before_tool_call(
-            &self,
-            _: &str,
-            name: &str,
-            _: &serde_json::Value,
-        ) -> ToolCallVerdict {
+        fn before_tool_call(&self, _: &str, name: &str, _: &serde_json::Value) -> ToolCallVerdict {
             if name == "bash" {
                 ToolCallVerdict::Block("no bash".into())
             } else {
@@ -88,12 +79,7 @@ mod tests {
 
     struct AllowAll;
     impl HookChain for AllowAll {
-        fn before_tool_call(
-            &self,
-            _: &str,
-            _: &str,
-            _: &serde_json::Value,
-        ) -> ToolCallVerdict {
+        fn before_tool_call(&self, _: &str, _: &str, _: &serde_json::Value) -> ToolCallVerdict {
             ToolCallVerdict::Allow
         }
         fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
@@ -103,12 +89,7 @@ mod tests {
 
     struct Redact;
     impl HookChain for Redact {
-        fn before_tool_call(
-            &self,
-            _: &str,
-            _: &str,
-            _: &serde_json::Value,
-        ) -> ToolCallVerdict {
+        fn before_tool_call(&self, _: &str, _: &str, _: &serde_json::Value) -> ToolCallVerdict {
             ToolCallVerdict::Allow
         }
         fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
@@ -124,10 +105,7 @@ mod tests {
 
     #[test]
     fn first_block_wins() {
-        let stack = HookStack::new(vec![
-            Arc::new(AllowAll),
-            Arc::new(BlockBash),
-        ]);
+        let stack = HookStack::new(vec![Arc::new(AllowAll), Arc::new(BlockBash)]);
         let v = stack.before_tool_call("1", "bash", &serde_json::json!({}));
         assert!(matches!(v, ToolCallVerdict::Block(_)));
     }

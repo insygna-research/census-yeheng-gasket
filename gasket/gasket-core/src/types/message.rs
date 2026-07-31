@@ -1,7 +1,5 @@
 //! `AgentMessage` — the internal unified message model.
 //!
-//! See `gasket-refactor-plan.md` §3.1.
-//!
 //! All messages carry a `timestamp` (ms since epoch via [`crate::now`]).
 //! `CustomMessage` is plugin-private and filtered out at the LLM boundary.
 

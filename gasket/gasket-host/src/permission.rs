@@ -61,6 +61,9 @@ impl PermissionPolicy {
         }
     }
 
+    /// V0 hardcoded name table; unknown tools default to High (safe default).
+    /// Per-tool risk metadata on `ToolDefinition` is future work — there is
+    /// no consumer for it yet.
     pub fn risk_of(tool_name: &str) -> RiskLevel {
         match tool_name {
             "read" | "list" | "grep" => RiskLevel::Low,

@@ -1,6 +1,6 @@
 //! Anthropic native messages API provider.
 //!
-//! See `gasket-refactor-plan.md` §8.2. Uses the same SSE transport as
+//! Uses the same SSE transport as
 //! [`crate::providers::openai_compat`] but a different body/event shape:
 //! `system` is a top-level field, tools use `input_schema`, and stream deltas
 //! arrive as `content_block_delta` events with `text_delta` / `input_json_delta`.

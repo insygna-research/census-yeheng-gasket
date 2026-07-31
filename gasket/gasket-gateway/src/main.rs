@@ -44,8 +44,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use gasket_core::{
-    built_in_tools, run_agent_loop, AgentContext, AgentEvent, AgentMessage, ContentBlock,
-    ContentDelta, ToolDefinition, UserMessage,
+    built_in_tools, run_agent_loop, AgentEvent, AgentMessage, ContentBlock, ContentDelta,
+    ToolDefinition, UserMessage,
 };
 use gasket_host::{ConfigLoader, Mode, PermissionPolicy};
 
@@ -58,6 +58,10 @@ struct AppState {
 struct WsSession {
     sender: SplitSink<WebSocket, Message>,
     history: Vec<AgentMessage>,
+    /// Provider-reported token usage accumulated across turns (fed by
+    /// `AfterProviderResponse` events in the forwarder).
+    usage_in: u64,
+    usage_out: u64,
 }
 
 // ── Wire protocol types ──────────────────────────────────────
@@ -88,22 +92,64 @@ struct OutgoingEvent {
 
 impl OutgoingEvent {
     fn content(s: String) -> Self {
-        Self { event_type: "content", content: Some(s), name: None, arguments: None, output: None, message: None }
+        Self {
+            event_type: "content",
+            content: Some(s),
+            name: None,
+            arguments: None,
+            output: None,
+            message: None,
+        }
     }
     fn thinking(s: String) -> Self {
-        Self { event_type: "thinking", content: Some(s), name: None, arguments: None, output: None, message: None }
+        Self {
+            event_type: "thinking",
+            content: Some(s),
+            name: None,
+            arguments: None,
+            output: None,
+            message: None,
+        }
     }
     fn tool_start(name: String, args: String) -> Self {
-        Self { event_type: "tool_start", content: None, name: Some(name), arguments: Some(args), output: None, message: None }
+        Self {
+            event_type: "tool_start",
+            content: None,
+            name: Some(name),
+            arguments: Some(args),
+            output: None,
+            message: None,
+        }
     }
     fn tool_end(name: String, output: String) -> Self {
-        Self { event_type: "tool_end", content: None, name: Some(name), arguments: None, output: Some(output), message: None }
+        Self {
+            event_type: "tool_end",
+            content: None,
+            name: Some(name),
+            arguments: None,
+            output: Some(output),
+            message: None,
+        }
     }
     fn error(msg: String) -> Self {
-        Self { event_type: "error", content: Some(msg.clone()), name: None, arguments: None, output: None, message: Some(msg) }
+        Self {
+            event_type: "error",
+            content: Some(msg.clone()),
+            name: None,
+            arguments: None,
+            output: None,
+            message: Some(msg),
+        }
     }
     fn done() -> Self {
-        Self { event_type: "done", content: None, name: None, arguments: None, output: None, message: None }
+        Self {
+            event_type: "done",
+            content: None,
+            name: None,
+            arguments: None,
+            output: None,
+            message: None,
+        }
     }
 }
 
@@ -121,18 +167,18 @@ async fn main() {
         sessions: DashMap::new(),
     });
 
-    let frontend_dist = std::env::var("GASKET_GATEWAY_STATIC_DIR")
-        .unwrap_or_else(|_| "../web/dist".to_string());
+    let frontend_dist =
+        std::env::var("GASKET_GATEWAY_STATIC_DIR").unwrap_or_else(|_| "../web/dist".to_string());
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/commands", get(get_commands))
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))
         .fallback_service(
-            tower_http::services::ServeDir::new(&frontend_dist)
-                .not_found_service(tower_http::services::ServeFile::new(
-                    format!("{frontend_dist}/index.html"),
-                )),
+            tower_http::services::ServeDir::new(&frontend_dist).not_found_service(
+                tower_http::services::ServeFile::new(format!("{frontend_dist}/index.html")),
+            ),
         )
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
@@ -157,8 +203,13 @@ async fn ws_handler(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // `user_id` is untrusted client input. Never use it as a filesystem path
+    // component: a malicious `?user_id=../../etc` would otherwise write the
+    // session JSONL outside the store root. Validate; fall back to a fresh
+    // server-generated UUID when missing or unsafe.
     let session_id = params
         .get("user_id")
+        .filter(|s| gasket_core::is_valid_session_id(s))
         .cloned()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!("ws upgrade: session={session_id}");
@@ -170,6 +221,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let session = Arc::new(Mutex::new(WsSession {
         sender: ws_tx,
         history: Vec::new(),
+        usage_in: 0,
+        usage_out: 0,
     }));
     state.sessions.insert(session_id.clone(), session.clone());
 
@@ -227,6 +280,34 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     Some(t) if !t.trim().is_empty() => t,
                     _ => continue,
                 };
+                info!(
+                    "session {session_id}: message (trace {:?})",
+                    incoming.trace_id
+                );
+
+                // Slash commands are handled server-side; anything else goes
+                // to the LLM. Keep this list in sync with `/api/commands`.
+                if let Some(cmd) = user_text.strip_prefix('/') {
+                    let mut parts = cmd.split_whitespace();
+                    let reply = match parts.next() {
+                        Some("clear") => {
+                            session.lock().await.history.clear();
+                            Some(OutgoingEvent::content("(session cleared)".to_string()))
+                        }
+                        Some("help") => Some(OutgoingEvent::content(
+                            "commands: /clear  /help".to_string(),
+                        )),
+                        Some(other) => {
+                            Some(OutgoingEvent::error(format!("unknown command /{other}")))
+                        }
+                        None => None,
+                    };
+                    if let Some(ev) = reply {
+                        let mut s = session.lock().await;
+                        send_json(&mut s.sender, &ev).await;
+                    }
+                    continue;
+                }
 
                 let user_msg = AgentMessage::User(UserMessage {
                     content: vec![ContentBlock::text(user_text)],
@@ -239,35 +320,36 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                 // ── Spawn agent loop ──────────────────────────
                 // We run it in a background task so the main task can
                 // eavesdrop on incoming messages (like "cancel").
-                let (event_tx, event_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-                let (result_tx, mut result_rx) =
-                    tokio::sync::oneshot::channel::<
-                        Result<Vec<AgentMessage>, gasket_core::AgentError>,
-                    >();
+                let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                let (result_tx, mut result_rx) = tokio::sync::oneshot::channel::<
+                    Result<Vec<AgentMessage>, gasket_core::AgentError>,
+                >();
 
-                let agent_cfg = prepare_agent_config(
-                    &host_cfg,
-                    &system_prompt,
-                    &history,
-                    &session_id,
-                    &cwd,
-                    &extra_tools,
-                    signal.clone(),
+                let tools = {
+                    let mut t = built_in_tools();
+                    t.extend(extra_tools.iter().cloned());
+                    t
+                };
+                let (context, config) = host_cfg.prepare_turn(
+                    gasket_host::TurnInputs {
+                        system_prompt: &system_prompt,
+                        history: &history,
+                        tools: &tools,
+                        cwd: &cwd,
+                        session_id: &session_id,
+                    },
+                    &signal,
                     policy.clone(),
+                    host_cfg.provider_stream_fn(),
+                    host_cfg.tunables.max_turns,
                 );
 
                 let agent_event_tx = event_tx.clone();
 
                 tokio::spawn(async move {
-                    let result = run_agent_loop(
-                        vec![user_msg],
-                        agent_cfg.context,
-                        agent_cfg.config,
-                        |ev| {
-                            let _ = agent_event_tx.send(ev);
-                        },
-                    )
+                    let result = run_agent_loop(vec![user_msg], context, config, |ev| {
+                        let _ = agent_event_tx.send(ev);
+                    })
                     .await;
                     drop(event_tx); // Signal the forwarder to stop.
                     let _ = result_tx.send(result);
@@ -283,10 +365,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     while let Some(event) = rx.recv().await {
                         // Capture tool names as they arrive.
                         if let AgentEvent::ToolExecutionStart {
-                            tool_call_id, tool_name, ..
+                            tool_call_id,
+                            tool_name,
+                            ..
                         } = &event
                         {
                             tool_names.insert(tool_call_id.clone(), tool_name.clone());
+                        }
+                        // Accumulate provider-reported usage for the context API.
+                        if let AgentEvent::AfterProviderResponse { response, .. } = &event {
+                            if let Some(u) = &response.usage {
+                                let mut s = fwd_session.lock().await;
+                                s.usage_in += u.input_tokens;
+                                s.usage_out += u.output_tokens;
+                            }
                         }
                         let json = event_to_ws(&event, &mut tool_names);
                         if let Some(json) = json {
@@ -338,7 +430,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         msg = ws_rx.next() => {
                             match msg {
                                 Some(Ok(Message::Text(t))) => {
-                                    if t.contains(r#""cancel""#) || t.contains("cancel") {
+                                    // Cancel only on an explicit
+                                    // `{"type":"cancel"}` - never on a user
+                                    // message that merely contains "cancel".
+                                    let is_cancel = serde_json::from_str::<
+                                        IncomingMessage,
+                                    >(&t)
+                                        .ok()
+                                        .is_some_and(|m| m.msg_type == "cancel");
+                                    if is_cancel {
                                         info!("session {session_id}: cancel during turn");
                                         signal.store(true, Ordering::Relaxed);
                                     }
@@ -378,47 +478,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
 
     info!("session {session_id}: ended");
     state.sessions.remove(&session_id);
-}
-
-// ── Agent config builder ───────────────────────────────────────
-
-struct AgentConfig {
-    context: AgentContext,
-    config: gasket_core::AgentLoopConfig,
-}
-
-fn prepare_agent_config(
-    host_cfg: &gasket_host::HostConfig,
-    system_prompt: &str,
-    history: &[AgentMessage],
-    session_id: &str,
-    cwd: &std::path::Path,
-    extra_tools: &[ToolDefinition],
-    signal: Arc<AtomicBool>,
-    policy: Arc<PermissionPolicy>,
-) -> AgentConfig {
-    let mut tools = built_in_tools();
-    tools.extend(extra_tools.iter().cloned());
-
-    let context = AgentContext {
-        system_prompt: system_prompt.to_string(),
-        messages: history.to_vec(),
-        tools,
-        cwd: cwd.to_path_buf(),
-        env: std::env::vars().collect(),
-        session_id: session_id.to_string(),
-    };
-
-    // Reset signal for a fresh turn.
-    signal.store(false, Ordering::Relaxed);
-
-    let config = host_cfg.build_loop_config(
-        host_cfg.tunables.max_turns,
-        Some(signal),
-        Some(policy as Arc<dyn gasket_core::HookChain>),
-    );
-
-    AgentConfig { context, config }
 }
 
 // ── Event → JSON conversion ────────────────────────────────────
@@ -498,26 +557,77 @@ async fn load_external_tools() -> Vec<ToolDefinition> {
 
 // ── REST API ───────────────────────────────────────────────────
 
-async fn get_context(
-    Path(_key): Path<String>,
-) -> Json<Value> {
-    Json(json!({
-        "context_stats": {
-            "usage_percent": 0,
-            "total_tokens": 0,
+/// The slash commands this gateway actually supports. The frontend's
+/// completer renders this list — every entry MUST have a handler in the WS
+/// message loop above.
+async fn get_commands() -> Json<Value> {
+    Json(json!([
+        {
+            "name": "clear",
+            "description": "Clear the conversation history",
+            "aliases": []
         },
-        "watermark_info": {}
-    }))
+        {
+            "name": "help",
+            "description": "Show available commands",
+            "aliases": ["?"]
+        }
+    ]))
 }
 
+/// The frontend keys sessions as `websocket:{id}` while the WS connection
+/// registers under bare `{id}` — strip the prefix before looking up.
+fn session_key(key: &str) -> &str {
+    key.strip_prefix("websocket:").unwrap_or(key)
+}
+
+/// Provider-reported tokens accumulated over the session, plus a saturation
+/// percentage against the configured window (`GASKET_CONTEXT_WINDOW`,
+/// default 128k). The percentage is a display heuristic; the token counts
+/// themselves are real API usage.
+fn context_stats(usage_in: u64, usage_out: u64) -> Value {
+    let window = std::env::var("GASKET_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(128_000);
+    let current = usage_in + usage_out;
+    let usage_percent = if window > 0 {
+        (current as f64 / window as f64) * 100.0
+    } else {
+        0.0
+    };
+    json!({
+        "current_tokens": current,
+        "usage_percent": usage_percent,
+        "is_compressing": false,
+    })
+}
+
+async fn get_context(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> Json<Value> {
+    let stats = match state.sessions.get(session_key(&key)) {
+        Some(s) => {
+            let s = s.lock().await;
+            context_stats(s.usage_in, s.usage_out)
+        }
+        None => context_stats(0, 0),
+    };
+    // No watermark/compaction mechanism exists in this architecture — null so
+    // the frontend hides the watermark chip instead of rendering undefined.
+    Json(json!({ "context_stats": stats, "watermark_info": null }))
+}
+
+/// Compact the session's working memory (append-only JSONL untouched), then
+/// return fresh stats. Mirrors the CLI's per-turn compaction.
 async fn compact_context(
-    Path(_key): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
 ) -> Json<Value> {
-    Json(json!({
-        "context_stats": {
-            "usage_percent": 0,
-            "total_tokens": 0,
-        },
-        "watermark_info": {}
-    }))
+    let mut stats = context_stats(0, 0);
+    if let Some(s) = state.sessions.get(session_key(&key)) {
+        let mut s = s.lock().await;
+        let max = gasket_host::max_messages_from_env();
+        s.history = gasket_host::compact_by_count(&s.history, max);
+        stats = context_stats(s.usage_in, s.usage_out);
+    }
+    Json(json!({ "context_stats": stats, "watermark_info": null }))
 }

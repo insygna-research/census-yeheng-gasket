@@ -1,7 +1,7 @@
 //! OpenAI-compatible provider (OpenAI / DeepSeek / 智谱 / xAI / Groq / Ollama /
 //! vLLM / etc.).
 //!
-//! See `gasket-refactor-plan.md` §8.1. One implementation covers ~80% of
+//! One implementation covers ~80% of
 //! providers; Anthropic native lives in [`crate::providers::anthropic`].
 
 use std::pin::Pin;

@@ -1,7 +1,5 @@
 //! `AgentEvent` — single-direction state-change signals.
 //!
-//! See `gasket-refactor-plan.md` §3.2.
-//!
 //! **Every variant is a pure notification.** None of them ask the agent to do
 //! anything — interceptable behavior (block / modify tool calls) lives in the
 //! separate `register_before_tool_call` / `register_after_tool_call` hook API,

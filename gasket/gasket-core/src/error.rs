@@ -15,8 +15,12 @@ pub enum AgentError {
     Tool(String),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("corrupt transcript: {0}")]
+    Transcript(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid session id: {0}")]
+    InvalidSessionId(String),
 }
 
 /// Error returned by a tool's `execute` closure.

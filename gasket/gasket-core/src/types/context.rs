@@ -1,6 +1,4 @@
 //! `AgentContext` / `AgentLoopConfig` — what the agent sees and how it runs.
-//!
-//! See `gasket-refactor-plan.md` §3.3.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
