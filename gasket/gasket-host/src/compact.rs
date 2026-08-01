@@ -21,21 +21,64 @@ pub fn max_messages_from(lookup: &dyn Fn(&str) -> Result<String, std::env::VarEr
         .unwrap_or(DEFAULT_MAX_MESSAGES)
 }
 
-/// If `messages.len() > max_messages`, keep the newest `max_messages - 1`
-/// entries and prepend one user notice naming how many were dropped.
+/// Partition `messages` into atomic `[start, end)` groups that must never be
+/// split across a compaction boundary. An `Assistant` opens a group and
+/// absorbs any immediately-following `ToolResult` messages into the same
+/// group; every other message forms its own singleton group.
+fn atomic_groups(messages: &[AgentMessage]) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let start = i;
+        if matches!(messages[i], AgentMessage::Assistant(_)) {
+            i += 1;
+            while i < messages.len() && matches!(messages[i], AgentMessage::ToolResult(_)) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        groups.push((start, i));
+    }
+    groups
+}
+
+/// If `messages.len() > max_messages`, keep the newest groups whose total
+/// message count fits in `max_messages - 1` (one slot reserved for the
+/// summary notice) and prepend one user notice naming how many were dropped.
+/// Groups are kept whole, so an `Assistant(tool_call)` is never separated from
+/// its trailing `ToolResult`s.
 ///
 /// Under budget (or `max_messages == 0`): clone unchanged.
-/// Best-effort by count only — no turn-boundary repair.
 pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<AgentMessage> {
     if max_messages == 0 || messages.len() <= max_messages {
         return messages.to_vec();
     }
 
-    let keep = max_messages.saturating_sub(1);
-    let start = messages.len().saturating_sub(keep);
-    let dropped = start;
+    let groups = atomic_groups(messages);
+    let budget = max_messages.saturating_sub(1);
 
-    let mut out = Vec::with_capacity(keep + 1);
+    // Walk groups from newest backwards, accumulating whole groups until the
+    // running message count would exceed the budget. Always keep at least the
+    // final group.
+    let mut kept_msg_count = 0;
+    let mut first_kept_group = groups.len();
+    for (idx, &(start, end)) in groups.iter().enumerate().rev() {
+        let group_len = end - start;
+        if idx < groups.len() - 1 && kept_msg_count + group_len > budget {
+            break;
+        }
+        kept_msg_count += group_len;
+        first_kept_group = idx;
+    }
+
+    let start = groups[first_kept_group].0;
+    let dropped = start;
+    if dropped == 0 {
+        return messages.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(kept_msg_count + 1);
     out.push(AgentMessage::User(UserMessage {
         content: vec![ContentBlock::text(format!(
             "[compacted {dropped} earlier messages]"
@@ -49,7 +92,8 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gasket_core::{AssistantMessage, StopReason};
+    use gasket_core::types::message::{FunctionCall, ToolCall};
+    use gasket_core::{AssistantMessage, StopReason, ToolResultMessage};
 
     fn user(s: &str) -> AgentMessage {
         AgentMessage::User(UserMessage {
@@ -64,6 +108,36 @@ mod tests {
             model: "m".into(),
             stop_reason: StopReason::EndTurn,
             usage: None,
+            timestamp: 1,
+        })
+    }
+
+    /// Assistant carrying a single tool call with the given id.
+    fn assistant_with_tool(id: &str) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: id.into(),
+                    function: FunctionCall {
+                        name: "f".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            }],
+            model: "m".into(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            timestamp: 1,
+        })
+    }
+
+    /// ToolResult answering `tool_call_id`.
+    fn result(id: &str) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "f".into(),
+            content: vec![ContentBlock::text("ok")],
+            is_error: false,
             timestamp: 1,
         })
     }
@@ -115,11 +189,21 @@ mod tests {
     }
 
     #[test]
-    fn max_one_is_summary_only() {
+    fn max_one_keeps_last_group_plus_notice() {
+        // max=1 leaves zero budget for real messages, but the last atomic
+        // group is always kept (never dropped entirely), so the result is the
+        // summary notice followed by the final message.
         let msgs = vec![user("a"), user("b")];
         let out = compact_by_count(&msgs, 1);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert!(matches!(out[0], AgentMessage::User(_)));
+        match &out[1] {
+            AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "b"),
+                _ => panic!(),
+            },
+            _ => panic!("expected last message preserved"),
+        }
     }
 
     #[test]
@@ -138,5 +222,51 @@ mod tests {
             }),
             12
         );
+    }
+
+    #[test]
+    fn never_splits_tool_call_from_result() {
+        // [user, asst(tc=t1), result(t1), user, asst(tc=t2), result(t2), user]
+        let msgs = vec![
+            user("u1"),
+            assistant_with_tool("t1"),
+            result("t1"),
+            user("u2"),
+            assistant_with_tool("t2"),
+            result("t2"),
+            user("u3"),
+        ];
+        let out = compact_by_count(&msgs, 4);
+
+        // Collect tool_call ids and result ids from the kept tail (skip the
+        // leading summary notice).
+        let mut call_ids: Vec<String> = Vec::new();
+        let mut result_ids: Vec<String> = Vec::new();
+        for m in out.iter().skip(1) {
+            match m {
+                AgentMessage::Assistant(a) => {
+                    for b in &a.content {
+                        if let ContentBlock::ToolCall { tool_call } = b {
+                            call_ids.push(tool_call.id.clone());
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(r) => result_ids.push(r.tool_call_id.clone()),
+                _ => {}
+            }
+        }
+        // Every tool call has a matching result and vice versa: no orphans.
+        for id in &call_ids {
+            assert!(
+                result_ids.contains(id),
+                "orphan tool_call {id} has no result"
+            );
+        }
+        for id in &result_ids {
+            assert!(
+                call_ids.contains(id),
+                "orphan tool_result {id} has no call"
+            );
+        }
     }
 }
