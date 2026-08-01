@@ -25,6 +25,15 @@
 //! {"type":"error","content":"...","message":"..."}
 //! {"type":"done"}
 //! ```
+//!
+//! ### 契约核对表（前端 `useChatSession.ts` / `types/index.ts` 全部消息类型）
+//!
+//! | 消息 | 方向 | 状态 |
+//! |---|---|---|
+//! | `message` / `cancel` | C→S | ✅ 已实现 |
+//! | `approval_request` / `approval_response` | 双向 | ✅ 已实现（本任务） |
+//! | `thinking` / `tool_start` / `tool_end` / `content` / `error` / `done` | S→C | ✅ 已实现 |
+//! | `subagent_*`（10 种） | S→C | ⏳ M2 规划（core 子 agent 编排落地后启用；前端处理器已存在，网关不发送） |
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +56,12 @@ use gasket_core::{
     built_in_tools, run_agent_loop, AgentEvent, AgentMessage, ContentBlock, ContentDelta,
     ToolDefinition, UserMessage,
 };
+use gasket_host::permission::Approver;
 use gasket_host::{ConfigLoader, Mode, PermissionPolicy};
+
+mod approval;
+
+use approval::{ApprovalRegistry, RegisterOutcome};
 
 // ── Shared state ──────────────────────────────────────────────
 
@@ -62,6 +76,7 @@ struct WsSession {
     /// `AfterProviderResponse` events in the forwarder).
     usage_in: u64,
     usage_out: u64,
+    registry: ApprovalRegistry,
 }
 
 // ── Wire protocol types ──────────────────────────────────────
@@ -74,10 +89,26 @@ struct IncomingMessage {
     trace_id: Option<String>,
 }
 
+/// Inbound `{"type":"approval_response","request_id":"ap1","approved":true,"remember":false}`
+/// from the frontend. `remember` is optional (defaults false).
+#[derive(Deserialize)]
+struct ApprovalResponse {
+    request_id: String,
+    approved: bool,
+    #[serde(default)]
+    remember: bool,
+}
+
 #[derive(Serialize)]
 struct OutgoingEvent {
     #[serde(rename = "type")]
     event_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,6 +125,9 @@ impl OutgoingEvent {
     fn content(s: String) -> Self {
         Self {
             event_type: "content",
+            id: None,
+            tool_name: None,
+            description: None,
             content: Some(s),
             name: None,
             arguments: None,
@@ -104,6 +138,9 @@ impl OutgoingEvent {
     fn thinking(s: String) -> Self {
         Self {
             event_type: "thinking",
+            id: None,
+            tool_name: None,
+            description: None,
             content: Some(s),
             name: None,
             arguments: None,
@@ -114,6 +151,9 @@ impl OutgoingEvent {
     fn tool_start(name: String, args: String) -> Self {
         Self {
             event_type: "tool_start",
+            id: None,
+            tool_name: None,
+            description: None,
             content: None,
             name: Some(name),
             arguments: Some(args),
@@ -124,6 +164,9 @@ impl OutgoingEvent {
     fn tool_end(name: String, output: String) -> Self {
         Self {
             event_type: "tool_end",
+            id: None,
+            tool_name: None,
+            description: None,
             content: None,
             name: Some(name),
             arguments: None,
@@ -134,6 +177,9 @@ impl OutgoingEvent {
     fn error(msg: String) -> Self {
         Self {
             event_type: "error",
+            id: None,
+            tool_name: None,
+            description: None,
             content: Some(msg.clone()),
             name: None,
             arguments: None,
@@ -144,9 +190,32 @@ impl OutgoingEvent {
     fn done() -> Self {
         Self {
             event_type: "done",
+            id: None,
+            tool_name: None,
+            description: None,
             content: None,
             name: None,
             arguments: None,
+            output: None,
+            message: None,
+        }
+    }
+    fn approval_request(request_id: String, tool_name: String, args: &serde_json::Value) -> Self {
+        // description 给前端展示；arguments 保留原始参数。截断防超长。
+        let desc = serde_json::to_string(args).unwrap_or_default();
+        let desc = if desc.chars().count() > 300 {
+            format!("{}...", desc.chars().take(300).collect::<String>())
+        } else {
+            desc
+        };
+        Self {
+            event_type: "approval_request",
+            id: Some(request_id),
+            tool_name: Some(tool_name),
+            description: Some(desc),
+            content: None,
+            name: None,
+            arguments: Some(args.to_string()),
             output: None,
             message: None,
         }
@@ -223,6 +292,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         history: Vec::new(),
         usage_in: 0,
         usage_out: 0,
+        registry: ApprovalRegistry::new(),
     }));
     state.sessions.insert(session_id.clone(), session.clone());
 
@@ -243,10 +313,46 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let cwd = std::env::current_dir().unwrap_or_default();
     let system_prompt = "You are a helpful, concise assistant.".to_string();
     let signal = Arc::new(AtomicBool::new(false));
-    let policy = Arc::new(PermissionPolicy::new(
-        Mode::FullAuto,
-        Arc::new(|_, _| Box::pin(async { true })),
-    ));
+    let mode = std::env::var("GASKET_GATEWAY_MODE")
+        .ok()
+        .and_then(|s| Mode::parse(&s))
+        .unwrap_or(Mode::AutoEdit);
+    // cancel 信号的双通道：AtomicBool 驱动 loop 中止，watch 解锁挂起的审批。
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let approver_session = session.clone();
+    // 显式标注 Approver：闭包返回的 Box::pin(async …) 需要在这里按
+    // `Pin<Box<dyn Future + Send>>` 非大小化（裸闭包推断会把返回类型
+    // 锁死为具体 async block，后续再转 Arc<dyn Fn…> 会失败）。
+    let approver: Approver = Arc::new(move |tool_name: &str, args: &serde_json::Value| {
+        let session = approver_session.clone();
+        let mut cancel_rx = cancel_rx.clone();
+        Box::pin(async move {
+            let outcome = { session.lock().await.registry.register(tool_name) };
+            let (request_id, rx) = match outcome {
+                RegisterOutcome::Remembered(v) => return v,
+                RegisterOutcome::Pending { request_id, rx } => (request_id, rx),
+            };
+            {
+                let mut s = session.lock().await;
+                let ev = OutgoingEvent::approval_request(
+                    request_id.clone(),
+                    tool_name.to_string(),
+                    args,
+                );
+                send_json(&mut s.sender, &ev).await;
+            }
+            let timeout_s = std::env::var("GASKET_APPROVAL_TIMEOUT_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300u64);
+            tokio::select! {
+                r = rx => r.unwrap_or(false),
+                _ = cancel_rx.changed() => false,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_s)) => false,
+            }
+        })
+    });
+    let policy = Arc::new(PermissionPolicy::new(mode, approver));
     let extra_tools = load_external_tools().await;
     let storage = gasket_core::JsonlStorage::default_root();
 
@@ -403,6 +509,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                 let mut s = session.lock().await;
                                 send_json(&mut s.sender, &OutgoingEvent::done()).await;
                             }
+                            // 回合结束：清空在途审批，与后续回合隔离。
+                            session.lock().await.registry.clear_pending();
 
                             match result {
                                 Ok(Ok(new_msgs)) => {
@@ -433,23 +541,35 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         msg = ws_rx.next() => {
                             match msg {
                                 Some(Ok(Message::Text(t))) => {
-                                    // Cancel only on an explicit
-                                    // `{"type":"cancel"}` - never on a user
-                                    // message that merely contains "cancel".
-                                    let is_cancel = serde_json::from_str::<
-                                        IncomingMessage,
-                                    >(&t)
-                                        .ok()
-                                        .is_some_and(|m| m.msg_type == "cancel");
-                                    if is_cancel {
-                                        info!("session {session_id}: cancel during turn");
-                                        signal.store(true, Ordering::Relaxed);
+                                    if let Ok(incoming) =
+                                        serde_json::from_str::<IncomingMessage>(&t)
+                                    {
+                                        match incoming.msg_type.as_str() {
+                                            "cancel" => {
+                                                info!("session {session_id}: cancel during turn");
+                                                signal.store(true, Ordering::Relaxed);
+                                                let _ = cancel_tx.send(true);
+                                            }
+                                            "approval_response" => {
+                                                if let Ok(resp) = serde_json::from_str::<
+                                                    ApprovalResponse,
+                                                >(&t)
+                                                {
+                                                    session.lock().await.registry.respond(
+                                                        &resp.request_id,
+                                                        resp.approved,
+                                                        resp.remember,
+                                                    );
+                                                }
+                                            }
+                                            _ => {} // 回合中的其他消息忽略
+                                        }
                                     }
-                                    // Ignore other messages during agent execution.
                                 }
                                 Some(Ok(Message::Close(_))) | None => {
                                     info!("session {session_id}: ws closed during turn");
                                     signal.store(true, Ordering::Relaxed);
+                                    let _ = cancel_tx.send(true);
                                     // Wait for agent to finish cleanly.
                                     let _ = fwd_handle.await;
                                     break;
@@ -461,6 +581,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                 Some(Err(e)) => {
                                     warn!("session {session_id}: ws error during turn: {e}");
                                     signal.store(true, Ordering::Relaxed);
+                                    let _ = cancel_tx.send(true);
                                     let _ = fwd_handle.await;
                                     break;
                                 }
@@ -470,8 +591,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                 }
             }
             "cancel" => {
-                // No active turn to cancel — ignore.
+                // 回合外 cancel：置 signal + 解锁任何残留审批等待。
+                signal.store(true, Ordering::Relaxed);
+                let _ = cancel_tx.send(true);
                 info!("session {session_id}: cancel outside turn");
+            }
+            "approval_response" => {
+                // 迟到的审批响应（回合已结束，registry 已 clear）：静默忽略。
+                if let Ok(resp) = serde_json::from_str::<ApprovalResponse>(&msg) {
+                    session.lock().await.registry.respond(
+                        &resp.request_id,
+                        resp.approved,
+                        resp.remember,
+                    );
+                }
             }
             other => {
                 warn!("session {session_id}: unknown msg type: {other}");
