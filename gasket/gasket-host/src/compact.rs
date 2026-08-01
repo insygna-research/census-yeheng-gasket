@@ -1,7 +1,9 @@
-//! In-memory history compaction by message count.
+//! In-memory history compaction.
 //!
 //! Pure host policy: shrinks the working transcript before `run_agent_loop`.
-//! Does not rewrite JSONL. No token counting, no LLM summary.
+//! Does not rewrite JSONL, no LLM summary. Two trigger modes: token-aware
+//! (provider-reported `usage.input_tokens` with hysteresis) via
+//! [`ContextBudget`], and a simple message-count cap via [`compact_by_count`].
 
 use gasket_core::{AgentMessage, ContentBlock, UserMessage};
 
@@ -87,6 +89,123 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
     }));
     out.extend_from_slice(&messages[start..]);
     out
+}
+
+/// Parse `key` from the lookup as `T`, falling back to `default` on miss or
+/// parse failure. Mirrors the helper in `gasket-core/src/types/context.rs` so
+/// `compact.rs` stays self-contained.
+fn env_parse<T: std::str::FromStr>(
+    lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    key: &str,
+    default: T,
+) -> T {
+    lookup(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Token-aware compaction trigger with hysteresis.
+///
+/// Uses the provider-reported `usage.input_tokens` (fed in via
+/// [`record_input_tokens`](Self::record_input_tokens)) to decide when the
+/// working transcript has grown past `threshold_pct` of the context `window`.
+/// When it has, [`compact`](Self::compact) drops the oldest atomic groups
+/// until the remaining tail is estimated to fit under `target_pct` of the
+/// window, then prepends a summary notice.
+///
+/// When no usage has been recorded (`last_input_tokens == 0`), compaction
+/// falls back to a message-count cap via [`compact_by_count`].
+pub struct ContextBudget {
+    /// Model context window (`GASKET_CONTEXT_WINDOW`, default 128_000).
+    window: u64,
+    /// Compaction trigger as a percentage of `window`
+    /// (`GASKET_COMPACT_THRESHOLD_PCT`, default 80).
+    threshold_pct: u8,
+    /// Post-compaction target as a percentage of `window`
+    /// (`GASKET_COMPACT_TARGET_PCT`, default 50).
+    target_pct: u8,
+    /// Message-count fallback when no usage is available
+    /// (`GASKET_COMPACT_MAX_MESSAGES`, default 80).
+    fallback_max_messages: usize,
+    /// Most recent `usage.input_tokens` reported by the provider.
+    last_input_tokens: u64,
+}
+
+impl ContextBudget {
+    /// Read all knobs from the process environment.
+    pub fn from_env() -> Self {
+        Self::from_env_with(&|k| std::env::var(k))
+    }
+
+    /// Same as [`from_env`](Self::from_env) but with an injectable lookup -
+    /// used by tests to avoid mutating process env.
+    pub fn from_env_with(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Self {
+        Self {
+            window: env_parse(lookup, "GASKET_CONTEXT_WINDOW", 128_000),
+            threshold_pct: env_parse(lookup, "GASKET_COMPACT_THRESHOLD_PCT", 80),
+            target_pct: env_parse(lookup, "GASKET_COMPACT_TARGET_PCT", 50),
+            fallback_max_messages: max_messages_from(lookup),
+            last_input_tokens: 0,
+        }
+    }
+
+    /// Feed the provider-reported input-token count for this turn.
+    pub fn record_input_tokens(&mut self, n: u64) {
+        self.last_input_tokens = n;
+    }
+
+    /// Current input-token occupancy (most recent provider report).
+    pub fn current_tokens(&self) -> u64 {
+        self.last_input_tokens
+    }
+
+    /// True when `last_input_tokens` exceeds `threshold_pct` of `window`.
+    pub fn needs_compaction(&self) -> bool {
+        self.last_input_tokens > self.window * self.threshold_pct as u64 / 100
+    }
+
+    /// Compact `messages` according to the budget.
+    ///
+    /// - No usage recorded: fall back to [`compact_by_count`] with
+    ///   `fallback_max_messages`.
+    /// - Under threshold: return unchanged.
+    /// - Over threshold: drop the oldest whole atomic groups until the kept
+    ///   tail is estimated to fit under `target_pct` of `window`, then prepend
+    ///   a `[compacted N earlier messages]` user notice. At least one group is
+    ///   kept and at least one is dropped.
+    pub fn compact(&self, messages: &[AgentMessage]) -> Vec<AgentMessage> {
+        if self.last_input_tokens == 0 {
+            return compact_by_count(messages, self.fallback_max_messages);
+        }
+        if !self.needs_compaction() {
+            return messages.to_vec();
+        }
+
+        let groups = atomic_groups(messages);
+        let total = groups.len();
+        if total <= 1 {
+            return messages.to_vec();
+        }
+
+        let target_tokens = self.window * self.target_pct as u64 / 100;
+        let kept_groups = ((total as u64 * target_tokens / self.last_input_tokens) as usize)
+            .max(1)
+            .min(total - 1);
+        let drop_groups = total - kept_groups;
+        let keep_from = groups[drop_groups].0;
+        let dropped = keep_from;
+
+        let mut out = Vec::with_capacity(messages.len() - dropped + 1);
+        out.push(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(format!(
+                "[compacted {dropped} earlier messages]"
+            ))],
+            timestamp: gasket_core::now(),
+        }));
+        out.extend_from_slice(&messages[keep_from..]);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +356,133 @@ mod tests {
             user("u3"),
         ];
         let out = compact_by_count(&msgs, 4);
+
+        // Collect tool_call ids and result ids from the kept tail (skip the
+        // leading summary notice).
+        let mut call_ids: Vec<String> = Vec::new();
+        let mut result_ids: Vec<String> = Vec::new();
+        for m in out.iter().skip(1) {
+            match m {
+                AgentMessage::Assistant(a) => {
+                    for b in &a.content {
+                        if let ContentBlock::ToolCall { tool_call } = b {
+                            call_ids.push(tool_call.id.clone());
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(r) => result_ids.push(r.tool_call_id.clone()),
+                _ => {}
+            }
+        }
+        // Every tool call has a matching result and vice versa: no orphans.
+        for id in &call_ids {
+            assert!(
+                result_ids.contains(id),
+                "orphan tool_call {id} has no result"
+            );
+        }
+        for id in &result_ids {
+            assert!(
+                call_ids.contains(id),
+                "orphan tool_result {id} has no call"
+            );
+        }
+    }
+
+    #[test]
+    fn needs_compaction_uses_real_tokens() {
+        let mut budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 0,
+        };
+        budget.record_input_tokens(70_000);
+        assert!(!budget.needs_compaction());
+        budget.record_input_tokens(85_000);
+        assert!(budget.needs_compaction());
+    }
+
+    #[test]
+    fn compact_drops_groups_under_target() {
+        let msgs: Vec<_> = (0..10).map(|i| user(&format!("m{i}"))).collect();
+        let budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 100_000,
+        };
+        let out = budget.compact(&msgs);
+        // kept_groups = 10 * 50k / 100k = 5 -> drop 5 -> 1 notice + 5 kept = 6
+        assert_eq!(out.len(), 6);
+        match &out[0] {
+            AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => assert!(text.contains("compacted 5")),
+                _ => panic!(),
+            },
+            _ => panic!("expected summary user message"),
+        }
+    }
+
+    #[test]
+    fn compact_falls_back_when_no_usage() {
+        let msgs: Vec<_> = (0..10).map(|i| user(&format!("m{i}"))).collect();
+        let budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 4,
+            last_input_tokens: 0,
+        };
+        let out = budget.compact(&msgs);
+        // fallback: compact_by_count(msgs, 4) = 1 notice + 3 kept = 4
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn compact_under_threshold_is_noop() {
+        let msgs: Vec<_> = (0..5).map(|i| user(&format!("m{i}"))).collect();
+        let budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 50_000,
+        };
+        let out = budget.compact(&msgs);
+        assert_eq!(out.len(), 5);
+        // Clone, not prepended with a notice: first message is still m0.
+        match &out[0] {
+            AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "m0"),
+                _ => panic!(),
+            },
+            _ => panic!("expected original first message"),
+        }
+    }
+
+    #[test]
+    fn compact_never_splits_tool_pair() {
+        // [user, asst(tc=t1), result(t1), user, asst(tc=t2), result(t2), user]
+        let msgs = vec![
+            user("u1"),
+            assistant_with_tool("t1"),
+            result("t1"),
+            user("u2"),
+            assistant_with_tool("t2"),
+            result("t2"),
+            user("u3"),
+        ];
+        let budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 100_000,
+        };
+        let out = budget.compact(&msgs);
 
         // Collect tool_call ids and result ids from the kept tail (skip the
         // leading summary notice).
