@@ -318,14 +318,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         .and_then(|s| Mode::parse(&s))
         .unwrap_or(Mode::AutoEdit);
     // cancel 信号的双通道：AtomicBool 驱动 loop 中止，watch 解锁挂起的审批。
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // 闭包只保留 Sender，每次审批 subscribe() 出新 receiver——Receiver::clone()
+    // 会复制旧 observed-version，一次 cancel 后所有克隆都会立即命中 changed()
+    // （闩锁），见 approval.rs 的 wait_for_decision 测试。
+    let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
     let approver_session = session.clone();
+    // 闭包侧持有 Sender 的克隆（原 Sender 保留在主循环供 cancel 使用）。
+    let approver_cancel_tx = cancel_tx.clone();
     // 显式标注 Approver：闭包返回的 Box::pin(async …) 需要在这里按
     // `Pin<Box<dyn Future + Send>>` 非大小化（裸闭包推断会把返回类型
     // 锁死为具体 async block，后续再转 Arc<dyn Fn…> 会失败）。
     let approver: Approver = Arc::new(move |tool_name: &str, args: &serde_json::Value| {
         let session = approver_session.clone();
-        let mut cancel_rx = cancel_rx.clone();
+        let cancel_tx = approver_cancel_tx.clone();
         Box::pin(async move {
             let outcome = { session.lock().await.registry.register(tool_name) };
             let (request_id, rx) = match outcome {
@@ -345,11 +350,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300u64);
-            tokio::select! {
-                r = rx => r.unwrap_or(false),
-                _ = cancel_rx.changed() => false,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_s)) => false,
-            }
+            // subscribe() 把当前值标记为已见：只有将来的 send 才命中 changed()，
+            // 本连接的第一次 cancel 不会毒化后续所有审批。
+            approval::wait_for_decision(
+                rx,
+                cancel_tx.subscribe(),
+                std::time::Duration::from_secs(timeout_s),
+            )
+            .await
         })
     });
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
@@ -572,6 +580,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                     let _ = cancel_tx.send(true);
                                     // Wait for agent to finish cleanly.
                                     let _ = fwd_handle.await;
+                                    // 回合结束（ws 断开）：与 result 分支一致，清空在途审批。
+                                    session.lock().await.registry.clear_pending();
                                     break;
                                 }
                                 Some(Ok(Message::Ping(data))) => {
@@ -583,6 +593,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                     signal.store(true, Ordering::Relaxed);
                                     let _ = cancel_tx.send(true);
                                     let _ = fwd_handle.await;
+                                    // 回合结束（ws 错误）：与 result 分支一致，清空在途审批。
+                                    session.lock().await.registry.clear_pending();
                                     break;
                                 }
                             }

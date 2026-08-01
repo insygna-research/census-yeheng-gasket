@@ -66,6 +66,21 @@ impl ApprovalRegistry {
     }
 }
 
+/// 等待审批决策：oneshot 响应 / cancel 通知 / 超时 三路，任一先到即返回。
+/// `cancel_rx` 必须是 subscribe 出的新鲜 receiver（见 wait_for_decision 测试：
+/// 取消后新审批不得被旧信号毒化）。
+pub async fn wait_for_decision(
+    rx: oneshot::Receiver<bool>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    timeout: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        r = rx => r.unwrap_or(false),
+        _ = cancel_rx.changed() => false,
+        _ = tokio::time::sleep(timeout) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +154,80 @@ mod tests {
             panic!();
         };
         assert_eq!(request_id, "ap2");
+    }
+
+    /// 闩锁回归测试：订阅前的 cancel 不得命中 subscribe() 出的新 receiver——
+    /// 只有订阅之后的 send 才能解锁（返回 false）。旧实现用 Receiver::clone()
+    /// 每次复制旧 observed-version，第一次 cancel 后所有后续审批立即被拒。
+    #[tokio::test]
+    async fn cancel_before_subscribe_is_not_latched() {
+        let (cancel_tx, _old_rx) = tokio::sync::watch::channel(false);
+        // 先发送一次 cancel（模拟本连接早前的取消）
+        cancel_tx.send(true).unwrap();
+        let cancel_rx = cancel_tx.subscribe();
+        let (_decision_tx, decision_rx) = oneshot::channel();
+        let task = tokio::spawn(wait_for_decision(
+            decision_rx,
+            cancel_rx,
+            std::time::Duration::from_secs(60),
+        ));
+        // 让等待任务至少轮询一次：若 subscribe 被旧版本毒化，此刻应已 resolve(false)。
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "订阅前的 cancel 不得毒化新订阅（闩锁回归）"
+        );
+        // 只有后续 send 才能解锁 → false
+        cancel_tx.send(true).unwrap();
+        assert!(!task.await.unwrap());
+    }
+
+    /// 等待开始之后才收到 cancel → 立即按拒绝处理。
+    #[tokio::test]
+    async fn cancel_after_wait_starts_resolves_false() {
+        let (cancel_tx, _old_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = cancel_tx.subscribe();
+        let (_decision_tx, decision_rx) = oneshot::channel();
+        let task = tokio::spawn(wait_for_decision(
+            decision_rx,
+            cancel_rx,
+            std::time::Duration::from_secs(60),
+        ));
+        tokio::task::yield_now().await;
+        cancel_tx.send(true).unwrap();
+        assert!(!task.await.unwrap());
+    }
+
+    /// oneshot 决策通道的响应原样透出（true / false 两条路径）。
+    #[tokio::test]
+    async fn oneshot_response_resolves_value() {
+        for expected in [true, false] {
+            let (decision_tx, decision_rx) = oneshot::channel();
+            let (cancel_tx, _old_rx) = tokio::sync::watch::channel(false);
+            let cancel_rx = cancel_tx.subscribe();
+            let task = tokio::spawn(wait_for_decision(
+                decision_rx,
+                cancel_rx,
+                std::time::Duration::from_secs(60),
+            ));
+            decision_tx.send(expected).unwrap();
+            assert_eq!(task.await.unwrap(), expected);
+        }
+    }
+
+    /// 三路都未触发时，超时窗口结束后按拒绝处理，且不提前返回。
+    #[tokio::test]
+    async fn timeout_resolves_false() {
+        let (_decision_tx, decision_rx) = oneshot::channel();
+        let (cancel_tx, _old_rx) = tokio::sync::watch::channel(false);
+        let cancel_rx = cancel_tx.subscribe();
+        let start = std::time::Instant::now();
+        let result =
+            wait_for_decision(decision_rx, cancel_rx, std::time::Duration::from_millis(10)).await;
+        assert!(!result, "超时按拒绝处理");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(10),
+            "10ms 超时不应提前返回"
+        );
     }
 }
