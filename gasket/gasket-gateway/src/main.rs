@@ -76,6 +76,9 @@ struct WsSession {
     /// `AfterProviderResponse` events in the forwarder).
     usage_in: u64,
     usage_out: u64,
+    /// Most recent provider-reported input-token count for this turn (current
+    /// window occupancy). Distinct from `usage_in/out` which accumulate cost.
+    last_input_tokens: u64,
     registry: ApprovalRegistry,
 }
 
@@ -292,6 +295,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         history: Vec::new(),
         usage_in: 0,
         usage_out: 0,
+        last_input_tokens: 0,
         registry: ApprovalRegistry::new(),
     }));
     state.sessions.insert(session_id.clone(), session.clone());
@@ -363,6 +367,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
     let extra_tools = load_external_tools().await;
     let storage = gasket_core::JsonlStorage::default_root();
+    // Per-connection token-aware compaction budget. Fed from
+    // `last_input_tokens` (read off the session) before each turn; compaction
+    // runs on the history snapshot so the budget never crosses task boundaries.
+    let mut budget = gasket_host::ContextBudget::from_env();
 
     // ── Main event loop ─────────────────────────────────────
     loop {
@@ -431,8 +439,19 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     timestamp: gasket_core::now(),
                 });
 
-                // Snapshot current history.
-                let history = session.lock().await.history.clone();
+                // Snapshot current history and feed the per-turn compaction
+                // budget from the most recent provider report, then compact if
+                // over threshold. One lock grabs both history and token count.
+                let history = {
+                    let s = session.lock().await;
+                    budget.record_input_tokens(s.last_input_tokens);
+                    s.history.clone()
+                };
+                let history = if budget.needs_compaction() {
+                    budget.compact(&history)
+                } else {
+                    history
+                };
 
                 // ── Spawn agent loop ──────────────────────────
                 // We run it in a background task so the main task can
@@ -495,6 +514,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                 let mut s = fwd_session.lock().await;
                                 s.usage_in += u.input_tokens;
                                 s.usage_out += u.output_tokens;
+                                s.last_input_tokens = u.input_tokens;
                             }
                         }
                         let json = event_to_ws(&event, &mut tool_names);
@@ -731,25 +751,28 @@ fn session_key(key: &str) -> &str {
     key.strip_prefix("websocket:").unwrap_or(key)
 }
 
-/// Provider-reported tokens accumulated over the session, plus a saturation
-/// percentage against the configured window (`GASKET_CONTEXT_WINDOW`,
-/// default 128k). The percentage is a display heuristic; the token counts
+/// Context occupancy for the frontend. `last_input_tokens` is the current
+/// window occupancy (most recent provider-reported input-token count) and
+/// drives the saturation percentage against `GASKET_CONTEXT_WINDOW` (default
+/// 128k). `cumulative_in`/`cumulative_out` are the real accumulated API spend
+/// across the session. The percentage is a display heuristic; the token counts
 /// themselves are real API usage.
-fn context_stats(usage_in: u64, usage_out: u64) -> Value {
+fn context_stats(last_input_tokens: u64, usage_in: u64, usage_out: u64) -> Value {
     let window = std::env::var("GASKET_CONTEXT_WINDOW")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(128_000);
-    let current = usage_in + usage_out;
     let usage_percent = if window > 0 {
-        (current as f64 / window as f64) * 100.0
+        (last_input_tokens as f64 / window as f64) * 100.0
     } else {
         0.0
     };
     json!({
-        "current_tokens": current,
+        "current_tokens": last_input_tokens,
         "usage_percent": usage_percent,
         "is_compressing": false,
+        "cumulative_in": usage_in,
+        "cumulative_out": usage_out,
     })
 }
 
@@ -757,9 +780,9 @@ async fn get_context(State(state): State<Arc<AppState>>, Path(key): Path<String>
     let stats = match state.sessions.get(session_key(&key)) {
         Some(s) => {
             let s = s.lock().await;
-            context_stats(s.usage_in, s.usage_out)
+            context_stats(s.last_input_tokens, s.usage_in, s.usage_out)
         }
-        None => context_stats(0, 0),
+        None => context_stats(0, 0, 0),
     };
     // No watermark/compaction mechanism exists in this architecture — null so
     // the frontend hides the watermark chip instead of rendering undefined.
@@ -772,12 +795,13 @@ async fn compact_context(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<Value> {
-    let mut stats = context_stats(0, 0);
+    let mut stats = context_stats(0, 0, 0);
     if let Some(s) = state.sessions.get(session_key(&key)) {
         let mut s = s.lock().await;
-        let max = gasket_host::max_messages_from_env();
-        s.history = gasket_host::compact_by_count(&s.history, max);
-        stats = context_stats(s.usage_in, s.usage_out);
+        let mut b = gasket_host::ContextBudget::from_env();
+        b.record_input_tokens(s.last_input_tokens);
+        s.history = b.compact(&s.history);
+        stats = context_stats(s.last_input_tokens, s.usage_in, s.usage_out);
     }
     Json(json!({ "context_stats": stats, "watermark_info": null }))
 }
@@ -882,26 +906,31 @@ mod tests {
     fn context_stats_scenarios() {
         // 1. Zero usage → zero tokens, zero percent (default window).
         std::env::remove_var("GASKET_CONTEXT_WINDOW");
-        let stats = context_stats(0, 0);
+        let stats = context_stats(0, 0, 0);
         assert_eq!(stats["current_tokens"], 0);
         assert_eq!(stats["usage_percent"], 0.0);
         assert_eq!(stats["is_compressing"], false);
+        assert_eq!(stats["cumulative_in"], 0);
+        assert_eq!(stats["cumulative_out"], 0);
 
-        // 2. Usage accumulation: in + out, percentage against the default 128k window.
-        let stats = context_stats(64_000, 64_000);
-        assert_eq!(stats["current_tokens"], 128_000);
-        assert_eq!(stats["usage_percent"], 100.0);
+        // 2. Occupancy uses `last_input_tokens` (NOT cumulative in+out).
+        // 64k current against the default 128k window = 50%.
+        let stats = context_stats(64_000, 100_000, 50_000);
+        assert_eq!(stats["current_tokens"], 64_000);
+        assert_eq!(stats["usage_percent"], 50.0);
+        assert_eq!(stats["cumulative_in"], 100_000);
+        assert_eq!(stats["cumulative_out"], 50_000);
 
         // 3. A configured `GASKET_CONTEXT_WINDOW` is respected.
         std::env::set_var("GASKET_CONTEXT_WINDOW", "50000");
-        let stats = context_stats(10_000, 15_000);
+        let stats = context_stats(25_000, 999, 999);
         assert_eq!(stats["current_tokens"], 25_000);
         assert_eq!(stats["usage_percent"], 50.0);
 
         // 4. Zero window is treated as "no percentage" rather than dividing by zero.
         std::env::set_var("GASKET_CONTEXT_WINDOW", "0");
-        let stats = context_stats(1_000, 1_000);
-        assert_eq!(stats["current_tokens"], 2_000);
+        let stats = context_stats(1_000, 1_000, 1_000);
+        assert_eq!(stats["current_tokens"], 1_000);
         assert_eq!(stats["usage_percent"], 0.0);
 
         std::env::remove_var("GASKET_CONTEXT_WINDOW");
