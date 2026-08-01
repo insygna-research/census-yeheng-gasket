@@ -90,10 +90,6 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: web
 
-      - name: Build web dist
-        run: pnpm build
-        working-directory: web
-
       - name: Tauri build
         run: pnpm tauri build ${{ matrix.args }}
         working-directory: web
@@ -104,7 +100,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gasket-desktop-${{ matrix.platform }}
+          if-no-files-found: error
           path: |
+            web/src-tauri/target/aarch64-apple-darwin/release/bundle/**/*.dmg
             web/src-tauri/target/release/bundle/**/*.dmg
             web/src-tauri/target/release/bundle/**/*.msi
             web/src-tauri/target/release/bundle/**/*.exe
