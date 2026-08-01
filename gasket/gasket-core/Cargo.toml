@@ -29,7 +29,6 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 # Async utilities
-async-trait = { workspace = true }
 futures-util = { workspace = true }
 async-stream = "0.3"
 

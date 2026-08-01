@@ -39,7 +39,6 @@ tokio = { version = "1", features = [
     "fs", "io-util", "net", "process", "signal",
 ] }
 tokio-util = { version = "0.7", features = ["rt", "codec"] }
-async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3.32"
 
@@ -71,35 +70,14 @@ dotenvy = "0.15"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Telegram
-teloxide = { version = "0.17", features = ["rustls"] }
-
-# Discord
-serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "model", "client"] }
-
-# WebSocket (for Slack)
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-
-# Token counting
-tiktoken-rs = "0.12"
-
 # File watcher
 notify = "8"
 
 # YAML
 serde_yaml = "0.9"
 
-# Cron
-cron = "0.17"
-
 # UUID
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-
-# Async channel primitives
-async-channel = "2"
-
-# Markdown rendering
-termimad = "0.35"
 
 # HTTP server (for webhooks)
 axum = "0.8"
@@ -112,12 +90,6 @@ colored = "3"
 # REPL
 reedline = "0.49"
 nu-ansi-term = "0.50"
-
-# Interactive CLI
-dialoguer = "0.12"
-
-# HTML content extraction (Readability algorithm)
-readability = "0.3"
 
 # Concurrent data structures
 dashmap = "6"

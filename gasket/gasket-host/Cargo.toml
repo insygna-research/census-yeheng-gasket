@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 gasket-core = { workspace = true }
 dotenvy = { workspace = true }
-colored = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
