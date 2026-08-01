@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
 use gasket_host::{
-    commands_from_env, compact_by_count, install_ctrl_c, load_external_tools,
-    max_messages_from_env, ConfigLoader, EventPrinter, HookStack, Host, Mode, PermissionPolicy,
-    SessionManager,
+    commands_from_env, install_ctrl_c, load_external_tools, ConfigLoader, ContextBudget,
+    EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
 };
 use reedline::{DefaultPrompt, Reedline, Signal};
 
@@ -70,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let compact_max = max_messages_from_env();
+    let mut budget = ContextBudget::from_env();
     let (ext_tools, ext_hooks) = load_inprocess_ext();
     if !ext_tools.is_empty() {
         eprintln!("(in-process ext tools: {})", ext_tools.len());
@@ -117,10 +116,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp: gasket_core::now(),
         });
         // Shrink working memory only; JSONL on disk stays append-only full log.
-        history = compact_by_count(&history, compact_max);
+        if budget.needs_compaction() {
+            history = budget.compact(&history);
+        }
         let mut printer = EventPrinter::new(io::stdout());
         match host
             .run_turn(user_msg, &history, |ev| {
+                if let gasket_core::AgentEvent::AfterProviderResponse { response, .. } = &ev {
+                    if let Some(u) = &response.usage {
+                        budget.record_input_tokens(u.input_tokens);
+                    }
+                }
                 printer.on_event(&ev);
             })
             .await
