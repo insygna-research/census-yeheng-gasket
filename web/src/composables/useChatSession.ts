@@ -233,15 +233,31 @@ export function useChatSession(chatId: { value: string }) {
       case 'tool_end':
         isThinking.value = true;
         const toolCalls = chatStore.activeMessages.find(m => m.id === botMsg.id)?.toolCalls;
-        if (toolCalls && toolCalls.length > 0) {
-          const matchingTool = [...toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running');
-          const activeTool = matchingTool || [...toolCalls].reverse().find(t => t.status === 'running') || toolCalls[toolCalls.length - 1];
-          const updates: any = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output };
-          if (toolStartTimes.value[activeTool.id]) {
-            updates.duration = ((Date.now() - toolStartTimes.value[activeTool.id]) / 1000).toFixed(1);
-            delete toolStartTimes.value[activeTool.id];
+        // A tool_end resolves exactly the running call it corresponds to. When
+        // the core emits ToolExecutionEnd without a preceding ToolExecutionStart
+        // (approval denied / timeout / cancel), no running entry exists — append
+        // a standalone errored entry instead of falling back to (and thus
+        // overwriting) an unrelated tool's result.
+        const runningTool = toolCalls
+          ? [...toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running')
+          : undefined;
+        if (runningTool) {
+          const updates: { status: 'error' | 'complete'; result: string; duration?: string } = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output };
+          if (toolStartTimes.value[runningTool.id]) {
+            updates.duration = ((Date.now() - toolStartTimes.value[runningTool.id]) / 1000).toFixed(1);
+            delete toolStartTimes.value[runningTool.id];
           }
-          chatStore.updateToolCall(chatId.value, botMsg.id, activeTool.id, updates);
+          chatStore.updateToolCall(chatId.value, botMsg.id, runningTool.id, updates);
+        } else {
+          chatStore.ensureToolCalls(chatId.value, botMsg.id);
+          chatStore.pushToolCall(chatId.value, botMsg.id, {
+            id: Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9),
+            name: msg.name || 'unknown',
+            arguments: '',
+            status: 'error',
+            result: msg.error || msg.output || '',
+            startTime: Date.now()
+          });
         }
         break;
       case 'content':

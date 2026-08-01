@@ -631,7 +631,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
 // ── Event → JSON conversion ────────────────────────────────────
 
 /// Convert an [`AgentEvent`] to the frontend's JSON protocol, looking up
-/// tool names from `tool_names` (populated by [`ToolExecutionStart`]).
+/// tool names from `tool_names` (populated by [`ToolExecutionStart`]). For
+/// `ToolExecutionEnd` without a preceding start (denied/timed-out/cancelled
+/// tool calls) the name falls back to the one carried by the result message.
 fn event_to_ws(
     event: &AgentEvent,
     tool_names: &mut HashMap<String, String>,
@@ -659,7 +661,7 @@ fn event_to_ws(
             let name = tool_names
                 .get(tool_call_id)
                 .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
+                .unwrap_or_else(|| result.tool_name.clone());
             let summary = result
                 .content
                 .iter()
@@ -778,4 +780,130 @@ async fn compact_context(
         stats = context_stats(s.usage_in, s.usage_out);
     }
     Json(json!({ "context_stats": stats, "watermark_info": null }))
+}
+
+// ── Unit tests (pure functions only) ──────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gasket_core::ToolResultMessage;
+
+    /// A `ToolExecutionEnd` whose result carries the given tool name/text,
+    /// mirroring what the core emits for denied/timed-out/cancelled calls.
+    fn tool_end_event(tool_call_id: &str, tool_name: &str, text: &str) -> AgentEvent {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id: tool_call_id.into(),
+            result: ToolResultMessage {
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                content: vec![ContentBlock::Text { text: text.into() }],
+                is_error: true,
+                timestamp: 0,
+            },
+            is_error: true,
+        }
+    }
+
+    fn ws_json(event: &AgentEvent, tool_names: &mut HashMap<String, String>) -> Value {
+        let ws = event_to_ws(event, tool_names).expect("event maps to an OutgoingEvent");
+        serde_json::to_value(&ws).expect("OutgoingEvent serializes")
+    }
+
+    #[test]
+    fn tool_end_uses_registered_tool_name_when_start_was_seen() {
+        let mut tool_names = HashMap::new();
+        tool_names.insert("tc1".into(), "bash".into());
+        let v = ws_json(&tool_end_event("tc1", "bash", "ok"), &mut tool_names);
+        assert_eq!(v["type"], "tool_end");
+        assert_eq!(v["name"], "bash");
+        assert_eq!(v["output"], "ok");
+    }
+
+    #[test]
+    fn tool_end_falls_back_to_result_tool_name() {
+        // Denied/timed-out/cancelled calls have no preceding ToolExecutionStart,
+        // so `tool_names` is empty — the name must come from the result message.
+        let mut tool_names = HashMap::new();
+        let v = ws_json(
+            &tool_end_event("tc1", "bash", "approval denied by user"),
+            &mut tool_names,
+        );
+        assert_eq!(v["type"], "tool_end");
+        assert_eq!(v["name"], "bash");
+        assert_eq!(v["output"], "approval denied by user");
+    }
+
+    #[test]
+    fn text_delta_maps_to_content_event() {
+        let mut tool_names = HashMap::new();
+        let event = AgentEvent::MessageUpdate {
+            delta: ContentDelta::TextDelta("hello".into()),
+        };
+        let v = ws_json(&event, &mut tool_names);
+        assert_eq!(v["type"], "content");
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn unhandled_events_map_to_none() {
+        let mut tool_names = HashMap::new();
+        let events = [
+            AgentEvent::AgentStart,
+            AgentEvent::AgentEnd,
+            AgentEvent::TurnStart,
+            AgentEvent::MessageStart,
+            AgentEvent::MessageUpdate {
+                delta: ContentDelta::ToolCallDelta {
+                    id: "x".into(),
+                    name: None,
+                    args_delta: "{}".into(),
+                },
+            },
+        ];
+        for event in events {
+            assert!(
+                event_to_ws(&event, &mut tool_names).is_none(),
+                "unexpected mapping for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_key_strips_prefix_and_passes_through_bare_keys() {
+        assert_eq!(session_key("websocket:abc123"), "abc123");
+        assert_eq!(session_key("abc123"), "abc123");
+    }
+
+    /// The `context_stats` scenarios live in ONE test because they mutate the
+    /// process-global `GASKET_CONTEXT_WINDOW` env var; a single test function
+    /// runs on one thread, so parallel test threads can't race on it.
+    #[test]
+    fn context_stats_scenarios() {
+        // 1. Zero usage → zero tokens, zero percent (default window).
+        std::env::remove_var("GASKET_CONTEXT_WINDOW");
+        let stats = context_stats(0, 0);
+        assert_eq!(stats["current_tokens"], 0);
+        assert_eq!(stats["usage_percent"], 0.0);
+        assert_eq!(stats["is_compressing"], false);
+
+        // 2. Usage accumulation: in + out, percentage against the default 128k window.
+        let stats = context_stats(64_000, 64_000);
+        assert_eq!(stats["current_tokens"], 128_000);
+        assert_eq!(stats["usage_percent"], 100.0);
+
+        // 3. A configured `GASKET_CONTEXT_WINDOW` is respected.
+        std::env::set_var("GASKET_CONTEXT_WINDOW", "50000");
+        let stats = context_stats(10_000, 15_000);
+        assert_eq!(stats["current_tokens"], 25_000);
+        assert_eq!(stats["usage_percent"], 50.0);
+
+        // 4. Zero window is treated as "no percentage" rather than dividing by zero.
+        std::env::set_var("GASKET_CONTEXT_WINDOW", "0");
+        let stats = context_stats(1_000, 1_000);
+        assert_eq!(stats["current_tokens"], 2_000);
+        assert_eq!(stats["usage_percent"], 0.0);
+
+        std::env::remove_var("GASKET_CONTEXT_WINDOW");
+    }
 }
