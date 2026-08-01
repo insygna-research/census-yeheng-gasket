@@ -168,6 +168,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_edit_denies_bash_when_approver_rejects() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let p = PermissionPolicy::new(
+            Mode::AutoEdit,
+            Arc::new(move |_, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { false })
+            }),
+        );
+        assert!(matches!(verdict(&p, "write").await, ToolCallVerdict::Allow));
+        let v = verdict(&p, "bash").await;
+        assert!(matches!(
+            &v,
+            ToolCallVerdict::Block(msg) if msg == "bash denied by user"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1); // approver 被调用
+    }
+
+    #[tokio::test]
     async fn full_auto_allows_everything() {
         let p = PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { false })));
         assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
