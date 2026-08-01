@@ -3,6 +3,9 @@
 //! Host/cli composition root calls `ext::register(&mut api)` for each linked
 //! extension crate. See `docs/plugin-tutorial.md`.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::types::message::ToolResultMessage;
 use crate::types::tool::{ToolCallVerdict, ToolDefinition};
 
@@ -89,13 +92,15 @@ impl ExtensionApiImpl {
 }
 
 impl crate::types::tool::HookChain for ExtensionApiImpl {
-    fn before_tool_call(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> ToolCallVerdict {
-        ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args)
+    fn before_tool_call<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+        Box::pin(
+            async move { ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args) },
+        )
     }
 
     fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {

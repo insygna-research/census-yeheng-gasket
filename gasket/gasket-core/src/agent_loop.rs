@@ -52,12 +52,8 @@ where
         emit(AgentEvent::TurnStart);
         tracing::info!("agent turn {} start", turn);
 
-        // Cooperative abort before each expensive step.
-        if is_aborted(&config) {
-            break;
-        }
-
-        // 1. Call the LLM.
+        // 1. Call the LLM. (An abort signal is handled inside
+        //    `stream_assistant_response`, before any provider request is made.)
         let assistant = stream_assistant_response(&context, &config, &mut emit).await?;
         let stop_reason = assistant.stop_reason.clone();
         context
@@ -243,7 +239,7 @@ where
         // 1. before_tool_call hook: consult the hook chain if installed.
         //    Block → refuse; Modify → replace args; Allow → proceed.
         let verdict = match &config.hooks {
-            Some(h) => h.before_tool_call(&tc.id, &tc.function.name, &args),
+            Some(h) => h.before_tool_call(&tc.id, &tc.function.name, &args).await,
             None => ToolCallVerdict::Allow,
         };
         match verdict {
@@ -361,6 +357,23 @@ where
     let max_retries = config.retry.max_retries;
     let mut attempt: usize = 0;
     loop {
+        if is_aborted(config) {
+            // A cancel arrived while the host was waiting (e.g. an approval
+            // prompt): exit before burning a provider request. Mirrors the
+            // in-stream abort path's event shape so hosts see the Aborted
+            // message the same way.
+            tracing::info!("provider request skipped: aborted");
+            let mut msg = AssistantMessage::new(&config.model.id);
+            msg.stop_reason = StopReason::Aborted;
+            emit(AgentEvent::MessageEnd {
+                message: msg.clone(),
+            });
+            emit(AgentEvent::AfterProviderResponse {
+                model: config.model.id.clone(),
+                response: msg.clone(),
+            });
+            return Ok(msg);
+        }
         attempt += 1;
         emit(AgentEvent::BeforeProviderRequest {
             model: config.model.id.clone(),
@@ -548,11 +561,13 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 mod tests {
     use super::*;
     use crate::types::context::{ModelSpec, ProviderApi};
+    use crate::types::tool::ToolDefinition;
     use crate::ExtensionApi;
     use crate::StreamFn;
     use crate::ThinkingLevel;
     use futures_util::stream;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     /// A mock StreamFn that replays a fixed chunk sequence.
     struct MockStream(Vec<StreamChunk>);
@@ -1354,5 +1369,53 @@ mod tests {
                 if a.usage.as_ref().is_some_and(|u| u.input_tokens == 42 && u.output_tokens == 7))
         });
         assert!(merged, "usage must merge input+output across chunks");
+    }
+
+    /// Test stream that must never be polled: the pre-set abort has to stop
+    /// the loop before the provider is touched.
+    struct PollCountingStream {
+        polls: std::sync::atomic::AtomicUsize,
+    }
+    impl StreamFn for PollCountingStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                n, 0,
+                "provider stream must not be polled after a pre-set abort"
+            );
+            Box::pin(futures_util::stream::iter(vec![]))
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_set_signal_aborts_before_provider_request() {
+        let mut config = test_config(vec![]);
+        config.signal = Some(Arc::new(AtomicBool::new(true)));
+        config.stream_fn = Arc::new(PollCountingStream {
+            polls: Default::default(),
+        });
+        let ctx = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: std::env::current_dir().unwrap(),
+            env: std::collections::HashMap::new(),
+            session_id: "test".into(),
+        };
+        let msgs = crate::agent_loop(vec![], ctx, config).await.unwrap();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                AgentMessage::Assistant(a) if a.stop_reason == StopReason::Aborted
+            )),
+            "pre-set signal must produce an Aborted message"
+        );
     }
 }

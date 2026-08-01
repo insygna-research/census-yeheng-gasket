@@ -109,6 +109,10 @@ pub enum ToolCallVerdict {
 
 /// Object-safe hook chain the agent loop consults around each tool call.
 ///
+/// `before_tool_call` is async because hosts may need to ask a human for
+/// approval (CLI: stdin; gateway: WebSocket round-trip). `after_tool_call`
+/// stays sync — it is a pure transformation (redact etc.).
+///
 /// Defined in `types` (not `extension`) so `AgentLoopConfig` can hold an
 /// `Option<Arc<dyn HookChain>>` without a circular dependency. The concrete
 /// implementation is `ExtensionApiImpl`; `None` means "no hooks installed"
@@ -116,12 +120,12 @@ pub enum ToolCallVerdict {
 pub trait HookChain: Send + Sync {
     /// Consult all `before_tool_call` handlers. First `Block` wins; otherwise
     /// the last `Modify` wins; default `Allow`.
-    fn before_tool_call(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> ToolCallVerdict;
+    fn before_tool_call<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>>;
 
     /// Consult all `after_tool_call` handlers, each may replace the result.
     fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage;

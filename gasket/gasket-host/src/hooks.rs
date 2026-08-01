@@ -1,5 +1,7 @@
 //! Compose multiple [`HookChain`]s (e.g. PermissionPolicy + ExtensionApiImpl).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use gasket_core::{HookChain, ToolCallVerdict, ToolResultMessage};
@@ -24,29 +26,34 @@ impl HookStack {
 }
 
 impl HookChain for HookStack {
-    fn before_tool_call(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> ToolCallVerdict {
-        let mut current = args.clone();
-        let mut modified = false;
-        for chain in &self.chains {
-            match chain.before_tool_call(tool_call_id, tool_name, &current) {
-                ToolCallVerdict::Block(reason) => return ToolCallVerdict::Block(reason),
-                ToolCallVerdict::Modify(a) => {
-                    current = a;
-                    modified = true;
+    fn before_tool_call<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+        Box::pin(async move {
+            let mut current = args.clone();
+            let mut modified = false;
+            for chain in &self.chains {
+                match chain
+                    .before_tool_call(tool_call_id, tool_name, &current)
+                    .await
+                {
+                    ToolCallVerdict::Block(reason) => return ToolCallVerdict::Block(reason),
+                    ToolCallVerdict::Modify(a) => {
+                        current = a;
+                        modified = true;
+                    }
+                    ToolCallVerdict::Allow => {}
                 }
-                ToolCallVerdict::Allow => {}
             }
-        }
-        if modified {
-            ToolCallVerdict::Modify(current)
-        } else {
-            ToolCallVerdict::Allow
-        }
+            if modified {
+                ToolCallVerdict::Modify(current)
+            } else {
+                ToolCallVerdict::Allow
+            }
+        })
     }
 
     fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {
@@ -65,12 +72,19 @@ mod tests {
 
     struct BlockBash;
     impl HookChain for BlockBash {
-        fn before_tool_call(&self, _: &str, name: &str, _: &serde_json::Value) -> ToolCallVerdict {
-            if name == "bash" {
-                ToolCallVerdict::Block("no bash".into())
-            } else {
-                ToolCallVerdict::Allow
-            }
+        fn before_tool_call<'a>(
+            &'a self,
+            _: &'a str,
+            name: &'a str,
+            _: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+            Box::pin(async move {
+                if name == "bash" {
+                    ToolCallVerdict::Block("no bash".into())
+                } else {
+                    ToolCallVerdict::Allow
+                }
+            })
         }
         fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
             r.clone()
@@ -79,8 +93,13 @@ mod tests {
 
     struct AllowAll;
     impl HookChain for AllowAll {
-        fn before_tool_call(&self, _: &str, _: &str, _: &serde_json::Value) -> ToolCallVerdict {
-            ToolCallVerdict::Allow
+        fn before_tool_call<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+            Box::pin(async { ToolCallVerdict::Allow })
         }
         fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
             r.clone()
@@ -89,24 +108,31 @@ mod tests {
 
     struct Redact;
     impl HookChain for Redact {
-        fn before_tool_call(&self, _: &str, _: &str, _: &serde_json::Value) -> ToolCallVerdict {
-            ToolCallVerdict::Allow
+        fn before_tool_call<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+            Box::pin(async { ToolCallVerdict::Allow })
         }
         fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
             ToolResultMessage {
                 tool_call_id: r.tool_call_id.clone(),
                 tool_name: r.tool_name.clone(),
-                content: vec![ContentBlock::text("[x]")],
+                content: vec![gasket_core::ContentBlock::text("[x]".to_string())],
                 is_error: r.is_error,
                 timestamp: r.timestamp,
             }
         }
     }
 
-    #[test]
-    fn first_block_wins() {
+    #[tokio::test]
+    async fn first_block_wins() {
         let stack = HookStack::new(vec![Arc::new(AllowAll), Arc::new(BlockBash)]);
-        let v = stack.before_tool_call("1", "bash", &serde_json::json!({}));
+        let v = stack
+            .before_tool_call("1", "bash", &serde_json::json!({}))
+            .await;
         assert!(matches!(v, ToolCallVerdict::Block(_)));
     }
 

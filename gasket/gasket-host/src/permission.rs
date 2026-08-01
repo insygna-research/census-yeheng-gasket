@@ -1,4 +1,6 @@
 //! PermissionPolicy: 实装 core 的 HookChain，三档模式 + 工具风险 + approver 闭包。
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -74,25 +76,32 @@ impl PermissionPolicy {
 }
 
 impl HookChain for PermissionPolicy {
-    fn before_tool_call(&self, _id: &str, name: &str, args: &serde_json::Value) -> ToolCallVerdict {
-        let risk = Self::risk_of(name);
-        match (self.mode(), risk) {
-            (Mode::FullAuto, _) => ToolCallVerdict::Allow,
-            (Mode::AutoEdit, RiskLevel::Low) | (Mode::AutoEdit, RiskLevel::Medium) => {
-                ToolCallVerdict::Allow
-            }
-            (Mode::AutoEdit, RiskLevel::High) => {
-                if (self.approver)(name, args) {
+    fn before_tool_call<'a>(
+        &'a self,
+        _id: &'a str,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+        Box::pin(async move {
+            let risk = Self::risk_of(name);
+            match (self.mode(), risk) {
+                (Mode::FullAuto, _) => ToolCallVerdict::Allow,
+                (Mode::AutoEdit, RiskLevel::Low) | (Mode::AutoEdit, RiskLevel::Medium) => {
                     ToolCallVerdict::Allow
-                } else {
-                    ToolCallVerdict::Block(format!("{name} denied by user"))
+                }
+                (Mode::AutoEdit, RiskLevel::High) => {
+                    if (self.approver)(name, args) {
+                        ToolCallVerdict::Allow
+                    } else {
+                        ToolCallVerdict::Block(format!("{name} denied by user"))
+                    }
+                }
+                (Mode::Suggest, RiskLevel::Low) => ToolCallVerdict::Allow,
+                (Mode::Suggest, RiskLevel::Medium) | (Mode::Suggest, RiskLevel::High) => {
+                    ToolCallVerdict::Block("read-only mode".into())
                 }
             }
-            (Mode::Suggest, RiskLevel::Low) => ToolCallVerdict::Allow,
-            (Mode::Suggest, _) => {
-                ToolCallVerdict::Block(format!("{name} not allowed in suggest (read-only) mode"))
-            }
-        }
+        })
     }
 
     fn after_tool_call(&self, _id: &str, result: &ToolResultMessage) -> ToolResultMessage {
@@ -115,63 +124,57 @@ mod tests {
         (f, calls)
     }
 
-    #[test]
-    fn suggest_blocks_bash_and_writes() {
+    /// 调 before_tool_call 并取回 verdict（async 迁移后的统一入口）。
+    async fn verdict(p: &PermissionPolicy, name: &str) -> ToolCallVerdict {
+        p.before_tool_call("x", name, &serde_json::json!({})).await
+    }
+
+    #[tokio::test]
+    async fn suggest_blocks_bash_and_writes() {
         let (a, _) = approver(false);
         let p = PermissionPolicy::new(Mode::Suggest, {
             let a = a.clone();
             move |n, args| a(n, args)
         });
+        assert!(matches!(verdict(&p, "read").await, ToolCallVerdict::Allow));
         assert!(matches!(
-            p.before_tool_call("x", "read", &serde_json::json!({})),
-            ToolCallVerdict::Allow
-        ));
-        assert!(matches!(
-            p.before_tool_call("x", "write", &serde_json::json!({})),
+            verdict(&p, "write").await,
             ToolCallVerdict::Block(_)
         ));
         assert!(matches!(
-            p.before_tool_call("x", "bash", &serde_json::json!({})),
+            verdict(&p, "bash").await,
             ToolCallVerdict::Block(_)
         ));
     }
 
-    #[test]
-    fn auto_edit_allows_writes_prompts_bash() {
-        let (a, calls) = approver(true);
-        let p = PermissionPolicy::new(Mode::AutoEdit, {
-            let a = a.clone();
-            move |n, args| a(n, args)
+    #[tokio::test]
+    async fn auto_edit_allows_writes_prompts_bash() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let p = PermissionPolicy::new(Mode::AutoEdit, move |_, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+            false
         });
-        assert!(matches!(
-            p.before_tool_call("x", "write", &serde_json::json!({})),
-            ToolCallVerdict::Allow
-        ));
-        let v = p.before_tool_call("x", "bash", &serde_json::json!({}));
-        assert!(matches!(v, ToolCallVerdict::Allow));
+        assert!(matches!(verdict(&p, "write").await, ToolCallVerdict::Allow));
+        let v = verdict(&p, "bash").await;
+        assert!(matches!(v, ToolCallVerdict::Block(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 1); // approver 被调用
     }
 
-    #[test]
-    fn full_auto_allows_everything() {
+    #[tokio::test]
+    async fn full_auto_allows_everything() {
         let p = PermissionPolicy::new(Mode::FullAuto, |_, _| false);
-        assert!(matches!(
-            p.before_tool_call("x", "bash", &serde_json::json!({})),
-            ToolCallVerdict::Allow
-        ));
+        assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
     }
 
-    #[test]
-    fn set_mode_switches_at_runtime() {
+    #[tokio::test]
+    async fn set_mode_switches_at_runtime() {
         let p = PermissionPolicy::new(Mode::Suggest, |_, _| false);
         assert!(matches!(
-            p.before_tool_call("x", "bash", &serde_json::json!({})),
+            verdict(&p, "bash").await,
             ToolCallVerdict::Block(_)
         ));
         p.set_mode(Mode::FullAuto);
-        assert!(matches!(
-            p.before_tool_call("x", "bash", &serde_json::json!({})),
-            ToolCallVerdict::Allow
-        ));
+        assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
     }
 }
