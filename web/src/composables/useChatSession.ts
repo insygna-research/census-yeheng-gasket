@@ -260,10 +260,14 @@ export function useChatSession(chatId: { value: string }) {
         break;
       case 'done':
         isThinking.value = false;
+        // 回合结束（含审批超时/连接关闭后的 done）：清理残留审批弹窗
+        pendingApprovals.value.clear();
         if (activeSubagents.value.size > 0) break;
         isReceiving.value = false;
         fetchContext();
         break;
+      // subagent_* 协议是 M2（core 子 agent 编排）的预留契约：网关当前
+      // 从不发送，这些分支保持无害惰性。M2 落地后由网关协议激活。
       case 'subagent_all_started':
         subagentPhase.value = 'running';
         break;

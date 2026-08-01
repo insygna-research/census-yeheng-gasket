@@ -44,8 +44,9 @@ export interface SubagentState {
 }
 
 /**
- * WebSocket message types for subagent events
- * These correspond to the Rust WebSocketMessage enum variants
+ * WebSocket message types for subagent events.
+ * M2 规划：网关当前不发送这些消息（core 子 agent 编排未实现），
+ * 类型保留供 M2 使用，勿删除。
  */
 export type SubagentWsMessage =
   | { type: 'subagent_all_started'; count: number }
