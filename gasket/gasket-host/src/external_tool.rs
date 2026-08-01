@@ -3,7 +3,7 @@
 //! Protocol (one JSON object per line):
 //! ```text
 //! → {"op":"list"}
-//! ← {"tools":[{"name":"...","description":"...","parameters":{...}}]}
+//! ← {"tools":[{"name":"...","description":"...","parameters":{...},"risk":"low"}]}
 //! → {"op":"call","id":"...","name":"...","args":{...}}
 //! ← {"id":"...","content":[{"type":"text","text":"..."}],"is_error":false}
 //! ```
@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gasket_core::{ContentBlock, ToolDefinition, ToolError, ToolResult};
+use gasket_core::{ContentBlock, RiskLevel, ToolDefinition, ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -46,10 +46,25 @@ struct ListedTool {
     parameters: serde_json::Value,
     #[serde(default)]
     label: Option<String>,
+    /// Self-reported risk: "low" | "medium" | "high" (case-insensitive).
+    /// Unknown/missing falls back to High — the safe default.
+    #[serde(default)]
+    risk: Option<String>,
 }
 
 fn empty_object() -> serde_json::Value {
     serde_json::json!({"type": "object", "properties": {}})
+}
+
+/// Map a self-reported risk string to a [`RiskLevel`]. Case-insensitive;
+/// anything unrecognized (including `None`) falls back to [`RiskLevel::High`]
+/// — the safe default, matching how built-in tools treat unknowns.
+fn parse_risk(s: Option<&str>) -> RiskLevel {
+    match s.map(|v| v.to_ascii_lowercase()).as_deref() {
+        Some("low") => RiskLevel::Low,
+        Some("medium") => RiskLevel::Medium,
+        _ => RiskLevel::High,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +212,13 @@ impl ExternalToolBridge {
         let bridge = Arc::clone(self);
         let name = t.name.clone();
         let label = t.label.unwrap_or_else(|| t.name.clone());
+        let risk = parse_risk(t.risk.as_deref());
         ToolDefinition {
             name: t.name,
             label,
             description: t.description,
             parameters: t.parameters,
-            risk: gasket_core::RiskLevel::High,
+            risk,
             execute: Arc::new(move |ctx| {
                 let bridge = Arc::clone(&bridge);
                 let name = name.clone();
@@ -306,6 +322,7 @@ for line in sys.stdin:
             "tools": [{
                 "name": "echo",
                 "description": "echo args",
+                "risk": "low",
                 "parameters": {
                     "type": "object",
                     "properties": {"text": {"type": "string"}},
@@ -337,6 +354,7 @@ for line in sys.stdin:
             .expect("spawn");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].risk, RiskLevel::Low);
 
         let result = (tools[0].execute)(ToolCallCtx {
             tool_call_id: "c1".into(),
@@ -374,5 +392,15 @@ for line in sys.stdin:
             vec!["python3".to_string(), "/tmp/a.py".to_string()]
         );
         assert_eq!(cmds[1], vec!["./bin/x".to_string()]);
+    }
+
+    #[test]
+    fn parse_risk_maps_known_levels() {
+        assert_eq!(parse_risk(Some("low")), RiskLevel::Low);
+        assert_eq!(parse_risk(Some("MEDIUM")), RiskLevel::Medium);
+        assert_eq!(parse_risk(Some("High")), RiskLevel::High);
+        // Unknown / missing → safe default High.
+        assert_eq!(parse_risk(Some("extreme")), RiskLevel::High);
+        assert_eq!(parse_risk(None), RiskLevel::High);
     }
 }

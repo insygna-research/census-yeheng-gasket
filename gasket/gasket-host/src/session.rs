@@ -55,6 +55,29 @@ impl SessionManager {
         Ok(msgs)
     }
 
+    /// Like [`resume`](Self::resume), but on a load error (e.g. a corrupt
+    /// transcript) still adopts `id` as the current session and starts fresh,
+    /// so future appends land in the right file. Returns the loaded history
+    /// (empty for a missing or unrecoverable session).
+    ///
+    /// Used by the gateway, which must keep the connection's `session_id`
+    /// authoritative even when the on-disk transcript cannot be read back.
+    pub async fn resume_or_adopt(&mut self, id: &str) -> Vec<AgentMessage> {
+        match self.storage.load_messages(id).await {
+            Ok(msgs) => {
+                self.current_id = id.to_string();
+                msgs
+            }
+            // Corrupt middle line (rare, real disk damage): adopt the id and
+            // start fresh so future appends land in the right file. Recovery is
+            // silent — the damaged transcript is unrecoverable anyway.
+            Err(_) => {
+                self.current_id = id.to_string();
+                Vec::new()
+            }
+        }
+    }
+
     pub async fn resume_last(&mut self) -> Result<Vec<AgentMessage>, crate::HostError> {
         let id = self
             .list()

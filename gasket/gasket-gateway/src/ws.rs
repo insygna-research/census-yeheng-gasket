@@ -1,7 +1,7 @@
 //! WebSocket upgrade handler and the per-connection session loop.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,11 +13,13 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use gasket_core::{
-    built_in_tools, run_agent_loop, AgentEvent, AgentMessage, ContentBlock, UserMessage,
+    built_in_tools, AgentEvent, AgentMessage, ContentBlock, UserMessage,
 };
 
 use gasket_host::permission::Approver;
-use gasket_host::{ConfigLoader, Mode, PermissionPolicy};
+use gasket_host::{
+    load_all_mcp, ConfigLoader, ContextBudget, Host, Mode, PermissionPolicy, SessionManager,
+};
 
 use crate::api::load_external_tools;
 use crate::approval::{self, ApprovalRegistry, RegisterOutcome};
@@ -69,9 +71,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         }
     };
 
-    let cwd = std::env::current_dir().unwrap_or_default();
+    // ── Resume prior transcript (reconnect keeps context) ──
+    // Host's SessionManager owns the on-disk JSONL; the in-memory
+    // WsSession.history is the working copy (compaction + REST context API).
+    let mut session_mgr = SessionManager::new();
+    let resumed = session_mgr.resume_or_adopt(&session_id).await;
+    if !resumed.is_empty() {
+        info!("session {session_id}: resumed {} msgs", resumed.len());
+        session.lock().await.history = resumed;
+    }
+
     let system_prompt = "You are a helpful, concise assistant.".to_string();
-    let signal = Arc::new(AtomicBool::new(false));
     let mode = std::env::var("GASKET_GATEWAY_MODE")
         .ok()
         .and_then(|s| Mode::parse(&s))
@@ -121,11 +131,23 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     });
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
     let extra_tools = load_external_tools().await;
-    let storage = gasket_core::JsonlStorage::default_root();
-    // Per-connection token-aware compaction budget. Fed from
-    // `last_input_tokens` (read off the session) before each turn; compaction
-    // runs on the history snapshot so the budget never crosses task boundaries.
-    let mut budget = gasket_host::ContextBudget::from_env();
+    let mcp_tools = load_all_mcp().await;
+    // Built-in + external + mcp tools, assembled once per connection.
+    let tools = {
+        let mut t = built_in_tools();
+        t.extend(extra_tools.iter().cloned());
+        t.extend(mcp_tools.iter().cloned());
+        t
+    };
+    // Per-connection Host drives the same run_turn pipeline the CLI uses; its
+    // resumed SessionManager owns the on-disk transcript (appends on success).
+    let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
+    // Cancel sets the Host's shared abort flag; run_turn reads it at safe points.
+    let signal = host.signal().clone();
+    // Per-connection token-aware compaction budget. Fed from `last_input_tokens`
+    // (read off the session) before each turn; compaction runs on the history
+    // snapshot so the budget never crosses the turn boundary.
+    let mut budget = ContextBudget::from_env();
 
     // ── Main event loop ─────────────────────────────────────
     loop {
@@ -208,53 +230,17 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     history
                 };
 
-                // ── Spawn agent loop ──────────────────────────
-                // We run it in a background task so the main task can
-                // eavesdrop on incoming messages (like "cancel").
-                let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-                let (result_tx, mut result_rx) = tokio::sync::oneshot::channel::<
-                    Result<Vec<AgentMessage>, gasket_core::AgentError>,
-                >();
-
-                let tools = {
-                    let mut t = built_in_tools();
-                    t.extend(extra_tools.iter().cloned());
-                    t
-                };
-                let (context, config) = host_cfg.prepare_turn(
-                    gasket_host::TurnInputs {
-                        system_prompt: &system_prompt,
-                        history: &history,
-                        tools: &tools,
-                        cwd: &cwd,
-                        session_id: &session_id,
-                    },
-                    &signal,
-                    policy.clone(),
-                    host_cfg.provider_stream_fn(),
-                    host_cfg.tunables.max_turns,
-                );
-
-                let agent_event_tx = event_tx.clone();
-
-                tokio::spawn(async move {
-                    let result = run_agent_loop(vec![user_msg], context, config, |ev| {
-                        let _ = agent_event_tx.send(ev);
-                    })
-                    .await;
-                    drop(event_tx); // Signal the forwarder to stop.
-                    let _ = result_tx.send(result);
-                });
-
-                // ── Forward events to WebSocket ──────────────
+                // ── Forward agent events to the WebSocket ──────
+                // run_turn drives the agent loop inline; the sync on_event
+                // closure hands each event to a forwarder task that does the
+                // async WS send. This is the same run_turn the CLI uses.
+                let (event_tx, event_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
                 let fwd_session = session.clone();
                 let fwd_handle = tokio::spawn(async move {
-                    // Track tool call IDs -> tool names so we can emit
-                    // tool_end with the correct name.
                     let mut tool_names: HashMap<String, String> = HashMap::new();
                     let mut rx = event_rx;
                     while let Some(event) = rx.recv().await {
-                        // Capture tool names as they arrive.
                         if let AgentEvent::ToolExecutionStart {
                             tool_call_id,
                             tool_name,
@@ -280,101 +266,102 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     }
                 });
 
-                // ── Select loop: agent result vs incoming msgs ──
-                loop {
-                    tokio::select! {
-                        // Agent loop finished
-                        result = &mut result_rx => {
-                            let _ = fwd_handle.await;
+                // ── Run the turn inline, multiplexing cancel/approval ──
+                // On close/error we break immediately: dropping `turn` is
+                // cancel-safe (run_turn persists only on success), and it stops
+                // us re-polling an exhausted ws_rx (a Stream contract violation).
+                let mut closing = false;
+                let turn_outcome: Option<Result<Vec<AgentMessage>, gasket_host::HostError>> = {
+                    let turn = host.run_turn(user_msg, &history, move |ev| {
+                        let _ = event_tx.send(ev);
+                    });
+                    tokio::pin!(turn);
 
-                            // Send "done"
-                            {
-                                let mut s = session.lock().await;
-                                send_json(&mut s.sender, &OutgoingEvent::done()).await;
+                    let mut outcome = None;
+                    loop {
+                        tokio::select! {
+                            res = &mut turn => {
+                                outcome = Some(res);
+                                break;
                             }
-                            // 回合结束：清空在途审批，与后续回合隔离。
-                            session.lock().await.registry.clear_pending();
-
-                            match result {
-                                Ok(Ok(new_msgs)) => {
-                                    // Persist
-                                    if let Err(e) = storage
-                                        .append_messages(&session_id, &new_msgs)
-                                        .await
-                                    {
-                                        warn!("session {session_id}: persist: {e}");
-                                    }
-                                    let mut s = session.lock().await;
-                                    s.history.extend(new_msgs);
-                                }
-                                Ok(Err(e)) => {
-                                    let err = OutgoingEvent::error(format!("{e}"));
-                                    let mut s = session.lock().await;
-                                    send_json(&mut s.sender, &err).await;
-                                    warn!("session {session_id}: agent error: {e}");
-                                }
-                                Err(e) => {
-                                    error!("session {session_id}: agent panic: {e}");
-                                }
-                            }
-                            break; // back to main loop
-                        }
-
-                        // Incoming message while agent is running
-                        msg = ws_rx.next() => {
-                            match msg {
-                                Some(Ok(Message::Text(t))) => {
-                                    if let Ok(incoming) =
-                                        serde_json::from_str::<IncomingMessage>(&t)
-                                    {
-                                        match incoming.msg_type.as_str() {
-                                            "cancel" => {
-                                                info!("session {session_id}: cancel during turn");
-                                                signal.store(true, Ordering::Relaxed);
-                                                let _ = cancel_tx.send(true);
-                                            }
-                                            "approval_response" => {
-                                                if let Ok(resp) = serde_json::from_str::<
-                                                    ApprovalResponse,
-                                                >(&t)
-                                                {
-                                                    session.lock().await.registry.respond(
-                                                        &resp.request_id,
-                                                        resp.approved,
-                                                        resp.remember,
-                                                    );
+                            msg = ws_rx.next() => {
+                                match msg {
+                                    Some(Ok(Message::Text(t))) => {
+                                        if let Ok(incoming) =
+                                            serde_json::from_str::<IncomingMessage>(&t)
+                                        {
+                                            match incoming.msg_type.as_str() {
+                                                "cancel" => {
+                                                    info!("session {session_id}: cancel during turn");
+                                                    signal.store(true, Ordering::Relaxed);
+                                                    let _ = cancel_tx.send(true);
                                                 }
+                                                "approval_response" => {
+                                                    if let Ok(resp) = serde_json::from_str::<
+                                                        ApprovalResponse,
+                                                    >(&t)
+                                                    {
+                                                        session.lock().await.registry.respond(
+                                                            &resp.request_id,
+                                                            resp.approved,
+                                                            resp.remember,
+                                                        );
+                                                    }
+                                                }
+                                                _ => {}
                                             }
-                                            _ => {} // 回合中的其他消息忽略
                                         }
                                     }
-                                }
-                                Some(Ok(Message::Close(_))) | None => {
-                                    info!("session {session_id}: ws closed during turn");
-                                    signal.store(true, Ordering::Relaxed);
-                                    let _ = cancel_tx.send(true);
-                                    // Wait for agent to finish cleanly.
-                                    let _ = fwd_handle.await;
-                                    // 回合结束（ws 断开）：与 result 分支一致，清空在途审批。
-                                    session.lock().await.registry.clear_pending();
-                                    break;
-                                }
-                                Some(Ok(Message::Ping(data))) => {
-                                    let _ = session.lock().await.sender.send(Message::Pong(data)).await;
-                                }
-                                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {}
-                                Some(Err(e)) => {
-                                    warn!("session {session_id}: ws error during turn: {e}");
-                                    signal.store(true, Ordering::Relaxed);
-                                    let _ = cancel_tx.send(true);
-                                    let _ = fwd_handle.await;
-                                    // 回合结束（ws 错误）：与 result 分支一致，清空在途审批。
-                                    session.lock().await.registry.clear_pending();
-                                    break;
+                                    Some(Ok(Message::Ping(data))) => {
+                                        let _ = session.lock().await.sender.send(Message::Pong(data)).await;
+                                    }
+                                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {}
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        info!("session {session_id}: ws closed during turn");
+                                        signal.store(true, Ordering::Relaxed);
+                                        let _ = cancel_tx.send(true);
+                                        closing = true;
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!("session {session_id}: ws error during turn: {e}");
+                                        signal.store(true, Ordering::Relaxed);
+                                        let _ = cancel_tx.send(true);
+                                        closing = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
+                    outcome
+                }; // turn dropped → event_tx dropped → forwarder drains & exits
+
+                let _ = fwd_handle.await;
+                // Turn boundary: clear in-flight approvals regardless of outcome.
+                session.lock().await.registry.clear_pending();
+
+                if !closing {
+                    {
+                        let mut s = session.lock().await;
+                        send_json(&mut s.sender, &OutgoingEvent::done()).await;
+                    }
+                    match turn_outcome {
+                        Some(Ok(new_msgs)) => {
+                            session.lock().await.history.extend(new_msgs);
+                        }
+                        Some(Err(e)) => {
+                            let err = OutgoingEvent::error(format!("{e}"));
+                            let mut s = session.lock().await;
+                            send_json(&mut s.sender, &err).await;
+                            warn!("session {session_id}: agent error: {e}");
+                        }
+                        None => {}
+                    }
+                }
+
+                if closing {
+                    break;
                 }
             }
             "cancel" => {

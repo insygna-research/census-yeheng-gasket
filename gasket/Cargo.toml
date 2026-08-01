@@ -23,7 +23,7 @@ opt-level = "z"
 lto = "fat"
 strip = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 debug = false
 incremental = false
 

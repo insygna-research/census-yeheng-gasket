@@ -1,9 +1,10 @@
 //! In-memory history compaction.
 //!
 //! Pure host policy: shrinks the working transcript before `run_agent_loop`.
-//! Does not rewrite JSONL, no LLM summary. Two trigger modes: token-aware
-//! (provider-reported `usage.input_tokens` with hysteresis) via
-//! [`ContextBudget`], and a simple message-count cap via [`compact_by_count`].
+//! Does not rewrite JSONL, no LLM summary. One algorithm ([`compact_by_count`]:
+//! drop oldest whole atomic groups, prepend a notice); two triggers via
+//! [`ContextBudget`]: token-aware (provider-reported `usage.input_tokens`
+//! over `threshold_pct` of `window`) or a message-count fallback.
 
 use gasket_core::{AgentMessage, ContentBlock, UserMessage};
 
@@ -110,19 +111,20 @@ fn env_parse<T: std::str::FromStr>(
 /// Uses the provider-reported `usage.input_tokens` (fed in via
 /// [`record_input_tokens`](Self::record_input_tokens)) to decide when the
 /// working transcript has grown past `threshold_pct` of the context `window`.
-/// When it has, [`compact`](Self::compact) drops the oldest atomic groups
-/// until the remaining tail is estimated to fit under `target_pct` of the
-/// window, then prepends a summary notice.
+/// When over threshold, [`compact`](Self::compact) retains `target_pct`% of
+/// the current messages — a proportional reduction. Core ships no tokenizer,
+/// so it does not pretend to model per-message token cost; it reuses
+/// [`compact_by_count`]'s greedy group-walking algorithm for both paths.
 ///
 /// When no usage has been recorded (`last_input_tokens == 0`), compaction
-/// falls back to a message-count cap via [`compact_by_count`].
+/// falls back to a fixed message-count cap (`fallback_max_messages`).
 pub struct ContextBudget {
     /// Model context window (`GASKET_CONTEXT_WINDOW`, default 128_000).
     window: u64,
     /// Compaction trigger as a percentage of `window`
     /// (`GASKET_COMPACT_THRESHOLD_PCT`, default 80).
     threshold_pct: u8,
-    /// Post-compaction target as a percentage of `window`
+    /// Post-compaction retention as a percentage of the current message count
     /// (`GASKET_COMPACT_TARGET_PCT`, default 50).
     target_pct: u8,
     /// Message-count fallback when no usage is available
@@ -170,10 +172,8 @@ impl ContextBudget {
     /// - No usage recorded: fall back to [`compact_by_count`] with
     ///   `fallback_max_messages`.
     /// - Under threshold: return unchanged.
-    /// - Over threshold: drop the oldest whole atomic groups until the kept
-    ///   tail is estimated to fit under `target_pct` of `window`, then prepend
-    ///   a `[compacted N earlier messages]` user notice. At least one group is
-    ///   kept and at least one is dropped.
+    /// - Over threshold: [`compact_by_count`] retaining `target_pct`% of the
+    ///   current message count. One algorithm, two triggers.
     pub fn compact(&self, messages: &[AgentMessage]) -> Vec<AgentMessage> {
         if self.last_input_tokens == 0 {
             return compact_by_count(messages, self.fallback_max_messages);
@@ -181,30 +181,12 @@ impl ContextBudget {
         if !self.needs_compaction() {
             return messages.to_vec();
         }
-
-        let groups = atomic_groups(messages);
-        let total = groups.len();
-        if total <= 1 {
-            return messages.to_vec();
-        }
-
-        let target_tokens = self.window * self.target_pct as u64 / 100;
-        let kept_groups = ((total as u64 * target_tokens / self.last_input_tokens) as usize)
-            .max(1)
-            .min(total - 1);
-        let drop_groups = total - kept_groups;
-        let keep_from = groups[drop_groups].0;
-        let dropped = keep_from;
-
-        let mut out = Vec::with_capacity(messages.len() - dropped + 1);
-        out.push(AgentMessage::User(UserMessage {
-            content: vec![ContentBlock::text(format!(
-                "[compacted {dropped} earlier messages]"
-            ))],
-            timestamp: gasket_core::now(),
-        }));
-        out.extend_from_slice(&messages[keep_from..]);
-        out
+        // Token pressure triggered. Core has no tokenizer, so a proportional
+        // message-count reduction is the honest target — it reuses the same
+        // greedy group-walker as the count-based path instead of a second
+        // compaction strategy that would pretend to know per-group token cost.
+        let target = (messages.len() * self.target_pct as usize / 100).max(1);
+        compact_by_count(messages, target)
     }
 }
 
@@ -412,11 +394,13 @@ mod tests {
             last_input_tokens: 100_000,
         };
         let out = budget.compact(&msgs);
-        // kept_groups = 10 * 50k / 100k = 5 -> drop 5 -> 1 notice + 5 kept = 6
-        assert_eq!(out.len(), 6);
+        // Token-triggered → retain target_pct% (50%) of 10 messages as the
+        // count budget = 5; compact_by_count reserves 1 for the notice, so it
+        // keeps 4 (m6..m9) + 1 notice = 5 total, dropping 6.
+        assert_eq!(out.len(), 5);
         match &out[0] {
             AgentMessage::User(u) => match &u.content[0] {
-                ContentBlock::Text { text } => assert!(text.contains("compacted 5")),
+                ContentBlock::Text { text } => assert!(text.contains("compacted 6")),
                 _ => panic!(),
             },
             _ => panic!("expected summary user message"),

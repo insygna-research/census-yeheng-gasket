@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
 use gasket_host::{
-    commands_from_env, install_ctrl_c, load_external_tools, ConfigLoader, ContextBudget,
-    EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
+    commands_from_env, install_ctrl_c, load_external_tools, load_all_mcp, ConfigLoader,
+    ContextBudget, EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
 };
 use reedline::{DefaultPrompt, Reedline, Signal};
 
@@ -27,14 +27,16 @@ fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn gasket_core::Hoo
     (Vec::new(), None)
 }
 
-/// built-in + in-process ext + external tools, in that precedence order.
+/// built-in + in-process ext + external + mcp tools, in that precedence order.
 fn assemble_tools(
     ext_tools: &[ToolDefinition],
     extra_tools: &[ToolDefinition],
+    mcp_tools: &[ToolDefinition],
 ) -> Vec<ToolDefinition> {
     let mut tools = gasket_core::built_in_tools();
     tools.extend(ext_tools.iter().cloned());
     tools.extend(extra_tools.iter().cloned());
+    tools.extend(mcp_tools.iter().cloned());
     tools
 }
 
@@ -75,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("(in-process ext tools: {})", ext_tools.len());
     }
     let extra_tools = load_external_from_env().await;
+    let mcp_tools = load_all_mcp().await;
 
     // ext gate first (pattern block), then permission mode/approver.
     let policy = Arc::new(PermissionPolicy::new(mode, Arc::new(stdin_approver)));
@@ -89,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session,
         policy,
         "You are a helpful, concise assistant.".to_string(),
-        assemble_tools(&ext_tools, &extra_tools),
+        assemble_tools(&ext_tools, &extra_tools, &mcp_tools),
     )
     .with_hooks(Arc::new(hook_stack));
 
@@ -232,7 +235,7 @@ async fn handle_slash(
         },
         Some("reload-tools") => {
             let extra = load_external_from_env().await;
-            host.set_tools(assemble_tools(ext_tools, &extra));
+            host.set_tools(assemble_tools(ext_tools, &extra, &[]));
             println!("(reloaded {} external tool(s))", extra.len());
         }
         Some("help") => println!(
