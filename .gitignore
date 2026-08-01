@@ -35,3 +35,5 @@ web/src-tauri/target/
 web/src-tauri/gen/
 .zread
 .workbuddy
+# SDD plan-execution scratch (ledgers, briefs, review packages)
+.superpowers/
