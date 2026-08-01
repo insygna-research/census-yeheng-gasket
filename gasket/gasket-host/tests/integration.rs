@@ -40,7 +40,7 @@ fn user_msg(text: &str) -> AgentMessage {
 }
 
 fn full_auto_policy() -> PermissionPolicy {
-    PermissionPolicy::new(Mode::FullAuto, |_, _| false)
+    PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { false })))
 }
 
 /// Basic chat: one text script. Asserts the assistant message is produced,

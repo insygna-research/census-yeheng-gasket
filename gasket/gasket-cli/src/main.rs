@@ -1,5 +1,7 @@
 //! gasket CLI REPL: 持一个 Host，每行调一次 run_turn，交互式终端 agent。
+use std::future::Future;
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
@@ -76,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extra_tools = load_external_from_env().await;
 
     // ext gate first (pattern block), then permission mode/approver.
-    let policy = Arc::new(PermissionPolicy::new(mode, stdin_approver));
+    let policy = Arc::new(PermissionPolicy::new(mode, Arc::new(stdin_approver)));
     let mut hook_stack = HookStack::new(Vec::new());
     if let Some(h) = ext_hooks {
         hook_stack.push(h);
@@ -131,12 +133,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn stdin_approver(name: &str, _args: &serde_json::Value) -> bool {
-    print!("\n[approve {name}? y/N] ");
-    let _ = io::stdout().flush();
-    let mut s = String::new();
-    let _ = io::stdin().read_line(&mut s);
-    s.trim().eq_ignore_ascii_case("y")
+fn stdin_approver<'a>(
+    name: &'a str,
+    _args: &'a serde_json::Value,
+) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    // 读 stdin 是阻塞的，挪到 blocking 池，避免卡住 tokio worker。
+    let name = name.to_string();
+    Box::pin(async move {
+        print!("\n[approve {name}? y/N] ");
+        let _ = io::stdout().flush();
+        tokio::task::spawn_blocking(move || {
+            let mut s = String::new();
+            let _ = io::stdin().read_line(&mut s);
+            s.trim().eq_ignore_ascii_case("y")
+        })
+        .await
+        .unwrap_or(false)
+    })
 }
 
 async fn load_external_from_env() -> Vec<ToolDefinition> {

@@ -210,7 +210,10 @@ mod tests {
         let mut host = Host::new(
             test_cfg(),
             session,
-            Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false)),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { false })),
+            )),
             "sys".into(),
             vec![],
         );

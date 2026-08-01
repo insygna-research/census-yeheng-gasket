@@ -243,7 +243,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let cwd = std::env::current_dir().unwrap_or_default();
     let system_prompt = "You are a helpful, concise assistant.".to_string();
     let signal = Arc::new(AtomicBool::new(false));
-    let policy = Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| true));
+    let policy = Arc::new(PermissionPolicy::new(
+        Mode::FullAuto,
+        Arc::new(|_, _| Box::pin(async { true })),
+    ));
     let extra_tools = load_external_tools().await;
     let storage = gasket_core::JsonlStorage::default_root();
 

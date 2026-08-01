@@ -31,8 +31,17 @@ pub enum RiskLevel {
     High,
 }
 
-/// 工具审批闭包：`(tool_name, args) -> 是否允许`。
-pub type Approver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
+/// 工具审批闭包：`(tool_name, args) -> 是否允许`。返回 future，宿主可
+/// 挂起回合等待人工决策（CLI 读 stdin；gateway 走 WebSocket 往返）。
+/// HRTB 允许 future 借用入参。
+pub type Approver = Arc<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 pub struct PermissionPolicy {
     mode: AtomicU8,
@@ -40,13 +49,10 @@ pub struct PermissionPolicy {
 }
 
 impl PermissionPolicy {
-    pub fn new(
-        mode: Mode,
-        approver: impl Fn(&str, &serde_json::Value) -> bool + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new(mode: Mode, approver: Approver) -> Self {
         Self {
             mode: AtomicU8::new(mode as u8),
-            approver: Arc::new(approver),
+            approver,
         }
     }
 
@@ -90,7 +96,7 @@ impl HookChain for PermissionPolicy {
                     ToolCallVerdict::Allow
                 }
                 (Mode::AutoEdit, RiskLevel::High) => {
-                    if (self.approver)(name, args) {
+                    if (self.approver)(name, args).await {
                         ToolCallVerdict::Allow
                     } else {
                         ToolCallVerdict::Block(format!("{name} denied by user"))
@@ -119,7 +125,7 @@ mod tests {
         let c = calls.clone();
         let f: Approver = Arc::new(move |_n, _a| {
             c.fetch_add(1, Ordering::SeqCst);
-            allow
+            Box::pin(async move { allow })
         });
         (f, calls)
     }
@@ -132,10 +138,7 @@ mod tests {
     #[tokio::test]
     async fn suggest_blocks_bash_and_writes() {
         let (a, _) = approver(false);
-        let p = PermissionPolicy::new(Mode::Suggest, {
-            let a = a.clone();
-            move |n, args| a(n, args)
-        });
+        let p = PermissionPolicy::new(Mode::Suggest, a);
         assert!(matches!(verdict(&p, "read").await, ToolCallVerdict::Allow));
         assert!(matches!(
             verdict(&p, "write").await,
@@ -151,25 +154,28 @@ mod tests {
     async fn auto_edit_allows_writes_prompts_bash() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = calls.clone();
-        let p = PermissionPolicy::new(Mode::AutoEdit, move |_, _| {
-            c.fetch_add(1, Ordering::SeqCst);
-            false
-        });
+        let p = PermissionPolicy::new(
+            Mode::AutoEdit,
+            Arc::new(move |_, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { true })
+            }),
+        );
         assert!(matches!(verdict(&p, "write").await, ToolCallVerdict::Allow));
         let v = verdict(&p, "bash").await;
-        assert!(matches!(v, ToolCallVerdict::Block(_)));
+        assert!(matches!(v, ToolCallVerdict::Allow));
         assert_eq!(calls.load(Ordering::SeqCst), 1); // approver 被调用
     }
 
     #[tokio::test]
     async fn full_auto_allows_everything() {
-        let p = PermissionPolicy::new(Mode::FullAuto, |_, _| false);
+        let p = PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { false })));
         assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
     }
 
     #[tokio::test]
     async fn set_mode_switches_at_runtime() {
-        let p = PermissionPolicy::new(Mode::Suggest, |_, _| false);
+        let p = PermissionPolicy::new(Mode::Suggest, Arc::new(|_, _| Box::pin(async { false })));
         assert!(matches!(
             verdict(&p, "bash").await,
             ToolCallVerdict::Block(_)

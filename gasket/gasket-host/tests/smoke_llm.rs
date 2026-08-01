@@ -28,7 +28,10 @@ async fn end_to_end_basic_chat() {
     let mut host = Host::new(
         cfg,
         SessionManager::with_root(tmp.path().to_path_buf()),
-        Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false)),
+        Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { false })),
+        )),
         "You are a test assistant. Follow instructions exactly.".into(),
         gasket_core::built_in_tools(),
     )
@@ -72,7 +75,10 @@ async fn end_to_end_tool_call() {
     let mut host = Host::new(
         cfg,
         SessionManager::with_root(tmp.path().to_path_buf()),
-        Arc::new(PermissionPolicy::new(Mode::FullAuto, |_, _| false)),
+        Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { false })),
+        )),
         "You are a test assistant. You MUST use tools when asked to.".into(),
         gasket_core::built_in_tools(),
     )
