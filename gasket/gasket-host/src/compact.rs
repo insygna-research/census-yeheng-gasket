@@ -382,10 +382,7 @@ mod tests {
             );
         }
         for id in &result_ids {
-            assert!(
-                call_ids.contains(id),
-                "orphan tool_result {id} has no call"
-            );
+            assert!(call_ids.contains(id), "orphan tool_result {id} has no call");
         }
     }
 
@@ -509,10 +506,7 @@ mod tests {
             );
         }
         for id in &result_ids {
-            assert!(
-                call_ids.contains(id),
-                "orphan tool_result {id} has no call"
-            );
+            assert!(call_ids.contains(id), "orphan tool_result {id} has no call");
         }
     }
 }

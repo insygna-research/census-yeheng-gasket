@@ -236,7 +236,10 @@ async fn compaction_keeps_history_valid() {
         ]);
         scripts.push(vec![
             StreamChunk::TextDelta("done".into()),
-            StreamChunk::Usage { input: 90, output: 1 },
+            StreamChunk::Usage {
+                input: 90,
+                output: 1,
+            },
             StreamChunk::Done,
         ]);
     }
