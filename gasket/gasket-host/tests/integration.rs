@@ -9,7 +9,8 @@ use std::sync::Arc;
 use common::FakeStream;
 use gasket_core::{AgentEvent, AgentMessage, ContentBlock, StreamChunk, UserMessage};
 use gasket_host::{
-    ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
+    ConfigLoader, ContextBudget, EventPrinter, Host, HostConfig, Mode, PermissionPolicy,
+    SessionManager,
 };
 
 fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
@@ -206,4 +207,133 @@ async fn host_error_surfaces_and_persists() {
         raw.contains("assistant"),
         "transcript must contain the errored turn"
     );
+}
+
+/// Multi-turn `run_turn` with token-driven compaction between turns (mirroring
+/// the CLI loop). The working history is compacted via `ContextBudget` before
+/// each turn once the provider-reported `input_tokens` trips the threshold, and
+/// the result must never contain an orphan `ToolCall` (no matching `ToolResult`)
+/// or orphan `ToolResult` (no matching `ToolCall`). A tiny context window makes
+/// a normal `Usage` report force compaction on the next turn, deterministically.
+#[tokio::test]
+async fn compaction_keeps_history_valid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+
+    // 4 tool-call turns = 8 scripts (2 per turn: ToolCallDelta+Done triggers
+    // execution, then TextDelta+Usage+Done closes with EndTurn). input=90 trips
+    // the 80% threshold of window=100 on the following turn. Distinct tool_call
+    // ids per turn make an orphan split actually detectable.
+    let mut scripts: Vec<Vec<StreamChunk>> = Vec::new();
+    for id in ["t1", "t2", "t3", "t4"] {
+        scripts.push(vec![
+            StreamChunk::ToolCallDelta {
+                id: id.into(),
+                name: Some("list".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        scripts.push(vec![
+            StreamChunk::TextDelta("done".into()),
+            StreamChunk::Usage { input: 90, output: 1 },
+            StreamChunk::Done,
+        ]);
+    }
+    let fake = FakeStream::new(scripts);
+    let mut host = Host::new(
+        test_cfg(false),
+        session,
+        Arc::new(full_auto_policy()),
+        "You are a helpful assistant.".into(),
+        gasket_core::built_in_tools(),
+    )
+    .with_stream_fn(Arc::new(fake));
+
+    let mut budget = ContextBudget::from_env_with(&fake_env(&[
+        ("GASKET_LLM_BASE_URL", "https://api.test/v1"),
+        ("GASKET_LLM_KEY", "sk-test"),
+        ("GASKET_LLM_MODEL", "m"),
+        ("GASKET_CONTEXT_WINDOW", "100"),
+        ("GASKET_COMPACT_THRESHOLD_PCT", "80"),
+        ("GASKET_COMPACT_TARGET_PCT", "50"),
+    ]));
+    let mut history: Vec<AgentMessage> = Vec::new();
+
+    for _ in 0..4 {
+        // Mirror the CLI: compact before the turn when over threshold.
+        if budget.needs_compaction() {
+            history = budget.compact(&history);
+        }
+        let new = host
+            .run_turn(user_msg("go"), &history, |ev| {
+                if let AgentEvent::AfterProviderResponse { response, .. } = ev {
+                    if let Some(u) = response.usage {
+                        budget.record_input_tokens(u.input_tokens);
+                    }
+                }
+            })
+            .await
+            .expect("turn should succeed");
+        history.extend(new);
+    }
+
+    // Compaction must have fired at least once: turn 1 reports input=90 (>80%
+    // of 100), so turns 2..4 enter the loop over threshold and compact.
+    let compacted = history.iter().any(|m| {
+        matches!(
+            m,
+            AgentMessage::User(u) if u.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("[compacted")
+            ))
+        )
+    });
+    assert!(
+        compacted,
+        "expected at least one [compacted ...] notice in history"
+    );
+
+    // No orphan tool_call / tool_result pairs across the whole history.
+    assert_no_orphan_tool_pairs(&history);
+
+    // History non-empty and the tail is not a dangling ToolResult.
+    assert!(!history.is_empty(), "history must be non-empty");
+    assert!(
+        !matches!(history.last(), Some(AgentMessage::ToolResult(_))),
+        "history must not end on a bare ToolResult"
+    );
+}
+
+/// Every `ContentBlock::ToolCall` id must have a matching `ToolResult`
+/// (`tool_call_id`), and vice versa. Scans the whole history; an orphan on
+/// either side fails with the offending id.
+fn assert_no_orphan_tool_pairs(history: &[AgentMessage]) {
+    let mut call_ids: Vec<String> = Vec::new();
+    let mut result_ids: Vec<String> = Vec::new();
+    for m in history {
+        match m {
+            AgentMessage::Assistant(a) => {
+                for b in &a.content {
+                    if let ContentBlock::ToolCall { tool_call } = b {
+                        call_ids.push(tool_call.id.clone());
+                    }
+                }
+            }
+            AgentMessage::ToolResult(r) => result_ids.push(r.tool_call_id.clone()),
+            _ => {}
+        }
+    }
+    for id in &call_ids {
+        assert!(
+            result_ids.contains(id),
+            "orphan tool_call {id} has no matching result"
+        );
+    }
+    for id in &result_ids {
+        assert!(
+            call_ids.contains(id),
+            "orphan tool_result {id} has no matching call"
+        );
+    }
 }
