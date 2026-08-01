@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
 /// Maximum bytes returned in one read, to keep tool results bounded.
@@ -22,6 +22,7 @@ pub fn tool() -> ToolDefinition {
             },
             "required": ["path"]
         }),
+        risk: RiskLevel::Low,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }

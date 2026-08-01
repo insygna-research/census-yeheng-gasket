@@ -10,6 +10,18 @@ use std::sync::Arc;
 use crate::error::ToolError;
 use crate::types::message::{ContentBlock, ToolResultMessage};
 
+/// Risk level of a tool call - determines whether the host auto-approves,
+/// prompts, or blocks based on the active permission mode. Lives on
+/// [`ToolDefinition`] so the agent loop can forward it to hooks without a
+/// hardcoded name table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    #[default]
+    High,
+}
+
 /// A tool registered with the agent. `parameters` is a JSON Schema; the host
 /// validates args before calling `execute`.
 #[derive(Clone)]
@@ -18,6 +30,7 @@ pub struct ToolDefinition {
     pub label: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    pub risk: RiskLevel,
     pub execute: ToolFn,
 }
 
@@ -59,8 +72,8 @@ impl ToolCallCtx {
 }
 
 /// Context passed into a tool. `state_dir` is this plugin's **private** state
-/// directory (`~/.gasket/tool_state/{plugin}/`); the tool reads/writes its own
-/// files there.
+/// directory (`~/.gasket/tool_state/{session_id}/{tool_name}/`); the tool
+/// reads/writes its own files there.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
@@ -113,6 +126,11 @@ pub enum ToolCallVerdict {
 /// approval (CLI: stdin; gateway: WebSocket round-trip). `after_tool_call`
 /// stays sync — it is a pure transformation (redact etc.).
 ///
+/// Cancellation contract: while the agent loop is suspended in
+/// `before_tool_call().await`, an abort signal does NOT automatically cancel
+/// the future. An implementor that may block on a human must check the abort
+/// signal itself (or accept a cancel channel) and return promptly when set.
+///
 /// Defined in `types` (not `extension`) so `AgentLoopConfig` can hold an
 /// `Option<Arc<dyn HookChain>>` without a circular dependency. The concrete
 /// implementation is `ExtensionApiImpl`; `None` means "no hooks installed"
@@ -125,6 +143,7 @@ pub trait HookChain: Send + Sync {
         tool_call_id: &'a str,
         tool_name: &'a str,
         args: &'a serde_json::Value,
+        risk: RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>>;
 
     /// Consult all `after_tool_call` handlers, each may replace the result.

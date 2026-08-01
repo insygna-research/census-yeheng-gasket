@@ -202,6 +202,7 @@ impl ExternalToolBridge {
             label,
             description: t.description,
             parameters: t.parameters,
+            risk: gasket_core::RiskLevel::High,
             execute: Arc::new(move |ctx| {
                 let bridge = Arc::clone(&bridge);
                 let name = name.clone();

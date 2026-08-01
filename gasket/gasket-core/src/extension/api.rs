@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::types::message::ToolResultMessage;
-use crate::types::tool::{ToolCallVerdict, ToolDefinition};
+use crate::types::tool::{RiskLevel, ToolCallVerdict, ToolDefinition};
 
 /// A `before_tool_call` hook handler. Returns a verdict controlling flow.
 pub trait BeforeToolCallHandler: Send + Sync {
@@ -16,6 +16,7 @@ pub trait BeforeToolCallHandler: Send + Sync {
         tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
+        risk: RiskLevel,
     ) -> ToolCallVerdict;
 }
 
@@ -63,10 +64,11 @@ impl ExtensionApiImpl {
         tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
+        risk: RiskLevel,
     ) -> ToolCallVerdict {
         let mut verdict = ToolCallVerdict::Allow;
         for h in &self.before_hooks {
-            match h.call(tool_call_id, tool_name, args) {
+            match h.call(tool_call_id, tool_name, args, risk) {
                 v @ ToolCallVerdict::Block(_) => return v,
                 v @ ToolCallVerdict::Modify(_) => verdict = v,
                 ToolCallVerdict::Allow => {}
@@ -97,10 +99,11 @@ impl crate::types::tool::HookChain for ExtensionApiImpl {
         tool_call_id: &'a str,
         tool_name: &'a str,
         args: &'a serde_json::Value,
+        risk: RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
-        Box::pin(
-            async move { ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args) },
-        )
+        Box::pin(async move {
+            ExtensionApiImpl::before_tool_call(self, tool_call_id, tool_name, args, risk)
+        })
     }
 
     fn after_tool_call(&self, tool_call_id: &str, result: &ToolResultMessage) -> ToolResultMessage {
@@ -129,7 +132,7 @@ mod tests {
 
     struct Blocker;
     impl BeforeToolCallHandler for Blocker {
-        fn call(&self, _: &str, _: &str, _: &serde_json::Value) -> ToolCallVerdict {
+        fn call(&self, _: &str, _: &str, _: &serde_json::Value, _: RiskLevel) -> ToolCallVerdict {
             ToolCallVerdict::Block("no".into())
         }
     }
@@ -138,7 +141,7 @@ mod tests {
     fn before_hook_block_wins() {
         let mut api = ExtensionApiImpl::new();
         api.register_before_tool_call(Box::new(Blocker));
-        let v = api.before_tool_call("id", "bash", &serde_json::json!({}));
+        let v = api.before_tool_call("id", "bash", &serde_json::json!({}), RiskLevel::High);
         assert!(matches!(v, ToolCallVerdict::Block(_)));
     }
 

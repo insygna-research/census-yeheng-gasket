@@ -13,7 +13,7 @@ use std::sync::Arc;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 
-use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
 /// Directories never searched (mirrors `list` tool).
@@ -41,6 +41,7 @@ pub fn tool() -> ToolDefinition {
             },
             "required": ["pattern"]
         }),
+        risk: RiskLevel::Low,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }

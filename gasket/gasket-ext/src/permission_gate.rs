@@ -1,7 +1,7 @@
 //! Block dangerous bash patterns via `before_tool_call`.
 
 use gasket_core::extension::BeforeToolCallHandler;
-use gasket_core::{ExtensionApi, ToolCallVerdict};
+use gasket_core::{ExtensionApi, RiskLevel, ToolCallVerdict};
 
 struct DangerousCommandGate;
 
@@ -13,6 +13,7 @@ impl BeforeToolCallHandler for DangerousCommandGate {
         _tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
+        _risk: RiskLevel,
     ) -> ToolCallVerdict {
         if tool_name != "bash" {
             return ToolCallVerdict::Allow;

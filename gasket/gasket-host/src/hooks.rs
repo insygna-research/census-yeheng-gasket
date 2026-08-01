@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use gasket_core::{HookChain, ToolCallVerdict, ToolResultMessage};
+use gasket_core::{HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
 
 /// Runs hook chains in order.
 ///
@@ -31,13 +31,14 @@ impl HookChain for HookStack {
         tool_call_id: &'a str,
         tool_name: &'a str,
         args: &'a serde_json::Value,
+        risk: RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
         Box::pin(async move {
             let mut current = args.clone();
             let mut modified = false;
             for chain in &self.chains {
                 match chain
-                    .before_tool_call(tool_call_id, tool_name, &current)
+                    .before_tool_call(tool_call_id, tool_name, &current, risk)
                     .await
                 {
                     ToolCallVerdict::Block(reason) => return ToolCallVerdict::Block(reason),
@@ -77,6 +78,7 @@ mod tests {
             _: &'a str,
             name: &'a str,
             _: &'a serde_json::Value,
+            _: RiskLevel,
         ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
             Box::pin(async move {
                 if name == "bash" {
@@ -98,6 +100,7 @@ mod tests {
             _: &'a str,
             _: &'a str,
             _: &'a serde_json::Value,
+            _: RiskLevel,
         ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
             Box::pin(async { ToolCallVerdict::Allow })
         }
@@ -113,6 +116,7 @@ mod tests {
             _: &'a str,
             _: &'a str,
             _: &'a serde_json::Value,
+            _: RiskLevel,
         ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
             Box::pin(async { ToolCallVerdict::Allow })
         }
@@ -131,7 +135,7 @@ mod tests {
     async fn first_block_wins() {
         let stack = HookStack::new(vec![Arc::new(AllowAll), Arc::new(BlockBash)]);
         let v = stack
-            .before_tool_call("1", "bash", &serde_json::json!({}))
+            .before_tool_call("1", "bash", &serde_json::json!({}), RiskLevel::High)
             .await;
         assert!(matches!(v, ToolCallVerdict::Block(_)));
     }

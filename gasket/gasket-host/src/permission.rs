@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use gasket_core::{HookChain, ToolCallVerdict, ToolResultMessage};
+use gasket_core::{HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -22,13 +22,6 @@ impl Mode {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiskLevel {
-    Low,
-    Medium,
-    High,
 }
 
 /// 工具审批闭包：`(tool_name, args) -> 是否允许`。返回 future，宿主可
@@ -68,17 +61,6 @@ impl PermissionPolicy {
             _ => Mode::AutoEdit,
         }
     }
-
-    /// V0 hardcoded name table; unknown tools default to High (safe default).
-    /// Per-tool risk metadata on `ToolDefinition` is future work — there is
-    /// no consumer for it yet.
-    pub fn risk_of(tool_name: &str) -> RiskLevel {
-        match tool_name {
-            "read" | "list" | "grep" => RiskLevel::Low,
-            "write" | "edit" => RiskLevel::Medium,
-            _ => RiskLevel::High,
-        }
-    }
 }
 
 impl HookChain for PermissionPolicy {
@@ -87,9 +69,9 @@ impl HookChain for PermissionPolicy {
         _id: &'a str,
         name: &'a str,
         args: &'a serde_json::Value,
+        risk: RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
         Box::pin(async move {
-            let risk = Self::risk_of(name);
             match (self.mode(), risk) {
                 (Mode::FullAuto, _) => ToolCallVerdict::Allow,
                 (Mode::AutoEdit, RiskLevel::Low) | (Mode::AutoEdit, RiskLevel::Medium) => {
@@ -131,21 +113,25 @@ mod tests {
     }
 
     /// 调 before_tool_call 并取回 verdict（async 迁移后的统一入口）。
-    async fn verdict(p: &PermissionPolicy, name: &str) -> ToolCallVerdict {
-        p.before_tool_call("x", name, &serde_json::json!({})).await
+    async fn verdict(p: &PermissionPolicy, name: &str, risk: RiskLevel) -> ToolCallVerdict {
+        p.before_tool_call("x", name, &serde_json::json!({}), risk)
+            .await
     }
 
     #[tokio::test]
     async fn suggest_blocks_bash_and_writes() {
         let (a, _) = approver(false);
         let p = PermissionPolicy::new(Mode::Suggest, a);
-        assert!(matches!(verdict(&p, "read").await, ToolCallVerdict::Allow));
         assert!(matches!(
-            verdict(&p, "write").await,
+            verdict(&p, "read", RiskLevel::Low).await,
+            ToolCallVerdict::Allow
+        ));
+        assert!(matches!(
+            verdict(&p, "write", RiskLevel::Medium).await,
             ToolCallVerdict::Block(_)
         ));
         assert!(matches!(
-            verdict(&p, "bash").await,
+            verdict(&p, "bash", RiskLevel::High).await,
             ToolCallVerdict::Block(_)
         ));
     }
@@ -161,8 +147,11 @@ mod tests {
                 Box::pin(async { true })
             }),
         );
-        assert!(matches!(verdict(&p, "write").await, ToolCallVerdict::Allow));
-        let v = verdict(&p, "bash").await;
+        assert!(matches!(
+            verdict(&p, "write", RiskLevel::Medium).await,
+            ToolCallVerdict::Allow
+        ));
+        let v = verdict(&p, "bash", RiskLevel::High).await;
         assert!(matches!(v, ToolCallVerdict::Allow));
         assert_eq!(calls.load(Ordering::SeqCst), 1); // approver 被调用
     }
@@ -178,8 +167,11 @@ mod tests {
                 Box::pin(async { false })
             }),
         );
-        assert!(matches!(verdict(&p, "write").await, ToolCallVerdict::Allow));
-        let v = verdict(&p, "bash").await;
+        assert!(matches!(
+            verdict(&p, "write", RiskLevel::Medium).await,
+            ToolCallVerdict::Allow
+        ));
+        let v = verdict(&p, "bash", RiskLevel::High).await;
         assert!(matches!(
             &v,
             ToolCallVerdict::Block(msg) if msg == "bash denied by user"
@@ -190,17 +182,23 @@ mod tests {
     #[tokio::test]
     async fn full_auto_allows_everything() {
         let p = PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { false })));
-        assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
+        assert!(matches!(
+            verdict(&p, "bash", RiskLevel::High).await,
+            ToolCallVerdict::Allow
+        ));
     }
 
     #[tokio::test]
     async fn set_mode_switches_at_runtime() {
         let p = PermissionPolicy::new(Mode::Suggest, Arc::new(|_, _| Box::pin(async { false })));
         assert!(matches!(
-            verdict(&p, "bash").await,
+            verdict(&p, "bash", RiskLevel::High).await,
             ToolCallVerdict::Block(_)
         ));
         p.set_mode(Mode::FullAuto);
-        assert!(matches!(verdict(&p, "bash").await, ToolCallVerdict::Allow));
+        assert!(matches!(
+            verdict(&p, "bash", RiskLevel::High).await,
+            ToolCallVerdict::Allow
+        ));
     }
 }

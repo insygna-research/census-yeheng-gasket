@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use gasket_core::{ContentBlock, ExtensionApi, ToolCallCtx, ToolDefinition, ToolError, ToolResult};
+use gasket_core::{
+    ContentBlock, ExtensionApi, RiskLevel, ToolCallCtx, ToolDefinition, ToolError, ToolResult,
+};
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct Todo {
@@ -48,6 +50,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["action"]
         }),
+        risk: RiskLevel::High,
         execute: Arc::new(|ctx: ToolCallCtx| Box::pin(async move { execute(&ctx).await })),
     });
 }

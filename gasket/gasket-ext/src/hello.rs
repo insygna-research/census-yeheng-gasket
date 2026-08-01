@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolResult};
+use gasket_core::{ContentBlock, ExtensionApi, RiskLevel, ToolDefinition, ToolResult};
 
 pub fn register(api: &mut dyn ExtensionApi) {
     api.register_tool(ToolDefinition {
@@ -16,6 +16,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["name"]
         }),
+        risk: RiskLevel::High,
         execute: Arc::new(|ctx| {
             Box::pin(async move {
                 let name = ctx.args["name"].as_str().unwrap_or("world");

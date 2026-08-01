@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 
-use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
 /// Cap the number of entries returned so tool output stays bounded.
@@ -33,6 +33,7 @@ pub fn tool() -> ToolDefinition {
                 "pattern": { "type": "string", "description": "Glob to filter, e.g. **/*.rs" }
             }
         }),
+        risk: RiskLevel::Low,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }

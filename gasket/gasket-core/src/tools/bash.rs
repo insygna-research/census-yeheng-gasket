@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -22,6 +22,7 @@ pub fn tool() -> ToolDefinition {
             },
             "required": ["command"]
         }),
+        risk: RiskLevel::High,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }

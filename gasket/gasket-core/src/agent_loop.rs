@@ -12,7 +12,7 @@ use crate::types::event::{AgentEvent, ContentDelta};
 use crate::types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
 };
-use crate::types::tool::{ToolCallCtx, ToolCallVerdict, ToolContext};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext};
 
 /// Run the agent loop to completion.
 ///
@@ -237,9 +237,19 @@ where
         };
 
         // 1. before_tool_call hook: consult the hook chain if installed.
-        //    Block → refuse; Modify → replace args; Allow → proceed.
+        //    Risk is looked up from the tool definition (unknown tools default
+        //    to High - the safe default, matching the old host-side table).
+        let risk = context
+            .tools
+            .iter()
+            .find(|t| t.name == tc.function.name)
+            .map(|t| t.risk)
+            .unwrap_or(RiskLevel::High);
         let verdict = match &config.hooks {
-            Some(h) => h.before_tool_call(&tc.id, &tc.function.name, &args).await,
+            Some(h) => {
+                h.before_tool_call(&tc.id, &tc.function.name, &args, risk)
+                    .await
+            }
             None => ToolCallVerdict::Allow,
         };
         match verdict {
@@ -653,6 +663,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo args".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(
                     async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
@@ -700,6 +711,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo args".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(
                     async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
@@ -770,7 +782,13 @@ mod tests {
     /// A `before_tool_call` handler that blocks the `bash` tool.
     struct BlockBash;
     impl crate::extension::BeforeToolCallHandler for BlockBash {
-        fn call(&self, _id: &str, tool_name: &str, _args: &serde_json::Value) -> ToolCallVerdict {
+        fn call(
+            &self,
+            _id: &str,
+            tool_name: &str,
+            _args: &serde_json::Value,
+            _risk: RiskLevel,
+        ) -> ToolCallVerdict {
             if tool_name == "bash" {
                 ToolCallVerdict::Block("blocked by policy".into())
             } else {
@@ -808,6 +826,7 @@ mod tests {
             label: "Bash".into(),
             description: "shell".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|_c: ToolCallCtx| {
                 Box::pin(async move { Ok(crate::ToolResult::text("ran")) })
             }),
@@ -867,6 +886,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(async move { Ok(crate::ToolResult::text(c.args.to_string())) })
             }),
@@ -928,6 +948,7 @@ mod tests {
             label: "Boom".into(),
             description: "always fails".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|_c: ToolCallCtx| {
                 Box::pin(async move { Err(crate::error::ToolError::Message("boom".into())) })
             }),
@@ -973,6 +994,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(
                     async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
@@ -1120,6 +1142,7 @@ mod tests {
             label: "SetAbort".into(),
             description: "sets abort".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(async move {
                     c.signal.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1132,6 +1155,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(
                     async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
@@ -1296,6 +1320,7 @@ mod tests {
             label: "Echo".into(),
             description: "echo".into(),
             parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
             execute: std::sync::Arc::new(|c: ToolCallCtx| {
                 Box::pin(
                     async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },

@@ -17,8 +17,9 @@ pub mod session;
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use external_tool::{commands_from_env, load_all as load_external_tools, ExternalToolBridge};
+pub use gasket_core::RiskLevel;
 pub use hooks::HookStack;
-pub use permission::{Mode, PermissionPolicy, RiskLevel};
+pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use session::{SessionInfo, SessionManager};
 
@@ -218,7 +219,6 @@ mod tests {
             vec![],
         );
         assert!(!host.session().current_id().is_empty());
-        assert_eq!(PermissionPolicy::risk_of("bash"), RiskLevel::High);
         assert!(!host.signal().load(Ordering::Relaxed));
 
         host.set_tools(vec![]); // compile check: setter exists

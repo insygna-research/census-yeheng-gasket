@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use gasket_core::{ContentBlock, ExtensionApi, ToolDefinition, ToolError, ToolResult};
+use gasket_core::{ContentBlock, ExtensionApi, RiskLevel, ToolDefinition, ToolError, ToolResult};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -526,6 +526,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["query"]
         }),
+        risk: RiskLevel::High,
         execute: Arc::new(move |ctx| {
             let client = client.clone();
             Box::pin(async move {

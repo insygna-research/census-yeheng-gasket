@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::types::tool::{ToolCallCtx, ToolDefinition, ToolResult};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
 pub fn tool() -> ToolDefinition {
@@ -18,6 +18,7 @@ pub fn tool() -> ToolDefinition {
             },
             "required": ["path", "content"]
         }),
+        risk: RiskLevel::Medium,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }

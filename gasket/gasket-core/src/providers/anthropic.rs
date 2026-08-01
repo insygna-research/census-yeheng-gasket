@@ -379,6 +379,7 @@ mod tests {
             label: "T".into(),
             description: "d".into(),
             parameters: json!({"type": "object"}),
+            risk: crate::types::tool::RiskLevel::Low,
             execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
                 Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
             }),

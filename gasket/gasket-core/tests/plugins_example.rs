@@ -85,6 +85,7 @@ async fn permission_gate_blocks_bash() {
         label: "Bash".into(),
         description: "shell".into(),
         parameters: serde_json::json!({"type": "object"}),
+        risk: gasket_core::RiskLevel::High,
         execute: Arc::new(|_| Box::pin(async { Ok(gasket_core::ToolResult::text("RAN")) })),
     };
 
