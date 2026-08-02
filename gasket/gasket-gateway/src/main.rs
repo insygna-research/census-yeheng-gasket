@@ -42,7 +42,7 @@ use axum::Router;
 use dashmap::DashMap;
 use tracing::info;
 
-use crate::api::{compact_context, get_commands, get_context};
+use crate::api::{compact_context, get_commands, get_context, list_sessions};
 use crate::state::AppState;
 use crate::ws::ws_handler;
 
@@ -72,6 +72,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/sessions", get(list_sessions))
         .route("/api/commands", get(get_commands))
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))

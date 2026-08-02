@@ -12,6 +12,8 @@ use gasket_core::ToolDefinition;
 use crate::state::AppState;
 
 // ── External tools ─────────────────────────────────────────────
+use gasket_host::SessionManager;
+
 
 pub(crate) async fn load_external_tools() -> Vec<ToolDefinition> {
     let cmds = gasket_host::commands_from_env();
@@ -112,4 +114,31 @@ pub(crate) async fn compact_context(
         stats = context_stats(s.last_input_tokens, s.usage_in, s.usage_out);
     }
     Json(json!({ "context_stats": stats, "watermark_info": null }))
+}
+
+/// List all sessions on disk (id, msg_count, mtime). Does NOT depend on
+/// active WS connections — reads the JSONL store directly. Used by the
+/// frontend to discover sessions created by the CLI or other devices.
+pub(crate) async fn list_sessions() -> Json<Value> {
+    let mgr = SessionManager::new();
+    match mgr.list().await {
+        Ok(mut sessions) => {
+            // Newest first.
+            sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+            Json(json!({
+                "sessions": sessions.iter().map(|s| json!({
+                    "id": s.id,
+                    "msg_count": s.msg_count,
+                    "mtime": s.mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                })).collect::<Vec<_>>()
+            }))
+        }
+        Err(e) => {
+            warn!("list_sessions error: {e}");
+            Json(json!({ "sessions": [], "error": e.to_string() }))
+        }
+    }
 }
