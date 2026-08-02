@@ -698,6 +698,7 @@ for line in sys.stdin:
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
+                spawner: None,
             },
         }
     }

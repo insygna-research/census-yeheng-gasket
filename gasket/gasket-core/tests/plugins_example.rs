@@ -47,6 +47,7 @@ async fn hello_extension_greets() {
         cwd: ".".into(),
         env: Default::default(),
         session_id: "t".into(),
+            spawner: None,
     };
     let cfg = AgentLoopConfig {
         model: ModelSpec {
@@ -96,6 +97,7 @@ async fn permission_gate_blocks_bash() {
         cwd: ".".into(),
         env: Default::default(),
         session_id: "t".into(),
+            spawner: None,
     };
     let cfg = AgentLoopConfig {
         model: ModelSpec {

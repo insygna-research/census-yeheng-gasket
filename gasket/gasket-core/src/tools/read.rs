@@ -92,6 +92,7 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
+                spawner: None,
             },
         })
         .await
@@ -151,6 +152,7 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: tmp.path().to_path_buf(),
+                spawner: None,
             },
         })
         .await

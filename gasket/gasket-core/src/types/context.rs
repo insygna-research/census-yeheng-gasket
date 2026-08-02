@@ -10,7 +10,7 @@ use crate::types::tool::ToolDefinition;
 
 /// Everything the agent sees for one run. Deliberately has **no plugin-shared
 /// state field** — plugin-private state lives in files under `ToolContext.state_dir`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<crate::types::message::AgentMessage>,
@@ -18,6 +18,22 @@ pub struct AgentContext {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub session_id: String,
+    /// Subagent spawner. `None` in bare `agent_loop` tests; the host fills it.
+    #[allow(clippy::type_complexity)]
+    pub spawner: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
+}
+
+impl std::fmt::Debug for AgentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContext")
+            .field("system_prompt", &self.system_prompt)
+            .field("messages_len", &self.messages.len())
+            .field("tools_len", &self.tools.len())
+            .field("cwd", &self.cwd)
+            .field("session_id", &self.session_id)
+            .field("spawner", &self.spawner.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 /// How a single agent loop invocation is configured.

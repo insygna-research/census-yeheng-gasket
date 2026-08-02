@@ -307,6 +307,7 @@ where
                 env: context.env.clone(),
                 session_id: context.session_id.clone(),
                 state_dir: tool_state_dir(context, &tc.function.name),
+                spawner: context.spawner.clone(),
             },
         })
         .await
@@ -632,6 +633,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s1".into(),
+            spawner: None,
         };
 
         let mut saw_start = false;
@@ -686,6 +688,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s2".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -738,6 +741,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -860,6 +864,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s3".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -920,6 +925,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s4".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -968,6 +974,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -1016,6 +1023,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -1052,6 +1060,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -1118,6 +1127,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -1186,6 +1196,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
 
         let msgs = run_agent_loop(vec![], context, config, |_| {})
@@ -1252,6 +1263,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
         let msgs = run_agent_loop(vec![], context, config, |_| {})
             .await
@@ -1283,6 +1295,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
         let mut text_deltas = 0u32;
         let msgs = run_agent_loop(vec![], context, config, |ev| {
@@ -1348,6 +1361,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
         let msgs = run_agent_loop(vec![], context, config, |_| {})
             .await
@@ -1385,6 +1399,7 @@ mod tests {
             cwd: ".".into(),
             env: Default::default(),
             session_id: "s".into(),
+            spawner: None,
         };
         let msgs = run_agent_loop(vec![], context, config, |_| {})
             .await
@@ -1433,6 +1448,7 @@ mod tests {
             cwd: std::env::current_dir().unwrap(),
             env: std::collections::HashMap::new(),
             session_id: "test".into(),
+            spawner: None,
         };
         let msgs = crate::agent_loop(vec![], ctx, config).await.unwrap();
         assert!(

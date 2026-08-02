@@ -74,12 +74,28 @@ impl ToolCallCtx {
 /// Context passed into a tool. `state_dir` is this plugin's **private** state
 /// directory (`~/.gasket/tool_state/{session_id}/{tool_name}/`); the tool
 /// reads/writes its own files there.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub session_id: String,
     pub state_dir: PathBuf,
+    /// Subagent spawner injected by the host. `None` when no host is wired
+    /// (bare `agent_loop` tests); the `spawn_subagents` tool reports an error.
+    #[allow(clippy::type_complexity)]
+    pub spawner: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("session_id", &self.session_id)
+            .field("state_dir", &self.state_dir)
+            .field("spawner", &self.spawner.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 /// A tool's result. `details` is plugin-private (the agent never reads it).

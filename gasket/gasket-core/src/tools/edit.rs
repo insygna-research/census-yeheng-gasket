@@ -187,6 +187,7 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
+                spawner: None,
             },
         })
         .await

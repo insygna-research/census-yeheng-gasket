@@ -5,6 +5,7 @@ pub mod edit;
 pub mod fetch;
 pub mod grep;
 pub mod list;
+pub mod subagent;
 pub mod read;
 pub mod write;
 
@@ -12,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::types::tool::ToolDefinition;
 
-/// The 7 built-in tools, ready to drop into `AgentContext.tools`.
+/// The 8 built-in tools, ready to drop into `AgentContext.tools`.
 pub fn built_in_tools() -> Vec<ToolDefinition> {
     vec![
         read::tool(),
@@ -22,6 +23,7 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
         list::tool(),
         grep::tool(),
         fetch::tool(),
+        subagent::tool(),
     ]
 }
 

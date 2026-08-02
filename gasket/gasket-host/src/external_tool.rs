@@ -365,6 +365,7 @@ for line in sys.stdin:
                 env: HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
+                spawner: None,
             },
         })
         .await

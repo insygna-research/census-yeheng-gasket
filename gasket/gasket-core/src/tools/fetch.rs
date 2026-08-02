@@ -199,6 +199,7 @@ mod tests {
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
+                spawner: None,
             },
         };
         let result = execute(ctx).await.unwrap();

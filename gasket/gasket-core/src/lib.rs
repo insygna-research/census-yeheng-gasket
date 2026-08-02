@@ -9,6 +9,7 @@ pub mod error;
 pub mod extension;
 pub mod providers;
 pub mod storage;
+pub mod subagent;
 pub mod tools;
 pub mod types;
 
@@ -30,6 +31,7 @@ pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,
     ToolResult,
 };
+pub use subagent::{NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner};
 
 /// Current monotonically-increasing time in milliseconds since UNIX epoch.
 ///
