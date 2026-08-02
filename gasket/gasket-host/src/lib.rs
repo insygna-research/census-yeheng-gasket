@@ -14,6 +14,8 @@ pub mod mcp;
 pub mod permission;
 pub mod printer;
 pub mod session;
+pub mod subagent;
+
 
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
@@ -21,6 +23,7 @@ pub use external_tool::{commands_from_env, load_all as load_external_tools, Exte
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use gasket_core::RiskLevel;
 pub use hooks::HookStack;
+pub use subagent::HostSubagentSpawner;
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use session::{SessionInfo, SessionManager};
@@ -53,6 +56,9 @@ pub struct Host {
     tools: Vec<ToolDefinition>,
     cwd: PathBuf,
     max_turns: usize,
+    /// Subagent spawner — built lazily; injected into AgentContext so the
+    /// `spawn_subagents` tool can use it.
+    spawner: Option<Arc<dyn gasket_core::SubagentSpawner>>,
 }
 
 impl Host {
@@ -79,6 +85,7 @@ impl Host {
             signal: Arc::new(AtomicBool::new(false)),
             stream_fn: cfg.provider_stream_fn(),
             max_turns: cfg.tunables.max_turns,
+            spawner: None,
             cfg,
             session,
             policy,
@@ -104,6 +111,14 @@ impl Host {
     /// that stack extension gates before the policy pass the composed stack.
     pub fn with_hooks(mut self, hooks: Arc<dyn gasket_core::HookChain>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Inject a subagent spawner. Without this, the `spawn_subagents` tool
+    /// returns an "unavailable" error. CLI/gateway pass a `HostSubagentSpawner`
+    /// built from the host's config.
+    pub fn with_spawner(mut self, spawner: Arc<dyn gasket_core::SubagentSpawner>) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 
@@ -150,7 +165,7 @@ impl Host {
     where
         E: FnMut(gasket_core::AgentEvent),
     {
-        let (context, config) = self.cfg.prepare_turn(
+        let (mut context, config) = self.cfg.prepare_turn(
             TurnInputs {
                 system_prompt: &self.system_prompt,
                 history,
@@ -163,6 +178,10 @@ impl Host {
             self.stream_fn.clone(),
             self.max_turns,
         );
+        // Inject the subagent spawner if the host has one configured.
+        if let Some(sp) = &self.spawner {
+            context.spawner = Some(Arc::clone(sp));
+        }
         let new_msgs =
             gasket_core::run_agent_loop(vec![user_msg], context, config, on_event).await?;
         self.session.append(&new_msgs).await?;

@@ -52,3 +52,43 @@ pub(crate) fn event_to_ws(
         _ => None,
     }
 }
+
+/// Convert a [`SubagentEvent`] to a raw JSON string for the frontend's
+/// `subagent_*` protocol. Returns `None` for events that have no WS
+/// representation.
+pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option<String> {
+    use gasket_core::SubagentEvent;
+    let json = match event {
+        SubagentEvent::AllStarted { count } => serde_json::json!({
+            "type": "subagent_all_started", "count": count
+        }),
+        SubagentEvent::Synthesizing => serde_json::json!({
+            "type": "subagent_synthesizing"
+        }),
+        SubagentEvent::Started { id, task, index } => serde_json::json!({
+            "type": "subagent_started", "id": id, "task": task, "index": index
+        }),
+        SubagentEvent::Thinking { id, content } => serde_json::json!({
+            "type": "subagent_thinking", "id": id, "content": content
+        }),
+        SubagentEvent::Content { id, content } => serde_json::json!({
+            "type": "subagent_content", "id": id, "content": content
+        }),
+        SubagentEvent::ToolStart { id, name, arguments } => serde_json::json!({
+            "type": "subagent_tool_start", "id": id, "name": name,
+            "arguments": arguments
+        }),
+        SubagentEvent::ToolEnd { id, tool_id, name, output } => serde_json::json!({
+            "type": "subagent_tool_end", "id": id, "name": name,
+            "tool_id": tool_id, "output": output
+        }),
+        SubagentEvent::Completed { id, index, summary, tool_count } => serde_json::json!({
+            "type": "subagent_completed", "id": id, "index": index,
+            "summary": summary, "tool_count": tool_count
+        }),
+        SubagentEvent::Error { id, index, error } => serde_json::json!({
+            "type": "subagent_error", "id": id, "index": index, "error": error
+        }),
+    };
+    Some(serde_json::to_string(&json).unwrap_or_default())
+}

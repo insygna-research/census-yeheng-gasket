@@ -18,7 +18,8 @@ use gasket_core::{
 
 use gasket_host::permission::Approver;
 use gasket_host::{
-    load_all_mcp, ConfigLoader, ContextBudget, Host, Mode, PermissionPolicy, SessionManager,
+    load_all_mcp, ConfigLoader, ContextBudget, Host, HostSubagentSpawner, Mode,
+    PermissionPolicy, SessionManager,
 };
 
 use crate::api::load_external_tools;
@@ -141,7 +142,55 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     };
     // Per-connection Host drives the same run_turn pipeline the CLI uses; its
     // resumed SessionManager owns the on-disk transcript (appends on success).
+    let spawner_cfg = host_cfg.clone();
     let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
+    // Subagent spawner: events forwarded to WS via the session sender.
+    {
+        let spawner_signal = host.signal().clone();
+        let spawner_session = session.clone();
+        let ws_emit: Arc<dyn Fn(gasket_core::SubagentEvent) + Send + Sync> = Arc::new(
+            move |ev: gasket_core::SubagentEvent| {
+                if let Some(json) = crate::event_map::subagent_event_to_ws(&ev) {
+                    let s = spawner_session.clone();
+                    // Best-effort send: fire and forget (the forwarder may be
+                    // mid-lock; a dropped event is acceptable for progress UI).
+                    tokio::spawn(async move {
+                        let mut s = s.lock().await;
+                        let _ = s
+                            .sender
+                            .send(axum::extract::ws::Message::Text(json.into()))
+                            .await;
+                    });
+                }
+            },
+        );
+        let spawner_stream_fn = spawner_cfg.provider_stream_fn();
+        let spawner_hooks: Arc<dyn gasket_core::HookChain> = Arc::new(
+            gasket_host::HookStack::new(vec![Arc::new(PermissionPolicy::new(
+                mode,
+                Arc::new(|_, _| Box::pin(async { true })),
+            ))]),
+        );
+        let model = spawner_cfg.build_loop_config(
+            spawner_cfg.tunables.max_turns,
+            Some(spawner_signal.clone()),
+            None,
+            spawner_stream_fn.clone(),
+        ).model;
+        let spawner = Arc::new(
+            HostSubagentSpawner::new(
+                "You are a focused sub-agent. Complete your assigned task concisely.".into(),
+                built_in_tools(),
+                spawner_stream_fn,
+                spawner_hooks,
+                spawner_signal,
+                std::env::current_dir().unwrap_or_default(),
+                model,
+            )
+            .with_ws_emit(ws_emit),
+        );
+        host = host.with_spawner(spawner);
+    }
     // Cancel sets the Host's shared abort flag; run_turn reads it at safe points.
     let signal = host.signal().clone();
     // Per-connection token-aware compaction budget. Fed from `last_input_tokens`
