@@ -701,4 +701,61 @@ for line in sys.stdin:
             },
         }
     }
+
+    // ── Smoke test: real GitHub MCP server (needs token + network) ──────
+
+    /// End-to-end against the real `@modelcontextprotocol/server-github`.
+    /// Ignored by default — run with:
+    ///   GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx \
+    ///     cargo test -p gasket-host -- --ignored mcp_smoke_github
+    #[tokio::test]
+    #[ignore]
+    async fn mcp_smoke_github() {
+        let token = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
+            .expect("set GITHUB_PERSONAL_ACCESS_TOKEN to run this smoke test");
+        let mut env = HashMap::new();
+        env.insert("GITHUB_PERSONAL_ACCESS_TOKEN".into(), token);
+
+        let (bridge, tools) = McpBridge::spawn(
+            "github",
+            "npx",
+            &["-y".into(), "@modelcontextprotocol/server-github".into()],
+            &env,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("spawn github mcp");
+
+        // GitHub MCP exposes dozens of tools; we just need > 0.
+        assert!(!tools.is_empty(), "expected tools from github server");
+        eprintln!("(github mcp: {} tools discovered)", tools.len());
+
+        // Verify naming convention on the first tool.
+        assert!(
+            tools[0].name.starts_with("mcp__github__"),
+            "tool name not prefixed: {}",
+            tools[0].name
+        );
+
+        // Call search_repositories — read-only, no specific repo needed,
+        // verifies the token works and the full tools/call path.
+        let search = tools
+            .iter()
+            .find(|t| t.name == "mcp__github__search_repositories")
+            .expect("search_repositories tool not found");
+
+        let result = (search.execute)(tool_call_ctx_for_test(
+            "smoke",
+            serde_json::json!({"query": "gasket"}),
+        ))
+        .await
+        .expect("search_repositories call");
+        assert!(
+            !result.is_error,
+            "search_repositories returned error: {:?}",
+            result.content
+        );
+        eprintln!("(search_repositories ok, {} content blocks)", result.content.len());
+        drop(bridge);
+    }
 }
