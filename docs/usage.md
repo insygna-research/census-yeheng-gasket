@@ -240,7 +240,7 @@ Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/session
 
 ### 9.1 内置工具
 
-`read` / `write` / `edit` / `bash` / `grep` / `list`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级,低风险(`read`/`grep`/`list`)通常自动放行,高风险(`write`/`edit`/`bash`)在非 full-auto 模式下会请求审批。
+`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级,低风险(`read`/`grep`/`list`/`fetch`)通常自动放行,高风险(`write`/`edit`/`bash`)在非 full-auto 模式下会请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。
 
 ### 9.2 外部工具(白名单)
 
