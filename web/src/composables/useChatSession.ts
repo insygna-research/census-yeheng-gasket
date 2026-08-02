@@ -426,6 +426,11 @@ export function useChatSession(chatId: { value: string }) {
     isSending.value = false;
     pendingApprovals.value.clear();
     chatStore.abortToolCalls(chatId.value);
+    // Clear sub-agent state: cancel aborts sub-agent tasks, so Synthesizing
+    // never arrives — without this the panels would spin until the 5-minute
+    // client timeout.
+    subagentPhase.value = 'idle';
+    activeSubagents.value.clear();
     Object.values(subagentTimers.value).forEach(clearTimeout);
     subagentTimers.value = {};
   };

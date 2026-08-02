@@ -237,9 +237,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
     let extra_tools = load_external_tools().await;
     let mcp_tools = load_all_mcp().await;
-    // Built-in + external + mcp tools, assembled once per connection.
+    // Built-in tools built once; the sub-agent set is filtered from this
+    // same Vec (minus `spawn_subagents`), so built_in_tools() is never
+    // called twice per connection.
+    let built_in = built_in_tools();
+    let subagent_tools: Vec<_> = built_in
+        .iter()
+        .filter(|t| t.name != "spawn_subagents")
+        .cloned()
+        .collect();
+    // Parent agent gets built-in + external + MCP.
     let tools = {
-        let mut t = built_in_tools();
+        let mut t = built_in;
         t.extend(extra_tools.iter().cloned());
         t.extend(mcp_tools.iter().cloned());
         t
@@ -262,15 +271,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         let spawner_hooks: Arc<dyn gasket_core::HookChain> = Arc::new(
             gasket_host::HookStack::new(vec![spawner_policy]),
         );
-        // Sub-agents get the built-in tool set minus `spawn_subagents`:
-        // nesting is disabled (sub-agent contexts carry no spawner), and
-        // MCP/external tools are deliberately excluded — their servers are
+        // Sub-agents get the built-in tool set minus `spawn_subagents`
+        // (nesting is disabled — sub-agent contexts carry no spawner).
+        // MCP/external tools are deliberately excluded: their servers are
         // shared per-connection and not built for 5 parallel loops. The
         // shared permission policy still gates every tool call they do get.
-        let subagent_tools: Vec<_> = built_in_tools()
-            .into_iter()
-            .filter(|t| t.name != "spawn_subagents")
-            .collect();
         // Loop-config template from the parent's provider/tunables; the
         // spawner clones it per sub-agent (capping max_turns, pinning the
         // shared signal + policy hooks).

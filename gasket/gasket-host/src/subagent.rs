@@ -7,6 +7,7 @@
 //! the constructor-injected forwarder (`with_ws_emit`). Results are collected
 //! after all sub-agents finish.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ pub struct HostSubagentSpawner {
     hooks: Arc<dyn gasket_core::HookChain>,
     signal: Arc<std::sync::atomic::AtomicBool>,
     cwd: std::path::PathBuf,
+    /// Process environment captured once at construction; cloned (cheap Arc)
+    /// into each sub-agent context instead of re-querying the OS per task.
+    env: Arc<HashMap<String, String>>,
     /// Loop-config template derived from the parent's provider/tunables
     /// (`build_loop_config`). Each sub-agent clones it and overrides
     /// `max_turns` (capped) plus signal/hooks. Sub-agents therefore inherit
@@ -54,6 +58,7 @@ impl HostSubagentSpawner {
             hooks,
             signal,
             cwd,
+            env: Arc::new(std::env::vars().collect()),
             loop_config,
             ws_emit: None,
         }
@@ -86,6 +91,7 @@ impl SubagentSpawner for HostSubagentSpawner {
             hooks: Arc::clone(&self.hooks),
             signal: Arc::clone(&self.signal),
             cwd: self.cwd.clone(),
+            env: Arc::clone(&self.env),
             loop_config: self.loop_config.clone(),
             ws_emit: self.ws_emit.clone(),
         });
@@ -102,9 +108,7 @@ impl SubagentSpawner for HostSubagentSpawner {
             // the collection loop below), so a drop at any await point stops
             // everything — including the handle currently being awaited.
             let mut guard = AbortOnDrop::default();
-            let mut handles: Vec<tokio::task::JoinHandle<SubagentResult>> =
-                Vec::with_capacity(count);
-            let mut metas: Vec<(String, usize, String)> = Vec::with_capacity(count);
+            let mut pending: Vec<SubagentTask> = Vec::with_capacity(count);
 
             for (i, task) in tasks.into_iter().enumerate() {
                 let id = uuid::Uuid::new_v4().to_string();
@@ -130,7 +134,7 @@ impl SubagentSpawner for HostSubagentSpawner {
                     messages: vec![],
                     tools: spawner.tools.clone(),
                     cwd: spawner.cwd.clone(),
-                    env: std::env::vars().collect(),
+                    env: (*spawner.env).clone(),
                     session_id: format!("subagent-{id}"),
                     spawner: None,
                 };
@@ -244,15 +248,17 @@ impl SubagentSpawner for HostSubagentSpawner {
                     }
                 });
                 guard.push(&handle);
-                handles.push(handle);
-                metas.push((id, index, task_clone));
+                pending.push(SubagentTask {
+                    handle,
+                    id,
+                    index,
+                    task: task_clone,
+                });
             }
 
-            let mut results = Vec::with_capacity(handles.len());
-            while !handles.is_empty() {
-                let handle = handles.remove(0);
-                let (id, index, task) = metas.remove(0);
-                match handle.await {
+            let mut results = Vec::with_capacity(pending.len());
+            for st in pending {
+                match st.handle.await {
                     Ok(r) => results.push(r),
                     Err(e) => {
                         // Panicked sub-agent task: surface it exactly like a
@@ -260,14 +266,14 @@ impl SubagentSpawner for HostSubagentSpawner {
                         // completion count stays consistent.
                         let err_msg = format!("subagent task panicked: {e}");
                         emit(SubagentEvent::Error {
-                            id: id.clone(),
-                            index,
+                            id: st.id.clone(),
+                            index: st.index,
                             error: err_msg.clone(),
                         });
                         results.push(SubagentResult {
-                            id,
-                            task,
-                            index,
+                            id: st.id,
+                            task: st.task,
+                            index: st.index,
                             summary: String::new(),
                             tool_count: 0,
                             error: Some(err_msg),
@@ -305,6 +311,15 @@ impl Drop for AbortOnDrop {
             abort.abort();
         }
     }
+}
+
+/// A spawned sub-agent task awaiting collection: its JoinHandle plus the
+/// metadata needed to report a panic (id / index / task description).
+struct SubagentTask {
+    handle: tokio::task::JoinHandle<SubagentResult>,
+    id: String,
+    index: usize,
+    task: String,
 }
 
 /// Map a sub-agent's `AgentEvent` to a `SubagentEvent` tagged with `id`.
@@ -358,36 +373,48 @@ fn map_agent_event(id: &str, ev: &AgentEvent) -> Option<SubagentEvent> {
     }
 }
 
-/// Extract the last assistant text as summary + count tool results.
+/// Extract the sub-agent's summary (≤200 chars) + tool-result count.
+///
+/// The LAST assistant message is the sub-agent's final output — we never
+/// search backward past it. When `max_turns` runs out mid-tool-call, the
+/// last assistant ended on `ToolUse` (it wanted to keep going but the loop
+/// exhausted its turn budget). In that case the summary is marked incomplete
+/// so the main agent doesn't mistake an intermediate turn's text for the
+/// sub-agent's conclusion.
 fn extract_summary_and_tools(msgs: &[AgentMessage]) -> (String, usize) {
-    let summary = msgs
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            AgentMessage::Assistant(a) => {
-                let text: String = a
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text.chars().take(200).collect())
-                }
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
-
     let tool_count = msgs
         .iter()
         .filter(|m| matches!(m, AgentMessage::ToolResult(_)))
         .count();
+
+    let summary = match msgs.iter().rev().find_map(|m| match m {
+        AgentMessage::Assistant(a) => Some(a),
+        _ => None,
+    }) {
+        Some(a) => {
+            let text: String = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if matches!(a.stop_reason, gasket_core::StopReason::ToolUse) {
+                // The loop exhausted max_turns mid-tool-call.
+                if text.is_empty() {
+                    "(reached turn limit without a final answer)".into()
+                } else {
+                    let truncated: String = text.chars().take(200).collect();
+                    format!("{truncated} (note: reached turn limit, result may be incomplete)")
+                }
+            } else {
+                text.chars().take(200).collect()
+            }
+        }
+        None => String::new(),
+    };
 
     (summary, tool_count)
 }
@@ -573,6 +600,51 @@ mod tests {
                 }
             )),
             "usage must be emitted: {events:?}"
+        );
+    }
+
+    /// Summary honesty: when a sub-agent exhausts max_turns mid-tool-call,
+    /// the summary must NOT report an earlier turn's text as if it were the
+    /// final answer — it must indicate the task is incomplete.
+    #[tokio::test]
+    async fn max_turns_exhaustion_marks_summary_incomplete() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        // Mock replays the same chunks every turn: text + tool call → the
+        // loop keeps going until max_turns (2) runs out.
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::TextDelta("Searching the codebase".into()),
+                StreamChunk::ToolCallDelta {
+                    id: "tc1".into(),
+                    name: Some("list".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "search".into(),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        // It's Completed (not Error) — the sub-agent did work, just didn't finish.
+        assert!(results[0].error.is_none(), "max_turns is not an error");
+        // But the summary must warn about incompleteness, not report the
+        // stale "Searching the codebase" text as the final answer.
+        let summary = &results[0].summary;
+        assert!(
+            summary.contains("turn limit"),
+            "summary must indicate incomplete: {summary}"
         );
     }
 
