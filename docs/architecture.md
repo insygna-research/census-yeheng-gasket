@@ -45,7 +45,7 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
    │    gasket-host      │                                       │    gasket-ext      │
    │ config · session    │                                       │  hello · todo      │
    │ permission · compact│                                       │  search            │
-   │ hooks · external    │                                       │  permission_gate   │
+   │ hooks · external    │
    └──────────┬──────────┘                                       └─────────┬──────────┘
               │                                                            │ (可选 feature)
    ┌──────────┴──────────────────────┐                                     │
@@ -95,7 +95,7 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
 | **Hook** | 围绕每次工具调用的拦截器:`before_tool_call` 可 Allow/Block/Modify,`after_tool_call` 可改写结果(如脱敏) | `core/src/types/tool.rs`(`HookChain`) |
 | **Provider** | 一个实现了 `StreamFn` 的 LLM 客户端;内核只认这个 trait,不认具体厂商 | `core/src/providers/mod.rs` |
 | **Compaction** | 在喂给 LLM 之前**压缩工作内存**(只缩内存,不改盘),避免上下文溢出 | `host/src/compact.rs`(`ContextBudget`) |
-| **Gateway** | 把单个 WebSocket 连接当作一个会话,在后台任务里跑 agent loop 并把事件流式回推 | `gasket-gateway/src/main.rs` |
+| **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS | `gasket-gateway/src/ws.rs` |
 
 ---
 
@@ -180,12 +180,11 @@ on_event(AgentEnd);  返回本轮新增消息
    │  每条 WS 连接 = 一个 session (gasket-gateway/src/ws.rs)
    ▼
 收到 {"type":"message","content":"...","trace_id":"..."}
-   │  spawn 后台 agent loop 任务
+   │  内联 host.run_turn(select! 多路复用事件转发 + cancel/approval)
    ▼
-进入 secondary select! 多路复用:
-   ├─ agent 事件分支: AgentEvent → event_to_ws() → JSON → 推回 WS
+forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
    │     (thinking / tool_start / tool_end / content / error / done)
-   └─ 入站消息分支: {"type":"cancel"} → 置 signal 中止
+主任务 select! 入站: {"type":"cancel"} → 置 signal 中止
                     {"type":"approval_response",...} → 唤醒挂起的审批等待
 ```
 
@@ -276,6 +275,7 @@ on_event(AgentEnd);  返回本轮新增消息
 | `hooks.rs` | 把多个 `HookChain` 串成栈;`before` 取首个 Block / 末个 Modify,`after` 链式改写 | `HookStack` |
 | `compact.rs` | 上下文压缩(见第 9 章) | `ContextBudget` / `compact_by_count` |
 | `external_tool.rs` | 从 `GASKET_EXTERNAL_TOOLS` 白名单加载外部命令工具 | `ExternalToolBridge` / `commands_from_env` / `load_all` |
+| `mcp.rs` | MCP(Model Context Protocol)客户端:连接外部 MCP 工具服务器(stdio),握手 → tools/list → tools/call | `McpBridge` / `load_all_mcp` / `McpServerConfig` |
 | `printer.rs` | 把 `AgentEvent` 渲染到终端(含 Error 分支与 flush) | `EventPrinter` |
 
 ### 6.3 `install_ctrl_c`(`lib.rs:174`)
@@ -305,7 +305,7 @@ on_event(AgentEnd);  返回本轮新增消息
 
 ### 7.2 连接模型(每连接一会话)
 
-每条 WS 连接就是一个独立会话。收到 `"message"` 时:在后台任务里跑 agent loop,主任务进入一个 **select! 多路复用**,同时处理"agent 事件 → 推 WS"和"入站消息(cancel / approval_response)"。
+每条 WS 连接就是一个独立会话。收到 `"message"` 时:内联 `host.run_turn` 驱动 agent loop,一个 forwarder 任务把 `AgentEvent` 转 JSON 推回 WS;主任务进入 **select! 多路复用**,同时处理入站消息(cancel / approval_response)。
 
 ### 7.3 Wire 协议(前端 ↔ 网关)
 
@@ -388,7 +388,7 @@ on_event(AgentEnd);  返回本轮新增消息
 | **Token 感知(主)** | provider 上报的 `usage.input_tokens` 超过 `window` 的 `threshold_pct`(默认 80%)时触发;压缩后留到 `target_pct`(默认 50%)——**带滞后**,避免在阈值附近反复压缩 | `ContextBudget`(`compact.rs:119`) |
 | **条数兜底** | 当尚无 usage 数据(`last_input_tokens==0`)时,按消息条数 `GASKET_COMPACT_MAX_MESSAGES`(默认 80)压缩 | `compact_by_count`(`compact.rs:55`) |
 
-`ContextBudget::compact` 在超阈值时,按比例 `kept_groups = total * target_tokens / last_input_tokens` 从最新端保留整组,前置一条提示;至少保留一组、至少丢弃一组。
+`ContextBudget::compact` 在超阈值时,按 `target = messages.len() * target_pct / 100` 算出保留消息数,复用 `compact_by_count`(贪心保留最新整组 + 前置提示)。**一套算法,两个触发器**:token 感知(主)和条数兜底。无 tokenizer,不假装建模 per-message token 成本。
 
 ### 9.3 数据来源
 
