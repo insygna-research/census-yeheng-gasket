@@ -90,6 +90,7 @@ nu-ansi-term = "0.50"
 
 # Concurrent data structures
 dashmap = "6"
+parking_lot = "0.12"
 
 # Test utilities
 tempfile = "3"

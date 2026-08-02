@@ -10,7 +10,7 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "spawn_subagents".into(),
         label: "Spawn Subagents".into(),
-        description: "Spawn parallel sub-agents to work on independent tasks concurrently. Each sub-agent runs its own agent loop with the same tools. Use for divide-and-conquer: searching multiple areas, writing + testing + reviewing in parallel.".into(),
+        description: "Spawn parallel sub-agents to work on independent tasks concurrently. Each sub-agent runs its own agent loop with the standard built-in tools. Use for divide-and-conquer: searching multiple areas, writing + testing + reviewing in parallel. Max 5 tasks.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -38,7 +38,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         .as_array()
         .ok_or_else(|| crate::error::ToolError::Message("tasks array is required".into()))?;
 
-    let spawns: Vec<SubagentSpawn> = tasks
+    let mut spawns: Vec<SubagentSpawn> = tasks
         .iter()
         .filter_map(|t| {
             t["task"]
@@ -54,7 +54,8 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     }
 
     // Enforce the schema's maxItems: 5, regardless of what the LLM sent.
-    let mut spawns = spawns;
+    // Dropped tasks are reported so the model isn't silently truncated.
+    let dropped = spawns.len().saturating_sub(5);
     spawns.truncate(5);
 
     let spawner: Arc<dyn SubagentSpawner> = match &ctx.ctx.spawner {
@@ -62,14 +63,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         None => Arc::new(crate::subagent::NoopSubagentSpawner),
     };
 
-    // The emit callback is a no-op here — the host's spawner implementation
-    // owns the event channel to the gateway. This tool closure only collects
-    // the final results. (Events flow through the spawner's internal emit,
-    // not through this closure's return.)
-    let emit: Arc<dyn Fn(crate::SubagentEvent) + Send + Sync> = Arc::new(|_| {});
-    let results = spawner.spawn(spawns, emit).await;
+    let results = spawner.spawn(spawns).await;
 
-    let summary = results
+    let mut summary = results
         .iter()
         .map(|r| {
             if let Some(err) = &r.error {
@@ -80,6 +76,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    if dropped > 0 {
+        summary.push_str(&format!("\n\n(Note: {dropped} additional task(s) beyond the max of 5 were dropped.)"));
+    }
 
     Ok(ToolResult {
         content: vec![ContentBlock::text(summary)],
@@ -87,7 +86,116 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
             "subagent_count": results.len(),
             "completed": results.iter().filter(|r| r.error.is_none()).count(),
             "errors": results.iter().filter(|r| r.error.is_some()).count(),
+            "dropped": dropped,
         }),
         is_error: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::subagent::{SubagentResult, SubagentSpawner};
+    use crate::types::tool::ToolContext;
+
+    /// Records how many tasks it received; returns one canned result each.
+    struct CountingSpawner(Arc<AtomicUsize>);
+
+    impl SubagentSpawner for CountingSpawner {
+        fn spawn(
+            &self,
+            tasks: Vec<SubagentSpawn>,
+        ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
+            let count = Arc::clone(&self.0);
+            Box::pin(async move {
+                count.fetch_add(tasks.len(), Ordering::SeqCst);
+                tasks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, t)| SubagentResult {
+                        id: format!("r-{i}"),
+                        task: t.task,
+                        index: i + 1,
+                        summary: "ok".into(),
+                        tool_count: 0,
+                        error: None,
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    fn ctx_with(
+        spawner: Option<Arc<dyn SubagentSpawner>>,
+        tasks: serde_json::Value,
+    ) -> ToolCallCtx {
+        ToolCallCtx {
+            tool_call_id: "t1".into(),
+            args: serde_json::json!({ "tasks": tasks }),
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: std::env::current_dir().unwrap(),
+                env: HashMap::new(),
+                session_id: "s1".into(),
+                state_dir: std::env::temp_dir(),
+                spawner,
+            },
+        }
+    }
+
+    fn seven_tasks() -> serde_json::Value {
+        serde_json::json!([
+            { "task": "a" },
+            { "task": "b" },
+            { "task": "c" },
+            { "task": "d" },
+            { "task": "e" },
+            { "task": "f" },
+            { "task": "g" },
+        ])
+    }
+
+    /// The schema's maxItems (5) is enforced regardless of what the LLM
+    /// sent, and the truncation is reported instead of being silent.
+    #[tokio::test]
+    async fn truncates_over_limit_tasks_and_reports() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(CountingSpawner(Arc::clone(&count)));
+        let r = execute(ctx_with(Some(spawner), seven_tasks())).await.unwrap();
+
+        assert_eq!(count.load(Ordering::SeqCst), 5, "spawner must receive max 5");
+        assert_eq!(r.details["subagent_count"], 5);
+        assert_eq!(r.details["dropped"], 2);
+        let text = r.content.first().and_then(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(
+            text.unwrap_or_default().contains("dropped"),
+            "dropped count must be visible to the model"
+        );
+    }
+
+    /// No spawner wired (bare agent_loop / CLI without subagents): every
+    /// task comes back as an explicit error, never a silent no-op.
+    #[tokio::test]
+    async fn no_spawner_reports_unavailable() {
+        let r = execute(ctx_with(None, seven_tasks())).await.unwrap();
+
+        assert_eq!(r.details["subagent_count"], 5);
+        assert_eq!(r.details["errors"], 5);
+        let text = r.content.first().and_then(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(
+            text.unwrap_or_default().contains("not available"),
+            "unavailable spawner must be surfaced as errors"
+        );
+    }
 }

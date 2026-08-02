@@ -121,6 +121,22 @@ impl OutgoingEvent {
             message: None,
         }
     }
+    /// Reply to a message received while a turn is already running. Kept
+    /// distinct from `error` so the frontend can show a toast without
+    /// clearing the in-flight conversation state.
+    pub(crate) fn busy(msg: String) -> Self {
+        Self {
+            event_type: "busy",
+            id: None,
+            tool_name: None,
+            description: None,
+            content: Some(msg.clone()),
+            name: None,
+            arguments: None,
+            output: None,
+            message: Some(msg),
+        }
+    }
     pub(crate) fn approval_request(
         request_id: String,
         tool_name: String,

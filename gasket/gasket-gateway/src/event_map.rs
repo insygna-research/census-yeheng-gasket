@@ -55,7 +55,7 @@ pub(crate) fn event_to_ws(
 
 /// Convert a [`SubagentEvent`] to a raw JSON string for the frontend's
 /// `subagent_*` protocol. Returns `None` for events that have no WS
-/// representation.
+/// representation (the internal `Usage` accounting event).
 pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option<String> {
     use gasket_core::SubagentEvent;
     let json = match event {
@@ -78,9 +78,9 @@ pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option
             "type": "subagent_tool_start", "id": id, "name": name,
             "arguments": arguments
         }),
-        SubagentEvent::ToolEnd { id, tool_id, name, output } => serde_json::json!({
+        SubagentEvent::ToolEnd { id, name, output } => serde_json::json!({
             "type": "subagent_tool_end", "id": id, "name": name,
-            "tool_id": tool_id, "output": output
+            "output": output
         }),
         SubagentEvent::Completed { id, index, summary, tool_count } => serde_json::json!({
             "type": "subagent_completed", "id": id, "index": index,
@@ -89,6 +89,44 @@ pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option
         SubagentEvent::Error { id, index, error } => serde_json::json!({
             "type": "subagent_error", "id": id, "index": index, "error": error
         }),
+        // Internal accounting only — folded into the session usage counters
+        // by the WS forwarder; never serialized to the frontend.
+        SubagentEvent::Usage { .. } => return None,
     };
     Some(serde_json::to_string(&json).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gasket_core::SubagentEvent;
+
+    #[test]
+    fn usage_has_no_wire_representation() {
+        assert!(
+            subagent_event_to_ws(&SubagentEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+            })
+            .is_none(),
+            "Usage is internal accounting and must never reach the socket"
+        );
+    }
+
+    #[test]
+    fn tool_end_json_has_no_tool_id() {
+        // The frontend generates its own tool ids and matches by name;
+        // the server's tool_call_id is deliberately not serialized.
+        let json = subagent_event_to_ws(&SubagentEvent::ToolEnd {
+            id: "s1".into(),
+            name: "bash".into(),
+            output: Some("out".into()),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "subagent_tool_end");
+        assert_eq!(v["name"], "bash");
+        assert_eq!(v["id"], "s1");
+        assert!(v.get("tool_id").is_none(), "no dead tool_id on the wire");
+    }
 }

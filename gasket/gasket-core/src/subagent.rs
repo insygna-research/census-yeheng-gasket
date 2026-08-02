@@ -2,12 +2,12 @@
 //!
 //! The host injects a `SubagentSpawner` into `ToolContext`. The
 //! `spawn_subagents` tool calls it to fan out parallel sub-agent loops.
-//! Events are emitted as `SubagentEvent`, which the gateway maps 1:1 to the
-//! frontend's `subagent_*` WS protocol.
+//! Events are emitted as `SubagentEvent`: nine variants map 1:1 to the
+//! frontend's `subagent_*` WS protocol; [`SubagentEvent::Usage`] is internal
+//! accounting (session token counters) with no WS representation.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 /// One task for a sub-agent to work on.
 #[derive(Debug, Clone)]
@@ -26,8 +26,10 @@ pub struct SubagentResult {
     pub error: Option<String>,
 }
 
-/// Real-time events from sub-agent execution. Maps 1:1 to the frontend's
-/// `subagent_*` WS messages (see `web/src/types/index.ts`).
+/// Real-time events from sub-agent execution. The first nine variants map
+/// 1:1 to the frontend's `subagent_*` WS messages (see
+/// `web/src/types/index.ts`); [`Usage`](Self::Usage) is internal accounting
+/// only (provider token counts folded into the session counters).
 #[derive(Debug, Clone)]
 pub enum SubagentEvent {
     AllStarted { count: usize },
@@ -35,21 +37,28 @@ pub enum SubagentEvent {
     Thinking { id: String, content: String },
     Content { id: String, content: String },
     ToolStart { id: String, name: String, arguments: Option<String> },
-    ToolEnd { id: String, tool_id: Option<String>, name: String, output: Option<String> },
+    ToolEnd { id: String, name: String, output: Option<String> },
     Completed { id: String, index: usize, summary: String, tool_count: usize },
     Error { id: String, index: usize, error: String },
     Synthesizing,
+    /// Provider-reported token usage from a sub-agent's LLM calls. Never
+    /// forwarded to the frontend — the gateway accumulates it into the
+    /// session's usage counters.
+    Usage { input_tokens: u64, output_tokens: u64 },
 }
 
 /// Trait injected into `ToolContext` by the host. The `spawn_subagents` tool
 /// calls this to fan out parallel sub-agent loops. The host implementation
-/// builds per-task contexts (same tools/stream_fn/hooks, fewer max_turns) and
-/// runs `run_agent_loop` concurrently.
+/// builds per-task contexts (same built-in tools/stream_fn/hooks, capped
+/// max_turns) and runs `run_agent_loop` concurrently.
+///
+/// Event delivery is the spawner's own concern (configured at construction,
+/// e.g. a WS forwarder): there is no per-call emit parameter — every caller
+/// would only pass a no-op.
 pub trait SubagentSpawner: Send + Sync {
     fn spawn(
         &self,
         tasks: Vec<SubagentSpawn>,
-        emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>,
     ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>>;
 }
 
@@ -61,7 +70,6 @@ impl SubagentSpawner for NoopSubagentSpawner {
     fn spawn(
         &self,
         tasks: Vec<SubagentSpawn>,
-        _emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>,
     ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
         Box::pin(async move {
             tasks

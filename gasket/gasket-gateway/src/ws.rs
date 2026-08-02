@@ -28,6 +28,25 @@ use crate::event_map::event_to_ws;
 use crate::state::{AppState, WsSession};
 use crate::wire::{ApprovalResponse, IncomingMessage, OutgoingEvent};
 
+/// Everything written to the socket flows through ONE ordered channel and a
+/// single writer task. A single writer guarantees cross-stream ordering:
+/// without it, the turn-boundary `done` could overtake the last subagent
+/// event (the frontend skips `done` while subagents are active → stuck UI),
+/// and approval requests could overtake the tool_start they belong to.
+enum WireEvent {
+    Agent(gasket_core::AgentEvent),
+    Subagent(gasket_core::SubagentEvent),
+    Approval {
+        request_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+    },
+    /// Reply to a message received while a turn is already running.
+    Busy(String),
+    Done,
+    Error(String),
+}
+
 pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
@@ -92,30 +111,115 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     // 会复制旧 observed-version，一次 cancel 后所有克隆都会立即命中 changed()
     // （闩锁），见 approval.rs 的 wait_for_decision 测试。
     let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+    // ── Single ordered wire channel ──────────────────────────
+    // All outbound events (main agent stream, subagent events, approval
+    // requests, turn-boundary done/error) queue here; one writer task owns
+    // the socket, preserving order across streams.
+    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel::<WireEvent>();
+    let wire_session = session.clone();
+    tokio::spawn(async move {
+        // tool_call_id → tool name, per turn (cleared on Done).
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        while let Some(ev) = wire_rx.recv().await {
+            let payload: Option<String> = match ev {
+                WireEvent::Agent(event) => {
+                    if let AgentEvent::ToolExecutionStart {
+                        tool_call_id,
+                        tool_name,
+                        ..
+                    } = &event
+                    {
+                        tool_names.insert(tool_call_id.clone(), tool_name.clone());
+                    }
+                    // Accumulate provider-reported usage for the context API.
+                    if let AgentEvent::AfterProviderResponse { response, .. } = &event {
+                        if let Some(u) = &response.usage {
+                            let mut s = wire_session.lock().await;
+                            s.usage_in += u.input_tokens;
+                            s.usage_out += u.output_tokens;
+                            s.last_input_tokens = u.input_tokens;
+                        }
+                    }
+                    event_to_ws(&event, &mut tool_names)
+                        .map(|ev| serde_json::to_string(&ev).unwrap_or_default())
+                }
+                WireEvent::Subagent(ev) => {
+                    if let gasket_core::SubagentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } = ev
+                    {
+                        // Sub-agent provider usage counts toward the session's
+                        // token totals; it has no WS message of its own. (The
+                        // parent's compaction budget is NOT touched: sub-agent
+                        // messages never enter the main history.)
+                        let mut s = wire_session.lock().await;
+                        s.usage_in += input_tokens;
+                        s.usage_out += output_tokens;
+                        None
+                    } else {
+                        crate::event_map::subagent_event_to_ws(&ev)
+                    }
+                }
+                WireEvent::Approval {
+                    request_id,
+                    tool_name,
+                    args,
+                } => {
+                    let ev = OutgoingEvent::approval_request(request_id, tool_name, &args);
+                    Some(serde_json::to_string(&ev).unwrap_or_default())
+                }
+                WireEvent::Busy(msg) => {
+                    let ev = OutgoingEvent::busy(msg);
+                    Some(serde_json::to_string(&ev).unwrap_or_default())
+                }
+                WireEvent::Done => {
+                    // Turn boundary: the tool-name cache is per-turn.
+                    tool_names.clear();
+                    let ev = OutgoingEvent::done();
+                    Some(serde_json::to_string(&ev).unwrap_or_default())
+                }
+                WireEvent::Error(msg) => {
+                    let ev = OutgoingEvent::error(msg);
+                    Some(serde_json::to_string(&ev).unwrap_or_default())
+                }
+            };
+            if let Some(payload) = payload {
+                let mut s = wire_session.lock().await;
+                let _ = s
+                    .sender
+                    .send(axum::extract::ws::Message::Text(payload.into()))
+                    .await;
+            }
+        }
+    });
+
     let approver_session = session.clone();
     // 闭包侧持有 Sender 的克隆（原 Sender 保留在主循环供 cancel 使用）。
     let approver_cancel_tx = cancel_tx.clone();
     // 显式标注 Approver：闭包返回的 Box::pin(async …) 需要在这里按
     // `Pin<Box<dyn Future + Send>>` 非大小化（裸闭包推断会把返回类型
     // 锁死为具体 async block，后续再转 Arc<dyn Fn…> 会失败）。
+    let approver_wire = wire_tx.clone();
     let approver: Approver = Arc::new(move |tool_name: &str, args: &serde_json::Value| {
         let session = approver_session.clone();
         let cancel_tx = approver_cancel_tx.clone();
+        let wire = approver_wire.clone();
         Box::pin(async move {
             let outcome = { session.lock().await.registry.register(tool_name) };
             let (request_id, rx) = match outcome {
                 RegisterOutcome::Remembered(v) => return v,
                 RegisterOutcome::Pending { request_id, rx } => (request_id, rx),
             };
-            {
-                let mut s = session.lock().await;
-                let ev = OutgoingEvent::approval_request(
-                    request_id.clone(),
-                    tool_name.to_string(),
-                    args,
-                );
-                send_json(&mut s.sender, &ev).await;
-            }
+            // Approval requests go through the same ordered channel as every
+            // other wire event, so a request can never overtake the
+            // tool_start event of the call it belongs to.
+            let _ = wire.send(WireEvent::Approval {
+                request_id: request_id.clone(),
+                tool_name: tool_name.to_string(),
+                args: args.clone(),
+            });
             let timeout_s = std::env::var("GASKET_APPROVAL_TIMEOUT_S")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -145,49 +249,45 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let spawner_cfg = host_cfg.clone();
     let spawner_policy = Arc::clone(&policy);
     let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
-    // Subagent spawner: events forwarded to WS via the session sender.
+    // Subagent spawner: events forwarded to WS via the wire channel.
     {
         let spawner_signal = host.signal().clone();
-        let spawner_session = session.clone();
-        // Ordered event channel: emit closure writes JSON strings; a single
-        // forwarder task drains them sequentially to preserve event order.
-        let (sub_tx, mut sub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
-            while let Some(json) = sub_rx.recv().await {
-                let mut s = spawner_session.lock().await;
-                let _ = s
-                    .sender
-                    .send(axum::extract::ws::Message::Text(json.into()))
-                    .await;
-            }
-        });
-        let ws_emit: Arc<dyn Fn(gasket_core::SubagentEvent) + Send + Sync> = Arc::new(
-            move |ev: gasket_core::SubagentEvent| {
-                if let Some(json) = crate::event_map::subagent_event_to_ws(&ev) {
-                    let _ = sub_tx.send(json);
-                }
-            },
-        );
+        let ws_emit: Arc<dyn Fn(gasket_core::SubagentEvent) + Send + Sync> = {
+            let wire = wire_tx.clone();
+            Arc::new(move |ev: gasket_core::SubagentEvent| {
+                let _ = wire.send(WireEvent::Subagent(ev));
+            })
+        };
         let spawner_stream_fn = spawner_cfg.provider_stream_fn();
         let spawner_hooks: Arc<dyn gasket_core::HookChain> = Arc::new(
             gasket_host::HookStack::new(vec![spawner_policy]),
         );
-        let model = spawner_cfg.build_loop_config(
+        // Sub-agents get the built-in tool set minus `spawn_subagents`:
+        // nesting is disabled (sub-agent contexts carry no spawner), and
+        // MCP/external tools are deliberately excluded — their servers are
+        // shared per-connection and not built for 5 parallel loops. The
+        // shared permission policy still gates every tool call they do get.
+        let subagent_tools: Vec<_> = built_in_tools()
+            .into_iter()
+            .filter(|t| t.name != "spawn_subagents")
+            .collect();
+        // Loop-config template from the parent's provider/tunables; the
+        // spawner clones it per sub-agent (capping max_turns, pinning the
+        // shared signal + policy hooks).
+        let loop_config = spawner_cfg.build_loop_config(
             spawner_cfg.tunables.max_turns,
             Some(spawner_signal.clone()),
             None,
-            spawner_stream_fn.clone(),
-        ).model;
+            spawner_stream_fn,
+        );
         let spawner = Arc::new(
             HostSubagentSpawner::new(
                 "You are a focused sub-agent. Complete your assigned task concisely.".into(),
-                built_in_tools(),
-                spawner_stream_fn,
+                subagent_tools,
                 spawner_hooks,
                 spawner_signal,
                 std::env::current_dir().unwrap_or_default(),
-                model,
+                loop_config,
             )
             .with_ws_emit(ws_emit),
         );
@@ -281,50 +381,22 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     history
                 };
 
-                // ── Forward agent events to the WebSocket ──────
-                // run_turn drives the agent loop inline; the sync on_event
-                // closure hands each event to a forwarder task that does the
-                // async WS send. This is the same run_turn the CLI uses.
-                let (event_tx, event_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-                let fwd_session = session.clone();
-                let fwd_handle = tokio::spawn(async move {
-                    let mut tool_names: HashMap<String, String> = HashMap::new();
-                    let mut rx = event_rx;
-                    while let Some(event) = rx.recv().await {
-                        if let AgentEvent::ToolExecutionStart {
-                            tool_call_id,
-                            tool_name,
-                            ..
-                        } = &event
-                        {
-                            tool_names.insert(tool_call_id.clone(), tool_name.clone());
-                        }
-                        // Accumulate provider-reported usage for the context API.
-                        if let AgentEvent::AfterProviderResponse { response, .. } = &event {
-                            if let Some(u) = &response.usage {
-                                let mut s = fwd_session.lock().await;
-                                s.usage_in += u.input_tokens;
-                                s.usage_out += u.output_tokens;
-                                s.last_input_tokens = u.input_tokens;
-                            }
-                        }
-                        let json = event_to_ws(&event, &mut tool_names);
-                        if let Some(json) = json {
-                            let mut s = fwd_session.lock().await;
-                            send_json(&mut s.sender, &json).await;
-                        }
-                    }
-                });
-
                 // ── Run the turn inline, multiplexing cancel/approval ──
-                // On close/error we break immediately: dropping `turn` is
-                // cancel-safe (run_turn persists only on success), and it stops
-                // us re-polling an exhausted ws_rx (a Stream contract violation).
+                // run_turn drives the agent loop inline; the sync on_event
+                // closure forwards events to the connection-wide wire channel
+                // (whose single writer task owns the socket and ordering).
+                // This is the same run_turn the CLI uses. On close/error we
+                // break immediately: dropping `turn` is cancel-safe (run_turn
+                // persists only on success), and it stops us re-polling an
+                // exhausted ws_rx (a Stream contract violation).
+                let turn_wire = wire_tx.clone();
                 let mut closing = false;
                 let turn_outcome: Option<Result<Vec<AgentMessage>, gasket_host::HostError>> = {
-                    let turn = host.run_turn(user_msg, &history, move |ev| {
-                        let _ = event_tx.send(ev);
+                    let turn = host.run_turn(user_msg, &history, {
+                        let wire = turn_wire.clone();
+                        move |ev| {
+                            let _ = wire.send(WireEvent::Agent(ev));
+                        }
                     });
                     tokio::pin!(turn);
 
@@ -359,6 +431,16 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                                         );
                                                     }
                                                 }
+                                                "message" => {
+                                                    // A message during a turn
+                                                    // cannot be accepted. Never
+                                                    // drop user input silently:
+                                                    // tell them.
+                                                    let _ = turn_wire.send(WireEvent::Busy(
+                                                        "The agent is busy processing your previous request; this message was not accepted."
+                                                            .into(),
+                                                    ));
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -386,25 +468,23 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         }
                     }
                     outcome
-                }; // turn dropped → event_tx dropped → forwarder drains & exits
+                }; // turn dropped
 
-                let _ = fwd_handle.await;
                 // Turn boundary: clear in-flight approvals regardless of outcome.
                 session.lock().await.registry.clear_pending();
 
                 if !closing {
-                    {
-                        let mut s = session.lock().await;
-                        send_json(&mut s.sender, &OutgoingEvent::done()).await;
-                    }
+                    // done/error are queued AFTER every event the turn emitted
+                    // (all subagent events were queued before spawn returned),
+                    // so the frontend sees a complete picture before the
+                    // turn-boundary markers.
+                    let _ = wire_tx.send(WireEvent::Done);
                     match turn_outcome {
                         Some(Ok(new_msgs)) => {
                             session.lock().await.history.extend(new_msgs);
                         }
                         Some(Err(e)) => {
-                            let err = OutgoingEvent::error(format!("{e}"));
-                            let mut s = session.lock().await;
-                            send_json(&mut s.sender, &err).await;
+                            let _ = wire_tx.send(WireEvent::Error(format!("{e}")));
                             warn!("session {session_id}: agent error: {e}");
                         }
                         None => {}

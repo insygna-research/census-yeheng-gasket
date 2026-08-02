@@ -124,16 +124,12 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
-  const handleSubagentToolEnd = (msg: { id: string; tool_id?: string; name: string; output?: string }, botMsg: Message) => {
+  const handleSubagentToolEnd = (msg: { id: string; name: string; output?: string }, botMsg: Message) => {
     const subagent = activeSubagents.value.get(msg.id);
     if (subagent && subagent.toolCalls.length > 0) {
-      let tool: any | undefined;
-      if (msg.tool_id) {
-        tool = subagent.toolCalls.find(t => t.id === msg.tool_id);
-      }
-      if (!tool) {
-        tool = [...subagent.toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running');
-      }
+      // Sub-agents execute tools serially, so the newest running call with
+      // this name is the one that just finished.
+      const tool = [...subagent.toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running');
       if (tool) {
         tool.status = 'complete';
         tool.output = msg.output;
@@ -276,11 +272,17 @@ export function useChatSession(chatId: { value: string }) {
         break;
       case 'done':
         isThinking.value = false;
-        // 回合结束（含审批超时/连接关闭后的 done）：清理残留审批弹窗
+        // 回合结束（含审批超时/连接关闭后的 done）：清理残留审批弹窗。
+        // 网关保证 done 排在全部 subagent 事件之后（单一有序通道），
+        // 到达这里时子面板必然已收尾，无需再检查 activeSubagents。
         pendingApprovals.value.clear();
-        if (activeSubagents.value.size > 0) break;
         isReceiving.value = false;
         fetchContext();
+        break;
+      case 'busy':
+        // 发送时回合已在进行（竞态/打断）：只提示，不动会话状态——
+        // 正在流式的回复和子面板不能被清掉。
+        showError(msg.message || 'The agent is busy processing a request');
         break;
       // subagent_* 协议是 M2（core 子 agent 编排）的预留契约：网关当前
       // 从不发送，这些分支保持无害惰性。M2 落地后由网关协议激活。
@@ -443,7 +445,10 @@ export function useChatSession(chatId: { value: string }) {
   };
 
   const sendMessage = (text: string) => {
-    if (!text.trim() || !isConnected.value || isSending.value || (isReceiving.value && subagentPhase.value !== 'running')) return false;
+    // 接收期间一律禁发（含子 agent 运行中）：后端在回合内不会接受新
+    // message，发送只会被静默丢弃——之前允许 running 期间发送是个
+    // 契约错觉。
+    if (!text.trim() || !isConnected.value || isSending.value || isReceiving.value) return false;
 
     const msgId = Date.now().toString();
     chatStore.appendMessage(chatId.value, {
@@ -453,13 +458,6 @@ export function useChatSession(chatId: { value: string }) {
       timestamp: Date.now(),
       status: 'sending'
     });
-
-    if (subagentPhase.value === 'running') {
-      activeSubagents.value.clear();
-      subagentPhase.value = 'idle';
-      Object.values(subagentTimers.value).forEach(clearTimeout);
-      subagentTimers.value = {};
-    }
 
     isSending.value = true;
     try {

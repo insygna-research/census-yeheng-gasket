@@ -33,7 +33,7 @@ export interface SubagentState {
   toolCalls: SubagentToolCall[];
   /** Total tool call count */
   toolCount: number;
-  /** Brief summary (first 100 chars of result) */
+  /** Brief summary (first 200 chars of the sub-agent's final text) */
   summary?: string;
   /** Error message if status is 'error' */
   error?: string;
@@ -44,9 +44,9 @@ export interface SubagentState {
 }
 
 /**
- * WebSocket message types for subagent events.
- * M2 规划：网关当前不发送这些消息（core 子 agent 编排未实现），
- * 类型保留供 M2 使用，勿删除。
+ * WebSocket message types for subagent events (gateway → frontend).
+ * 网关经单一有序通道发送；`tool_id` 已从协议删除——前端自行生成工具
+ * id 并按 name 匹配（子 agent 串行执行工具，name 无歧义）。
  */
 export type SubagentWsMessage =
   | { type: 'subagent_all_started'; count: number }
@@ -55,7 +55,7 @@ export type SubagentWsMessage =
   | { type: 'subagent_thinking'; id: string; content: string }
   | { type: 'subagent_content'; id: string; content: string }
   | { type: 'subagent_tool_start'; id: string; name: string; arguments?: string }
-  | { type: 'subagent_tool_end'; id: string; tool_id?: string; name: string; output?: string }
+  | { type: 'subagent_tool_end'; id: string; name: string; output?: string }
   | { type: 'subagent_completed'; id: string; index: number; summary: string; tool_count: number }
   | { type: 'subagent_error'; id: string; index: number; error: string };
 

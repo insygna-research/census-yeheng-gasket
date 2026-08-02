@@ -1,15 +1,19 @@
 //! Host-side `SubagentSpawner`: fans out parallel sub-agent loops.
 //!
-//! Each sub-agent runs its own `run_agent_loop` with the same tools, stream_fn,
-//! and hooks as the parent. Events are mapped from `AgentEvent` to
-//! `SubagentEvent` and emitted through the callback. Results are collected
+//! Each sub-agent runs its own `run_agent_loop` with the same built-in tool
+//! set, stream_fn, and policy hooks as the parent (minus `spawn_subagents`
+//! itself — sub-agent contexts carry no spawner, so nesting is disabled).
+//! Events are mapped from `AgentEvent` to `SubagentEvent` and emitted through
+//! the constructor-injected forwarder (`with_ws_emit`). Results are collected
 //! after all sub-agents finish.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use gasket_core::{
-    run_agent_loop, AgentContext, AgentEvent, AgentMessage, ContentBlock, ContentDelta,
-    ModelSpec, StreamFn, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
+    run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock,
+    ContentDelta, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
     ToolDefinition, UserMessage,
 };
 
@@ -21,43 +25,42 @@ const SUBAGENT_MAX_TURNS: usize = 10;
 pub struct HostSubagentSpawner {
     system_prompt: String,
     tools: Vec<ToolDefinition>,
-    stream_fn: Arc<dyn StreamFn>,
     hooks: Arc<dyn gasket_core::HookChain>,
     signal: Arc<std::sync::atomic::AtomicBool>,
     cwd: std::path::PathBuf,
-    max_turns: usize,
-    model: ModelSpec,
-    /// Optional event forwarder set by the gateway. When set, subagent events
-    /// are forwarded here in addition to the per-spawn emit callback.
+    /// Loop-config template derived from the parent's provider/tunables
+    /// (`build_loop_config`). Each sub-agent clones it and overrides
+    /// `max_turns` (capped) plus signal/hooks. Sub-agents therefore inherit
+    /// the parent's configured thinking level, per-turn tool-call ceiling,
+    /// and retry policy — no hardcoded drift.
+    loop_config: AgentLoopConfig,
+    /// Optional event forwarder set by the gateway. All subagent events are
+    /// delivered through this callback (the trait has no per-call emit).
     ws_emit: Option<Arc<dyn Fn(SubagentEvent) + Send + Sync>>,
 }
 
 impl HostSubagentSpawner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         system_prompt: String,
         tools: Vec<ToolDefinition>,
-        stream_fn: Arc<dyn StreamFn>,
         hooks: Arc<dyn gasket_core::HookChain>,
         signal: Arc<std::sync::atomic::AtomicBool>,
         cwd: std::path::PathBuf,
-        model: ModelSpec,
+        loop_config: AgentLoopConfig,
     ) -> Self {
         Self {
             system_prompt,
             tools,
-            stream_fn,
             hooks,
             signal,
             cwd,
-            max_turns: SUBAGENT_MAX_TURNS,
-            model,
+            loop_config,
             ws_emit: None,
         }
     }
 
-    /// Set a WS event forwarder (gateway). When set, all subagent events are
-    /// forwarded to this callback in addition to the per-spawn emit.
+    /// Set an event forwarder (gateway). All subagent events are delivered to
+    /// this callback.
     pub fn with_ws_emit(
         mut self,
         ws_emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>,
@@ -71,38 +74,37 @@ impl SubagentSpawner for HostSubagentSpawner {
     fn spawn(
         &self,
         tasks: Vec<SubagentSpawn>,
-        emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SubagentResult>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
         let count = tasks.len();
-        // If the gateway set a ws_emit, merge it into the emit callback so
-        // events flow to both the per-spawn emit and the WS forwarder.
         let emit: Arc<dyn Fn(SubagentEvent) + Send + Sync> = match &self.ws_emit {
-            Some(ws) => {
-                let emit = Arc::clone(&emit);
-                let ws = Arc::clone(ws);
-                Arc::new(move |ev| {
-                    emit(ev.clone());
-                    ws(ev);
-                })
-            }
-            None => emit,
+            Some(ws) => Arc::clone(ws),
+            None => Arc::new(|_| {}),
         };
         let spawner = Arc::new(HostSubagentSpawner {
             system_prompt: self.system_prompt.clone(),
             tools: self.tools.clone(),
-            stream_fn: Arc::clone(&self.stream_fn),
             hooks: Arc::clone(&self.hooks),
             signal: Arc::clone(&self.signal),
             cwd: self.cwd.clone(),
-            max_turns: self.max_turns,
-            model: self.model.clone(),
+            loop_config: self.loop_config.clone(),
             ws_emit: self.ws_emit.clone(),
         });
 
         Box::pin(async move {
             emit(SubagentEvent::AllStarted { count });
 
-            let mut handles = Vec::with_capacity(count);
+            // Sub-agent tasks live behind a drop guard: if this future is
+            // dropped mid-flight (turn cancelled, connection closed), every
+            // still-running task is aborted instead of executing tools and
+            // emitting events into a dead session. abort() on a completed
+            // task is a no-op, so the guard is harmless on the happy path.
+            // AbortHandles stay tracked for the WHOLE function (including
+            // the collection loop below), so a drop at any await point stops
+            // everything — including the handle currently being awaited.
+            let mut guard = AbortOnDrop::default();
+            let mut handles: Vec<tokio::task::JoinHandle<SubagentResult>> =
+                Vec::with_capacity(count);
+            let mut metas: Vec<(String, usize, String)> = Vec::with_capacity(count);
 
             for (i, task) in tasks.into_iter().enumerate() {
                 let id = uuid::Uuid::new_v4().to_string();
@@ -133,16 +135,12 @@ impl SubagentSpawner for HostSubagentSpawner {
                     spawner: None,
                 };
 
-                let sub_config = gasket_core::AgentLoopConfig {
-                    model: spawner.model.clone(),
-                    thinking_level: gasket_core::ThinkingLevel::default(),
-                    max_turns: spawner.max_turns,
-                    max_tool_calls_per_turn: 20,
-                    signal: Some(Arc::clone(&spawner.signal)),
-                    stream_fn: Arc::clone(&spawner.stream_fn),
-                    hooks: Some(Arc::clone(&spawner.hooks)),
-                    retry: gasket_core::RetryPolicy::default(),
-                };
+                // Clone the parent-derived template, then pin this spawner's
+                // signal/hooks and cap max_turns below the parent's.
+                let mut sub_config = spawner.loop_config.clone();
+                sub_config.max_turns = SUBAGENT_MAX_TURNS.min(spawner.loop_config.max_turns);
+                sub_config.signal = Some(Arc::clone(&spawner.signal));
+                sub_config.hooks = Some(Arc::clone(&spawner.hooks));
 
                 let user_msg = AgentMessage::User(UserMessage {
                     content: vec![ContentBlock::text(task.task.clone())],
@@ -160,7 +158,7 @@ impl SubagentSpawner for HostSubagentSpawner {
                 let run_index = index;
                 let emit = Arc::clone(&emit);
 
-                handles.push(tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let result = run_agent_loop(
                         vec![user_msg],
                         sub_context,
@@ -176,20 +174,55 @@ impl SubagentSpawner for HostSubagentSpawner {
 
                     match result {
                         Ok(msgs) => {
-                            let (summary, tool_count) = extract_summary_and_tools(&msgs);
-                            emit(SubagentEvent::Completed {
-                                id: run_id.clone(),
-                                index: run_index,
-                                summary: summary.clone(),
-                                tool_count,
+                            // A run can end "successfully" with a failed
+                            // stream: provider error mid-response, or abort via
+                            // cancel. StopReason::Error/Aborted is surfaced as
+                            // a sub-agent error, not a completion — otherwise
+                            // the main agent and the frontend see a green
+                            // checkmark on work that never finished.
+                            let failed = msgs.iter().rev().find_map(|m| match m {
+                                AgentMessage::Assistant(a) => match &a.stop_reason {
+                                    gasket_core::StopReason::Error(e) => Some(format!(
+                                        "sub-agent stream failed: {e}"
+                                    )),
+                                    gasket_core::StopReason::Aborted => {
+                                        Some("sub-agent cancelled".into())
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
                             });
-                            SubagentResult {
-                                id: run_id,
-                                task: run_task,
-                                index: run_index,
-                                summary,
-                                tool_count,
-                                error: None,
+                            if let Some(err_msg) = failed {
+                                emit(SubagentEvent::Error {
+                                    id: run_id.clone(),
+                                    index: run_index,
+                                    error: err_msg.clone(),
+                                });
+                                SubagentResult {
+                                    id: run_id,
+                                    task: run_task,
+                                    index: run_index,
+                                    summary: String::new(),
+                                    tool_count: 0,
+                                    error: Some(err_msg),
+                                }
+                            } else {
+                                let (summary, tool_count) =
+                                    extract_summary_and_tools(&msgs);
+                                emit(SubagentEvent::Completed {
+                                    id: run_id.clone(),
+                                    index: run_index,
+                                    summary: summary.clone(),
+                                    tool_count,
+                                });
+                                SubagentResult {
+                                    id: run_id,
+                                    task: run_task,
+                                    index: run_index,
+                                    summary,
+                                    tool_count,
+                                    error: None,
+                                }
                             }
                         }
                         Err(e) => {
@@ -209,22 +242,35 @@ impl SubagentSpawner for HostSubagentSpawner {
                             }
                         }
                     }
-                }));
+                });
+                guard.push(&handle);
+                handles.push(handle);
+                metas.push((id, index, task_clone));
             }
 
-
             let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
+            while !handles.is_empty() {
+                let handle = handles.remove(0);
+                let (id, index, task) = metas.remove(0);
                 match handle.await {
                     Ok(r) => results.push(r),
                     Err(e) => {
+                        // Panicked sub-agent task: surface it exactly like a
+                        // run error (event + result) so the frontend's
+                        // completion count stays consistent.
+                        let err_msg = format!("subagent task panicked: {e}");
+                        emit(SubagentEvent::Error {
+                            id: id.clone(),
+                            index,
+                            error: err_msg.clone(),
+                        });
                         results.push(SubagentResult {
-                            id: "panic".into(),
-                            task: String::new(),
-                            index: 0,
+                            id,
+                            task,
+                            index,
                             summary: String::new(),
                             tool_count: 0,
-                            error: Some(format!("subagent task panicked: {e}")),
+                            error: Some(err_msg),
                         });
                     }
                 }
@@ -235,6 +281,29 @@ impl SubagentSpawner for HostSubagentSpawner {
             emit(SubagentEvent::Synthesizing);
             results
         })
+    }
+}
+
+/// Owns sub-agent abort handles; aborts every still-running task on drop.
+/// The spawn future holds one of these, so dropping the future mid-flight
+/// (turn cancelled, connection closed) stops sub-agents instead of leaving
+/// them detached. Handles are never removed — a drop at ANY await point
+/// (including the collection loop) aborts everything, even the task
+/// currently being awaited. abort() on a completed task is a no-op.
+#[derive(Default)]
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn push(&mut self, handle: &tokio::task::JoinHandle<SubagentResult>) {
+        self.0.push(handle.abort_handle());
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for abort in &self.0 {
+            abort.abort();
+        }
     }
 }
 
@@ -259,11 +328,7 @@ fn map_agent_event(id: &str, ev: &AgentEvent) -> Option<SubagentEvent> {
             name: tool_name.clone(),
             arguments: Some(serde_json::to_string(args).unwrap_or_default()),
         }),
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id,
-            result,
-            ..
-        } => {
+        AgentEvent::ToolExecutionEnd { result, .. } => {
             let output = result
                 .content
                 .iter()
@@ -272,11 +337,21 @@ fn map_agent_event(id: &str, ev: &AgentEvent) -> Option<SubagentEvent> {
                     _ => None,
                 })
                 .unwrap_or_default();
+            // Note: the server's tool_call_id is deliberately NOT forwarded —
+            // the frontend generates its own tool ids and matches by name
+            // (sub-agents execute tools serially, so the name is unambiguous).
             Some(SubagentEvent::ToolEnd {
                 id: id.into(),
-                tool_id: Some(tool_call_id.clone()),
                 name: result.tool_name.clone(),
                 output: Some(output),
+            })
+        }
+        // Provider usage from a sub-agent's LLM calls: internal accounting
+        // only — the gateway folds it into the session token counters.
+        AgentEvent::AfterProviderResponse { response, .. } => {
+            response.usage.as_ref().map(|u| SubagentEvent::Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
             })
         }
         _ => None,
@@ -315,4 +390,344 @@ fn extract_summary_and_tools(msgs: &[AgentMessage]) -> (String, usize) {
         .count();
 
     (summary, tool_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use gasket_core::{
+        AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn,
+        ThinkingLevel, ToolDefinition,
+    };
+
+    use crate::hooks::HookStack;
+    use crate::permission::{Approver, Mode, PermissionPolicy};
+
+    /// A mock StreamFn that replays a fixed chunk sequence on every call.
+    struct MockStream(Vec<StreamChunk>);
+
+    impl StreamFn for MockStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            Box::pin(futures_util::stream::iter(self.0.clone()))
+        }
+    }
+
+    fn test_spawner(
+        stream: Arc<dyn StreamFn>,
+        hooks: Arc<dyn gasket_core::HookChain>,
+        ev_tx: tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
+        signal: Arc<AtomicBool>,
+    ) -> HostSubagentSpawner {
+        HostSubagentSpawner::new(
+            "sys".into(),
+            gasket_core::built_in_tools(),
+            hooks,
+            signal,
+            std::env::current_dir().unwrap(),
+            AgentLoopConfig {
+                model: ModelSpec {
+                    id: "test".into(),
+                    api: ProviderApi::OpenAiCompat,
+                    max_tokens: 1024,
+                    supports_thinking: false,
+                },
+                thinking_level: ThinkingLevel::Off,
+                max_turns: 2,
+                max_tool_calls_per_turn: 20,
+                signal: None,
+                stream_fn: stream,
+                hooks: None,
+                retry: RetryPolicy::off(),
+            },
+        )
+        .with_ws_emit(Arc::new(move |ev| {
+            let _ = ev_tx.send(ev);
+        }))
+    }
+
+    /// Security regression: a sub-agent calling `bash` must go through the
+    /// SAME `PermissionPolicy` as the parent — the approver is consulted and
+    /// the call is blocked before any command runs.
+    #[tokio::test]
+    async fn subagent_tool_calls_go_through_shared_policy() {
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_c = Arc::clone(&calls);
+        let approver: Approver = Arc::new(move |name: &str, _args: &serde_json::Value| {
+            let calls = Arc::clone(&calls_c);
+            Box::pin(async move {
+                calls.lock().push(name.to_string());
+                false // deny: AutoEdit consults the approver for High-risk tools
+            })
+        });
+        let policy = Arc::new(PermissionPolicy::new(Mode::AutoEdit, approver));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::ToolCallDelta {
+                    id: "t1".into(),
+                    name: Some("bash".into()),
+                    args_delta: "{\"command\":\"echo hi\"}".into(),
+                },
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "run a command".into(),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].error.is_none(),
+            "sub-agent should complete: {:?}",
+            results[0].error
+        );
+
+        // The sub-agent's bash call hit the shared policy: the approver was
+        // consulted with the tool name...
+        let names = calls.lock().clone();
+        assert!(
+            names.iter().any(|n| n == "bash"),
+            "approver must be consulted for sub-agent bash: {names:?}"
+        );
+        // ...and the block surfaced on the wire as a tool result.
+        let mut tool_ends = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let SubagentEvent::ToolEnd { name, output, .. } = ev {
+                tool_ends.push((name, output.unwrap_or_default()));
+            }
+        }
+        assert!(
+            tool_ends.iter().any(|(n, o)| n == "bash" && o.contains("denied")),
+            "blocked bash must be visible in events: {tool_ends:?}"
+        );
+    }
+
+    /// Protocol ordering: `Synthesizing` must arrive after every sub-agent
+    /// terminal event; `AllStarted` leads; usage is forwarded internally.
+    #[tokio::test]
+    async fn synthesizing_arrives_last() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::TextDelta("done".into()),
+                StreamChunk::Usage {
+                    input: 7,
+                    output: 3,
+                },
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "say done".into(),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.is_none());
+
+        let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
+        assert!(matches!(events.first(), Some(SubagentEvent::AllStarted { .. })));
+        assert!(matches!(events.last(), Some(SubagentEvent::Synthesizing)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SubagentEvent::Completed { .. }))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SubagentEvent::Usage {
+                    input_tokens: 7,
+                    output_tokens: 3
+                }
+            )),
+            "usage must be emitted: {events:?}"
+        );
+    }
+
+    /// Error reporting: a sub-agent whose provider stream dies mid-response
+    /// must surface as an Error, not a hollow Completed.
+    #[tokio::test]
+    async fn mid_stream_failure_reports_error_not_completed() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::TextDelta("partial".into()),
+                StreamChunk::Error("provider boom".into()),
+            ])),
+            hooks,
+            ev_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "t".into(),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].error.is_some(),
+            "mid-stream failure must be an error result: {:?}",
+            results[0].error
+        );
+
+        let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, SubagentEvent::Error { .. })),
+            "a failed stream must emit Error: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SubagentEvent::Completed { .. })),
+            "a failed stream must NOT emit Completed: {events:?}"
+        );
+    }
+
+    /// Cancellation: a pre-set abort signal must surface as a sub-agent
+    /// error ("cancelled"), not a hollow Completed.
+    #[tokio::test]
+    async fn aborted_subagent_reports_cancelled() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::TextDelta("hi".into()),
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            Arc::new(AtomicBool::new(true)), // pre-set: loop aborts before any provider call
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "t".into(),
+            }])
+            .await;
+        let err = results[0].error.clone();
+        assert!(
+            err.is_some(),
+            "pre-set signal must produce an error result: {:?}",
+            err
+        );
+        assert!(
+            err.as_deref().unwrap_or_default().contains("cancelled"),
+            "abort must read as cancelled: {err:?}"
+        );
+
+        let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| matches!(e, SubagentEvent::Error { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SubagentEvent::Completed { .. }))
+        );
+    }
+
+    /// Lifecycle: dropping the spawn future mid-flight must abort every
+    /// sub-agent task (no detached tasks executing after the turn is gone).
+    #[tokio::test]
+    async fn dropping_spawn_future_aborts_subagents() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy]));
+        // The stream parks on a oneshot; if the sub-agent task survives the
+        // spawn-future drop, the sender below stays alive and this test hangs
+        // (it fails via the assertion instead).
+        let (block_tx, block_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let stream: Arc<dyn StreamFn> =
+            Arc::new(BlockingStream(parking_lot::Mutex::new(Some(block_rx))));
+        let spawner = test_spawner(stream, hooks, ev_tx, Arc::new(AtomicBool::new(false)));
+
+        // `spawn()` already returns `Pin<Box<dyn Future>>` — no tokio::pin!
+        // (it would shadow the variable, making `drop(fut)` drop only the
+        // pin wrapper and leaving the future — and the abort guard — alive).
+        let mut fut = spawner.spawn(vec![SubagentSpawn {
+            task: "hang".into(),
+        }]);
+        // One poll: the async block spawns the sub-agent task synchronously,
+        // then parks on the first handle.await.
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Dropping the spawn future must abort the sub-agent task, which
+        // drops its pending stream future — and with it the oneshot receiver.
+        // (The local `spawner` also holds the stream Arc; drop it so the
+        // receiver's fate depends only on the aborted task.)
+        drop(fut);
+        drop(spawner);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            block_tx.send(()).is_err(),
+            "sub-agent task must be aborted when the spawn future is dropped"
+        );
+    }
+
+    /// A StreamFn that parks on a oneshot receiver (used by the abort test).
+    struct BlockingStream(parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+    impl StreamFn for BlockingStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            let rx = self.0.lock().take();
+            Box::pin(futures_util::stream::once(async move {
+                if let Some(rx) = rx {
+                    let _ = rx.await; // parks until the task is aborted
+                }
+                StreamChunk::Done
+            }))
+        }
+    }
 }

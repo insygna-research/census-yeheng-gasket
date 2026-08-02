@@ -19,7 +19,7 @@
 | `subagent_thinking` | `{id, content}` | 子 agent 思考增量 |
 | `subagent_content` | `{id, content}` | 子 agent 文本增量 |
 | `subagent_tool_start` | `{id, name, arguments?}` | 子 agent 工具开始 |
-| `subagent_tool_end` | `{id, tool_id?, name, output?}` | 子 agent 工具结束 |
+| `subagent_tool_end` | `{id, name, output?}` | 子 agent 工具结束（`tool_id` 已删除——前端自行生成工具 id 并按 name 匹配，子 agent 串行执行工具故 name 无歧义） |
 | `subagent_completed` | `{id, index, summary, tool_count}` | 子 agent 完成 |
 | `subagent_error` | `{id, index, error}` | 子 agent 失败 |
 | `subagent_synthesizing` | `{}` | 所有子 agent 完成,主 agent 汇总中 |
@@ -62,9 +62,11 @@ pub trait SubagentSpawner: Send + Sync {
     fn spawn(
         &self,
         tasks: Vec<SubagentSpawn>,
-        emit: Box<dyn Fn(SubagentEvent) + Send>,
     ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>>;
 }
+```
+
+事件回调**不**作为 `spawn` 参数传入——每个调用方只会传 no-op。事件投递是 spawner 自己的职责:host 在构造时注入(gateway 传 WS forwarder)。
 
 pub enum SubagentEvent {
     AllStarted { count: usize },
@@ -76,10 +78,11 @@ pub enum SubagentEvent {
     Completed { id: String, index: usize, summary: String, tool_count: usize },
     Error { id: String, index: usize, error: String },
     Synthesizing,
+    Usage { input_tokens: u64, output_tokens: u64 }, // 内部记账,无 WS 表示
 }
 ```
 
-`SubagentEvent` 的变体与前端 9 种 WS 消息一一对应。gateway 的 event_map 把它转成 WS JSON。
+`SubagentEvent` 的前 9 个变体与前端 9 种 WS 消息一一对应;`Usage` 是内部记账(子 agent 的 provider token 用量折入会话计数器),**不**发给前端。gateway 的 event_map 把它转成 WS JSON(Usage 返回 None)。
 
 ### 3.3 并行执行(`host/src/subagent.rs`)
 
@@ -87,7 +90,7 @@ host 实现 `SubagentSpawner`:
 
 ```rust
 impl SubagentSpawner for HostSubagentSpawner {
-    fn spawn(&self, tasks, emit) -> Future<Vec<SubagentResult>> {
+    fn spawn(&self, tasks) -> Future<Vec<SubagentResult>> {
         emit(SubagentEvent::AllStarted { count: tasks.len() });
         // tokio::spawn 每个子任务,各自跑 run_agent_loop
         let handles: Vec<_> = tasks.enumerate().map(|(i, task)| {
@@ -104,17 +107,20 @@ impl SubagentSpawner for HostSubagentSpawner {
                 result
             })
         }).collect();
-        emit(SubagentEvent::Synthesizing);
+        // Synthesizing 必须在 join_all 之后(前端"全部完成才汇总"语义)
         join_all(handles).await → collect results
+        emit(SubagentEvent::Synthesizing);
     }
 }
 ```
 
 关键设计:
-- **子 agent 用同一套 tools/stream_fn/hooks**(继承父)。
-- **子 agent 的 max_turns 更少**(如 10,避免无限循环)。
+- **子 agent 用同一套 built-in tools**(继承父,但剥掉 `spawn_subagents`——子 agent context 不带 spawner,嵌套禁用;MCP/外部工具刻意不传,其 server 按连接共享,不为 5 路并行设计)。
+- **子 agent 的 max_turns 更少**(≤10,从父 loop config 模板派生其余参数——thinking level / max_tool_calls / retry 与父一致,不硬编码)。
 - **子 agent 不写磁盘**(它们是临时 worker,结果经 ToolResult 回主 agent,主 agent 持久化)。
 - **子 agent 的 AbortSignal 独立**(但跟随父 signal——父取消,子也取消)。
+- **spawn future 被 drop 时 abort 所有子任务**(turn 取消/连接关闭不留脱离任务)。
+- **子任务 panic 按普通 Error 事件上报**(带正确 id/index),前端完成计数不塌。
 
 ### 3.4 子 agent 事件映射
 
@@ -125,18 +131,26 @@ impl SubagentSpawner for HostSubagentSpawner {
 | `MessageUpdate { TextDelta }` | `Content { id, content }` |
 | `MessageUpdate { ThinkingDelta }` | `Thinking { id, content }` |
 | `ToolExecutionStart` | `ToolStart { id, name, arguments }` |
-| `ToolExecutionEnd` | `ToolEnd { id, tool_id, name, output }` |
+| `ToolExecutionEnd` | `ToolEnd { id, name, output }` |
 | (loop 结束,提取 summary) | `Completed { id, summary, tool_count }` |
 | (loop 报错) | `Error { id, error }` |
+| `AfterProviderResponse` | `Usage { input, output }`(内部,无 WS) |
+
+**错误上报**:`run_agent_loop` 对 `StopReason::Error/Aborted` 返回 Ok——子 agent 收尾时必须检查最后 assistant 的 stop_reason,流中途失败/取消报 `Error`,**不**报空摘要的 `Completed`。
 
 ### 3.5 Gateway 转发(`event_map.rs` 扩展)
 
-`spawn_subagents` 工具执行时,`SubagentEvent` 流经一个新的事件通道。gateway 的 forwarder 把它们转成 WS JSON:
+`spawn_subagents` 工具执行时,`SubagentEvent` 流经 gateway 的**单一有序 wire 通道**(ws.rs 的 `WireEvent` enum + 单 writer task)。**所有**出站事件——主 agent 事件流、subagent 事件、审批请求、回合结束的 `done`/`error`/`busy`——都进同一个 channel,由唯一 writer 序列化后写 socket。
+
+单一 writer 保证跨流顺序:否则 `done` 可能插到最后一个 `subagent_completed` 之前(前端会跳过 done 导致 isReceiving 卡死),审批卡片也可能抢在所属 `tool_start` 前面。
 
 ```rust
-// event_map.rs 新增
-fn subagent_event_to_ws(event: &SubagentEvent) -> OutgoingEvent { ... }
+// event_map.rs
+fn subagent_event_to_ws(event: &SubagentEvent) -> Option<String> { ... }
+// Usage 变体返回 None——内部记账,由 writer 折入会话用量计数器
 ```
+
+`busy` 是独立消息类型(不是 `error`):前端收到只弹提示,不清正在流式的回复/子面板状态。
 
 ### 3.6 结果汇总
 
