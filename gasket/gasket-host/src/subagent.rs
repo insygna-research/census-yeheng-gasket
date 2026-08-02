@@ -212,7 +212,6 @@ impl SubagentSpawner for HostSubagentSpawner {
                 }));
             }
 
-            emit(SubagentEvent::Synthesizing);
 
             let mut results = Vec::with_capacity(handles.len());
             for handle in handles {
@@ -230,6 +229,10 @@ impl SubagentSpawner for HostSubagentSpawner {
                     }
                 }
             }
+
+            // All sub-agents finished: signal the main agent is synthesizing
+            // their results. Must come AFTER all handles complete, not before.
+            emit(SubagentEvent::Synthesizing);
             results
         })
     }

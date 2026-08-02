@@ -53,6 +53,10 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         ));
     }
 
+    // Enforce the schema's maxItems: 5, regardless of what the LLM sent.
+    let mut spawns = spawns;
+    spawns.truncate(5);
+
     let spawner: Arc<dyn SubagentSpawner> = match &ctx.ctx.spawner {
         Some(s) => Arc::clone(s),
         None => Arc::new(crate::subagent::NoopSubagentSpawner),

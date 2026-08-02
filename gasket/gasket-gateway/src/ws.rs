@@ -143,33 +143,35 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     // Per-connection Host drives the same run_turn pipeline the CLI uses; its
     // resumed SessionManager owns the on-disk transcript (appends on success).
     let spawner_cfg = host_cfg.clone();
+    let spawner_policy = Arc::clone(&policy);
     let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
     // Subagent spawner: events forwarded to WS via the session sender.
     {
         let spawner_signal = host.signal().clone();
         let spawner_session = session.clone();
+        // Ordered event channel: emit closure writes JSON strings; a single
+        // forwarder task drains them sequentially to preserve event order.
+        let (sub_tx, mut sub_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(json) = sub_rx.recv().await {
+                let mut s = spawner_session.lock().await;
+                let _ = s
+                    .sender
+                    .send(axum::extract::ws::Message::Text(json.into()))
+                    .await;
+            }
+        });
         let ws_emit: Arc<dyn Fn(gasket_core::SubagentEvent) + Send + Sync> = Arc::new(
             move |ev: gasket_core::SubagentEvent| {
                 if let Some(json) = crate::event_map::subagent_event_to_ws(&ev) {
-                    let s = spawner_session.clone();
-                    // Best-effort send: fire and forget (the forwarder may be
-                    // mid-lock; a dropped event is acceptable for progress UI).
-                    tokio::spawn(async move {
-                        let mut s = s.lock().await;
-                        let _ = s
-                            .sender
-                            .send(axum::extract::ws::Message::Text(json.into()))
-                            .await;
-                    });
+                    let _ = sub_tx.send(json);
                 }
             },
         );
         let spawner_stream_fn = spawner_cfg.provider_stream_fn();
         let spawner_hooks: Arc<dyn gasket_core::HookChain> = Arc::new(
-            gasket_host::HookStack::new(vec![Arc::new(PermissionPolicy::new(
-                mode,
-                Arc::new(|_, _| Box::pin(async { true })),
-            ))]),
+            gasket_host::HookStack::new(vec![spawner_policy]),
         );
         let model = spawner_cfg.build_loop_config(
             spawner_cfg.tunables.max_turns,
