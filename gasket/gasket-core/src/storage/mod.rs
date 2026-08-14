@@ -1,10 +1,11 @@
-//! Append-only JSONL message store.
+//! Append-only JSONL stores for sessions.
 //!
 //! Layout under `~/.gasket/`:
 //! ```text
 //! sessions/
 //!   {session_id}/
-//!     messages.jsonl   # append-only, one AgentMessage per line
+//!     events.jsonl     # append-only, one SessionEvent per line
+//!     messages.jsonl   # legacy: append-only, one AgentMessage per line
 //! tool_state/
 //!   {session_id}/{tool_name}/  # per-plugin private state
 //! ```
@@ -30,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::AgentError;
 use crate::types::message::AgentMessage;
+use crate::types::session_event::SessionEvent;
 
 /// The gasket config/data root: `~/.gasket/`.
 pub fn config_dir() -> PathBuf {
@@ -146,47 +148,58 @@ impl JsonlStorage {
     /// a corrupt line in the middle fails with its file line number.
     pub async fn load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, AgentError> {
         validate_session_id(session_id)?;
-        let path = self.messages_path(session_id);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => parse_transcript(&path, &bytes).await,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
-        }
+        parse_transcript(&self.messages_path(session_id)).await
     }
 
     /// Load messages from an arbitrary JSONL file (used by tests/hosts that
     /// point at a specific file). Same recovery policy as
     /// [`load_messages`](Self::load_messages).
     pub async fn load_from_file(path: &Path) -> Result<Vec<AgentMessage>, AgentError> {
-        match tokio::fs::read(path).await {
-            Ok(bytes) => parse_transcript(path, &bytes).await,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
-        }
+        parse_transcript(path).await
     }
 }
 
-/// Write one message as a single `line\n` buffer: one `write_all`, so a crash
+/// Write one record as a single `line\n` buffer: one `write_all`, so a crash
 /// can never leave a complete line dangling without its terminator — it leaves
 /// either a full line or a truncated fragment, and a truncated final fragment
-/// is what [`parse_transcript`] repairs on the next load.
-async fn append_line(file: &mut tokio::fs::File, msg: &AgentMessage) -> Result<(), AgentError> {
+/// is what [`scan_jsonl`] repairs on the next load.
+async fn append_line<T: serde::Serialize>(
+    file: &mut tokio::fs::File,
+    value: &T,
+) -> Result<(), AgentError> {
     use tokio::io::AsyncWriteExt;
-    let mut line = serde_json::to_string(msg)?;
+    let mut line = serde_json::to_string(value)?;
     line.push('\n');
     file.write_all(line.as_bytes()).await?;
     Ok(())
 }
 
-/// Parse a transcript buffer, applying the torn-tail recovery policy.
+/// Parse a message transcript, applying the torn-tail recovery policy.
 ///
-/// Returns `Err(AgentError::Transcript)` naming the file line for a corrupt
-/// line in the middle of the file (real damage). If only the **last** line is
-/// invalid it is a torn tail (an append interrupted by crash/power loss): the
-/// file is truncated at that line's start and loading succeeds with the
-/// preceding messages.
-async fn parse_transcript(path: &Path, bytes: &[u8]) -> Result<Vec<AgentMessage>, AgentError> {
-    let mut messages = Vec::new();
+/// Thin wrapper over the generic [`scan_jsonl`] scanner; see that function
+/// (and the module docs) for the exact semantics.
+async fn parse_transcript(path: &Path) -> Result<Vec<AgentMessage>, AgentError> {
+    scan_jsonl::<AgentMessage>(path, true).await
+}
+
+/// Scan a JSONL file into `T` rows, applying the torn-tail recovery policy.
+///
+/// A missing file is an empty log. Returns `Err(AgentError::Transcript)`
+/// naming the file line for a corrupt line in the middle of the file (real
+/// damage). If only the **last** line is invalid it is a torn tail (an append
+/// interrupted by crash/power loss): the line is dropped and — when
+/// `repair_tail` is set — the file is truncated at that line's start, so
+/// loading succeeds with the preceding records and later appends stay clean.
+async fn scan_jsonl<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    repair_tail: bool,
+) -> Result<Vec<T>, AgentError> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut items = Vec::new();
     let mut line_start = 0usize;
     let mut line_no = 0usize;
     for (idx, b) in bytes.iter().enumerate() {
@@ -202,8 +215,8 @@ async fn parse_transcript(path: &Path, bytes: &[u8]) -> Result<Vec<AgentMessage>
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_slice::<AgentMessage>(line) {
-            Ok(m) => messages.push(m),
+        match serde_json::from_slice::<T>(line) {
+            Ok(m) => items.push(m),
             Err(e) => {
                 if is_last {
                     tracing::warn!(
@@ -212,8 +225,10 @@ async fn parse_transcript(path: &Path, bytes: &[u8]) -> Result<Vec<AgentMessage>
                         error = %e,
                         "dropping torn transcript tail"
                     );
-                    repair_torn_tail(path, this_line_start).await?;
-                    return Ok(messages);
+                    if repair_tail {
+                        repair_torn_tail(path, this_line_start).await?;
+                    }
+                    return Ok(items);
                 }
                 return Err(AgentError::Transcript(format!(
                     "invalid line {line_no} in {}: {e}",
@@ -226,8 +241,8 @@ async fn parse_transcript(path: &Path, bytes: &[u8]) -> Result<Vec<AgentMessage>
     let tail = bytes[line_start..].trim_ascii();
     if !tail.is_empty() {
         line_no += 1;
-        match serde_json::from_slice::<AgentMessage>(tail) {
-            Ok(m) => messages.push(m),
+        match serde_json::from_slice::<T>(tail) {
+            Ok(m) => items.push(m),
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -235,11 +250,13 @@ async fn parse_transcript(path: &Path, bytes: &[u8]) -> Result<Vec<AgentMessage>
                     error = %e,
                     "dropping torn transcript tail"
                 );
-                repair_torn_tail(path, line_start).await?;
+                if repair_tail {
+                    repair_torn_tail(path, line_start).await?;
+                }
             }
         }
     }
-    Ok(messages)
+    Ok(items)
 }
 
 /// Truncate the transcript at `keep_until` (the byte offset where a torn line
@@ -249,6 +266,116 @@ async fn repair_torn_tail(path: &Path, keep_until: usize) -> Result<(), AgentErr
     let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     file.set_len(keep_until as u64).await?;
     Ok(())
+}
+
+/// Append-only JSONL session event store: `events.jsonl`, one
+/// [`SessionEvent`] per line, written with the same discipline (one
+/// `O_APPEND` handle, single `write_all` of `line\n`) and read with the same
+/// torn-tail policy as [`JsonlStorage`]. `messages.jsonl` in the same
+/// session directory is the legacy format; [`EventStorage`] can read it as
+/// the migration source and remove it once migrated.
+#[derive(Debug, Clone)]
+pub struct EventStorage {
+    root: PathBuf,
+}
+
+impl EventStorage {
+    /// Create a store rooted at `root` (typically `~/.gasket/sessions`).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn session_dir(&self, session_id: &str) -> PathBuf {
+        self.root.join(session_id)
+    }
+
+    /// Path to a session's `events.jsonl` (whether or not it exists yet).
+    pub fn events_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("events.jsonl")
+    }
+
+    /// Path to a session's legacy `messages.jsonl` — the migration source.
+    pub fn messages_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("messages.jsonl")
+    }
+
+    /// Whether the session has an event log on disk.
+    pub fn has_events(&self, session_id: &str) -> bool {
+        is_valid_session_id(session_id) && self.events_path(session_id).exists()
+    }
+
+    /// Append a single event to the session's JSONL log. Creates the session
+    /// directory if missing.
+    pub async fn append_event(
+        &self,
+        session_id: &str,
+        ev: &SessionEvent,
+    ) -> Result<(), AgentError> {
+        validate_session_id(session_id)?;
+        let path = self.events_path(session_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        append_line(&mut file, ev).await
+    }
+
+    /// Append a batch of events in order to a single open file handle.
+    /// An empty batch is a no-op (no directory or file is created).
+    pub async fn append_events(
+        &self,
+        session_id: &str,
+        evs: &[SessionEvent],
+    ) -> Result<(), AgentError> {
+        if evs.is_empty() {
+            return Ok(());
+        }
+        validate_session_id(session_id)?;
+        let path = self.events_path(session_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        for ev in evs {
+            append_line(&mut file, ev).await?;
+        }
+        Ok(())
+    }
+
+    /// Load all events for a session, in append order. Returns empty vec for
+    /// a session that has never been written. Same recovery policy as
+    /// [`JsonlStorage::load_messages`].
+    pub async fn load_events(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+        validate_session_id(session_id)?;
+        scan_jsonl::<SessionEvent>(&self.events_path(session_id), true).await
+    }
+
+    /// Load the legacy `messages.jsonl` for a session — the migration source.
+    /// Returns empty vec when there is nothing to migrate.
+    pub async fn load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, AgentError> {
+        validate_session_id(session_id)?;
+        scan_jsonl::<AgentMessage>(&self.messages_path(session_id), true).await
+    }
+
+    /// Remove the session's legacy `messages.jsonl` after a successful
+    /// migration. Other files in the session directory are untouched; a
+    /// missing file is not an error.
+    pub async fn delete_legacy(&self, session_id: &str) -> Result<(), AgentError> {
+        validate_session_id(session_id)?;
+        match tokio::fs::remove_file(self.messages_path(session_id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +604,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.len(), 1);
+    }
+
+    // ── EventStorage ──────────────────────────────────────────────
+
+    use crate::types::session_event::{SessionEvent, TurnEndReason};
+
+    fn sample_events() -> Vec<SessionEvent> {
+        vec![
+            SessionEvent::TurnStart,
+            SessionEvent::User(user_msg("hello")),
+            SessionEvent::TurnEnd {
+                reason: TurnEndReason::Completed,
+            },
+        ]
+    }
+
+    fn write_raw_events(store: &EventStorage, session_id: &str, content: &str) {
+        let path = store.events_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let events = sample_events();
+
+        store.append_events("s1", &events).await.unwrap();
+
+        let loaded = store.load_events("s1").await.unwrap();
+        assert_eq!(loaded, events);
+        assert_eq!(
+            store.events_path("s1"),
+            tmp.path().join("s1").join("events.jsonl")
+        );
+    }
+
+    #[tokio::test]
+    async fn events_torn_tail_last_line_dropped_and_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+
+        let good1 = serde_json::to_string(&SessionEvent::TurnStart).unwrap();
+        let good2 = serde_json::to_string(&SessionEvent::User(user_msg("ok"))).unwrap();
+        let torn = &good2[..good2.len() / 2]; // mid-JSON truncation
+        write_raw_events(&store, "s1", &format!("{good1}\n{good2}\n{torn}"));
+
+        let loaded = store.load_events("s1").await.unwrap();
+        assert_eq!(loaded.len(), 2, "torn tail must be dropped, prefix kept");
+
+        // File on disk is repaired: truncated at the torn line.
+        let raw = std::fs::read_to_string(store.events_path("s1")).unwrap();
+        assert_eq!(raw, format!("{good1}\n{good2}\n"));
+    }
+
+    #[tokio::test]
+    async fn events_mid_file_corruption_errors_with_line_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let good = serde_json::to_string(&SessionEvent::TurnStart).unwrap();
+        write_raw_events(&store, "s1", &format!("NOT_JSON\n{good}\n"));
+
+        let err = store.load_events("s1").await.unwrap_err();
+        assert!(matches!(err, AgentError::Transcript(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line 1"),
+            "error must name the file line, got: {msg}"
+        );
+        assert!(
+            msg.contains("events.jsonl"),
+            "error must name the file, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_unknown_variant_fails_load() {
+        // Fail closed: a row the reader does not know must fail the load, not
+        // be silently skipped. Placed mid-file so it is treated as real
+        // damage rather than a torn tail.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let good = serde_json::to_string(&SessionEvent::TurnStart).unwrap();
+        write_raw_events(
+            &store,
+            "s1",
+            &format!("{{\"type\":\"from_the_future\"}}\n{good}\n"),
+        );
+
+        let err = store.load_events("s1").await.unwrap_err();
+        assert!(matches!(err, AgentError::Transcript(_)));
     }
 }
