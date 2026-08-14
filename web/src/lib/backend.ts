@@ -4,9 +4,10 @@ import type { Message, ToolCall } from '@/types';
 
 /**
  * Session storage access layer.
- * The on-disk event log (`~/.gasket/sessions`) is the authoritative message
- * store; the frontend hydrates from here instead of persisting full
- * transcripts in localStorage.
+ * The backend's on-disk store (`~/.gasket/sessions`, owned by the Rust
+ * side — Tauri commands in-app, gateway HTTP in the browser) is the single
+ * source of truth: list, names, transcripts, and deletes all go through
+ * it. Nothing session-shaped is persisted client-side.
  *
  * Dual channel: inside the Tauri desktop shell the session API runs as
  * native commands (self-contained app); in a plain browser (dev) it falls

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { useSidebar } from './composables/useSidebar';
-import { storageKeys, writeJSON } from './lib/storage';
-import { onMounted, onUnmounted, ref, watch } from 'vue';
+import { onMounted, onUnmounted, ref } from 'vue';
 import AppSidebar from './components/AppSidebar.vue';
 import ChatArea from './components/ChatArea.vue';
 import { useChatStore } from './stores/chatStore';
@@ -14,21 +13,6 @@ const sidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 onMounted(() => {
   chatStore.syncFromBackend();
 });
-onUnmounted(() => {
-  if (saveTimer) clearTimeout(saveTimer);
-});
-
-// Persist chat metadata (id/name/updatedAt) — message bodies live on the
-// backend and hydrate from it, so localStorage stays small.
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-const debouncedSave = () => {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    const meta = chatStore.chats.map(({ id, name, updatedAt }) => ({ id, name, updatedAt }));
-    writeJSON(storageKeys.chatsMeta, meta);
-  }, 1000);
-};
-watch(() => chatStore.chats, debouncedSave, { deep: true });
 
 // ── Global shortcuts ────────────────────────────────────────
 

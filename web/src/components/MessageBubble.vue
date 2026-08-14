@@ -90,6 +90,15 @@ const formatTime = (ts: number) => {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
+const formatElapsed = (ms: number): string => {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return `${m}m ${rem}s`;
+};
+
 const isStreaming = computed(() => props.isLastBotMessage && props.isReceiving);
 </script>
 
@@ -133,6 +142,11 @@ const isStreaming = computed(() => props.isLastBotMessage && props.isReceiving);
         <div ref="mermaidContainerRef" class="prose max-w-none" :data-md-style="markdownStyle" v-html="parsedContent" @click="copyCode" />
         <!-- Streaming cursor -->
         <span v-if="isStreaming" class="inline-block w-2 h-4 bg-primary/80 ml-0.5 align-middle animate-pulse rounded-sm" />
+      </div>
+
+      <!-- Turn summary: elapsed time + cumulative tokens -->
+      <div v-if="message.turnSummary && !isStreaming" class="text-[11px] th-text-dim mt-1 select-none">
+        {{ formatElapsed(message.turnSummary.elapsedMs) }} · ↑{{ message.turnSummary.usageIn.toLocaleString() }} ↓{{ message.turnSummary.usageOut.toLocaleString() }}
       </div>
     </div>
   </div>

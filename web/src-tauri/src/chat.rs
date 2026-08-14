@@ -10,8 +10,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use log::{info, warn};
@@ -42,7 +43,6 @@ struct ChatEventPayload {
 /// Same internal queue as the gateway's `WireEvent`: everything the frontend
 /// sees flows through ONE ordered channel with a single emitter task, so a
 /// turn-boundary `done` can never overtake the last subagent event and an
-/// approval request cannot overtake the tool_start it belongs to.
 enum WireEvent {
   Agent(AgentEvent),
   Subagent(gasket_core::SubagentEvent),
@@ -53,6 +53,10 @@ enum WireEvent {
   },
   /// Reply to a message received while a turn is already running.
   Busy(String),
+  /// Slash-command reply: a content/error event that bypasses run_turn.
+  /// Always followed by `Done` so the frontend's turn-boundary handling
+  /// fires (clears isReceiving, refreshes context).
+  Reply(OutgoingEvent),
   Done,
   Error(String),
 }
@@ -70,10 +74,25 @@ struct ChatSession {
   /// Unlocks pending approval waits on cancel. Fresh `subscribe()` receivers
   /// per approval avoid the cancel-latch poisoning (see approval.rs tests).
   cancel_tx: tokio::sync::watch::Sender<bool>,
-  /// Shared with the approver closure baked into the Host's policy —
+  /// Shared with the approver closure baked into the Host's policy -
   /// `approval_response` must fill in decisions on THIS registry.
   registry: Arc<Mutex<ApprovalRegistry>>,
   wire_tx: UnboundedSender<WireEvent>,
+  /// Cumulative provider-reported input tokens across turns (fed by
+  /// `AfterProviderResponse` events in the emitter). Mirrors the gateway's
+  /// `WsSession::usage_in`. Lock-free: the emitter task accumulates, the
+  /// `get_context` command reads.
+  usage_in: AtomicU64,
+  /// Cumulative provider-reported output tokens across turns.
+  usage_out: AtomicU64,
+  /// Most recent provider-reported input-token count for this turn (current
+  /// window occupancy). Drives the context-saturation percentage.
+  last_input_tokens: AtomicU64,
+  /// Turn start timestamp for the `done` summary line. Set by the turn
+  /// task just before `run_turn`, read by the emitter on `Done`. Wrapped in
+  /// a Mutex so the setter (turn task) and reader (emitter task) synchronize
+  /// without atomics on an `Instant`.
+  turn_start: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
@@ -113,10 +132,17 @@ impl ChatState {
 
 /// Single emitter task per session: owns all `app.emit` calls for that
 /// session, preserving cross-stream ordering exactly like the gateway's
-/// single socket writer.
-fn spawn_emitter(app: AppHandle, session_id: String, mut rx: UnboundedReceiver<WireEvent>) {
+/// single socket writer. Also accumulates provider-reported token usage
+/// (from `AfterProviderResponse` events) into the session's atomic counters
+/// and renders a usage summary on `Done`.
+fn spawn_emitter(
+  app: AppHandle,
+  session_id: String,
+  mut rx: UnboundedReceiver<WireEvent>,
+  session: Arc<ChatSession>,
+) {
   tauri::async_runtime::spawn(async move {
-    // tool_call_id → tool name, per turn (cleared on Done).
+    // tool_call_id -> tool name, per turn (cleared on Done).
     let mut tool_names: HashMap<String, String> = HashMap::new();
     while let Some(ev) = rx.recv().await {
       let event: Option<serde_json::Value> = match ev {
@@ -129,12 +155,35 @@ fn spawn_emitter(app: AppHandle, session_id: String, mut rx: UnboundedReceiver<W
           {
             tool_names.insert(tool_call_id.clone(), tool_name.clone());
           }
-          // The gateway also accumulates provider usage here for its context
-          // REST API; the desktop app has no such endpoint, so usage is not
-          // tracked on this transport.
+          // Accumulate provider-reported usage (mirrors the gateway's
+          // forwarder). `AfterProviderResponse` carries the token counts
+          // the provider returned for this call; they accumulate into the
+          // session counters so the `done` summary and the `get_context`
+          // command report real API spend.
+          if let AgentEvent::AfterProviderResponse { response, .. } = &event {
+            if let Some(u) = &response.usage {
+              session.usage_in.fetch_add(u.input_tokens, Ordering::Relaxed);
+              session.usage_out.fetch_add(u.output_tokens, Ordering::Relaxed);
+              session.last_input_tokens.store(u.input_tokens, Ordering::Relaxed);
+            }
+          }
           event_to_ws(&event, &mut tool_names).and_then(|ev| serde_json::to_value(ev).ok())
         }
-        WireEvent::Subagent(ev) => subagent_event_to_ws(&ev),
+        WireEvent::Subagent(ev) => {
+          // Sub-agent provider usage counts toward the session's token
+          // totals (same as the gateway); it has no IPC message of its own.
+          if let gasket_core::SubagentEvent::Usage {
+            input_tokens,
+            output_tokens,
+          } = ev
+          {
+            session.usage_in.fetch_add(input_tokens, Ordering::Relaxed);
+            session.usage_out.fetch_add(output_tokens, Ordering::Relaxed);
+            None
+          } else {
+            subagent_event_to_ws(&ev)
+          }
+        }
         WireEvent::Approval {
           request_id,
           tool_name,
@@ -142,10 +191,28 @@ fn spawn_emitter(app: AppHandle, session_id: String, mut rx: UnboundedReceiver<W
         } => serde_json::to_value(OutgoingEvent::approval_request(request_id, tool_name, &args))
           .ok(),
         WireEvent::Busy(msg) => serde_json::to_value(OutgoingEvent::busy(msg)).ok(),
+        WireEvent::Reply(ev) => serde_json::to_value(ev).ok(),
         WireEvent::Done => {
           // Turn boundary: the tool-name cache is per-turn.
           tool_names.clear();
-          serde_json::to_value(OutgoingEvent::done()).ok()
+          // Emit a usage summary line: cumulative tokens + elapsed time.
+          // `turn_start` is set by the turn task just before run_turn.
+          let elapsed_ms = session
+            .turn_start
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+          let ev = if elapsed_ms > 0 {
+            OutgoingEvent::done_with_summary(
+              session.usage_in.load(Ordering::Relaxed),
+              session.usage_out.load(Ordering::Relaxed),
+              elapsed_ms,
+            )
+          } else {
+            OutgoingEvent::done()
+          };
+          serde_json::to_value(ev).ok()
         }
         WireEvent::Error(msg) => serde_json::to_value(OutgoingEvent::error(msg)).ok(),
       };
@@ -192,7 +259,6 @@ async fn build_session(
   let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
   let registry = Arc::new(Mutex::new(ApprovalRegistry::new()));
   let (wire_tx, wire_rx) = tokio::sync::mpsc::unbounded_channel::<WireEvent>();
-  spawn_emitter(app.clone(), session_id.to_string(), wire_rx);
 
   let approver: Approver = {
     let registry = registry.clone();
@@ -299,13 +365,21 @@ async fn build_session(
     host = host.with_spawner(spawner);
   }
 
-  Ok(Arc::new(ChatSession {
+  let session = Arc::new(ChatSession {
     host,
     turn_active: AtomicBool::new(false),
     cancel_tx,
     registry,
     wire_tx,
-  }))
+    usage_in: AtomicU64::new(0),
+    usage_out: AtomicU64::new(0),
+    last_input_tokens: AtomicU64::new(0),
+    turn_start: Mutex::new(None),
+  });
+  // Spawn the emitter after the session Arc exists so it can hold a clone
+  // for usage accumulation and the `done` summary line.
+  spawn_emitter(app.clone(), session_id.to_string(), wire_rx, Arc::clone(&session));
+  Ok(session)
 }
 
 /// Start a turn for `content` on the given session. Returns immediately; the
@@ -347,6 +421,36 @@ pub async fn send_message(
     return Ok(());
   }
 
+  // ── Slash commands (mirrors the gateway's WS loop) ─────────
+  // /clear and /help are handled server-side; everything else goes to
+  // the LLM. Keep this list in sync with the ChatInput.vue completer.
+  if let Some(cmd) = content.strip_prefix('/') {
+    let mut parts = cmd.split_whitespace();
+    let reply = match parts.next() {
+      Some("clear") => {
+        // The gateway rotates the Host's SessionManager to a fresh id
+        // (session_mut().clear()), but the desktop app's Host sits behind
+        // an Arc<ChatSession> with no &mut access. Instead: reset the
+        // accumulated usage counters and let the frontend clear its local
+        // message list on receipt. The on-disk log keeps its session id; new
+        // turns append to it (the event log is append-only anyway).
+        session.usage_in.store(0, Ordering::Relaxed);
+        session.usage_out.store(0, Ordering::Relaxed);
+        session.last_input_tokens.store(0, Ordering::Relaxed);
+        OutgoingEvent::content("(session cleared)".to_string())
+      }
+      Some("help") => OutgoingEvent::content("commands: /clear  /help".to_string()),
+      Some(other) => OutgoingEvent::error(format!("unknown command /{other}")),
+      None => return Ok(()), // just "/" with nothing after
+    };
+    // Slash commands are not turns: clear turn_start so the `done`
+    // event renders without a stale elapsed/usage summary.
+    *session.turn_start.lock().unwrap() = None;
+    let _ = session.wire_tx.send(WireEvent::Reply(reply));
+    let _ = session.wire_tx.send(WireEvent::Done);
+    return Ok(());
+  }
+
   tauri::async_runtime::spawn(async move {
     // Drop guard: a failed/aborted turn must still free the slot, or the
     // session would stay "busy" forever.
@@ -357,6 +461,9 @@ pub async fn send_message(
       }
     }
     let _guard = TurnGuard(&session.turn_active);
+    // Record turn start for the done-summary line. Set before run_turn
+    // begins so the elapsed time covers the whole turn.
+    *session.turn_start.lock().unwrap() = Some(Instant::now());
 
     let wire = session.wire_tx.clone();
     let outcome = session
@@ -411,4 +518,41 @@ pub fn approval_response(
       .respond(&request_id, approved, remember);
   }
   Ok(())
+}
+
+/// Context occupancy for the desktop app. Mirrors the gateway's
+/// `GET /api/sessions/:id/context` endpoint: reads the session's accumulated
+/// usage counters and computes a saturation percentage against
+/// `GASKET_CONTEXT_WINDOW` (default 128k). Returns the same JSON shape the
+/// frontend expects: `{ context_stats, watermark_info }`.
+#[tauri::command]
+pub fn get_context(
+  state: State<'_, ChatState>,
+  session_id: String,
+) -> Result<serde_json::Value, String> {
+  let (last_input_tokens, usage_in, usage_out) = match state.sessions.get(&session_id) {
+    Some(session) => (
+      session.last_input_tokens.load(Ordering::Relaxed),
+      session.usage_in.load(Ordering::Relaxed),
+      session.usage_out.load(Ordering::Relaxed),
+    ),
+    None => (0u64, 0u64, 0u64),
+  };
+  let window = std::env::var("GASKET_CONTEXT_WINDOW")
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .unwrap_or(128_000);
+  let usage_percent = if window > 0 {
+    (last_input_tokens as f64 / window as f64) * 100.0
+  } else {
+    0.0
+  };
+  let stats = serde_json::json!({
+    "current_tokens": last_input_tokens,
+    "usage_percent": usage_percent,
+    "is_compressing": false,
+    "cumulative_in": usage_in,
+    "cumulative_out": usage_out,
+  });
+  Ok(serde_json::json!({ "context_stats": stats, "watermark_info": null }))
 }

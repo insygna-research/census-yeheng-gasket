@@ -89,6 +89,42 @@ async fn rename_session(id: String, name: String) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// `~/.gasket/app_config.json` — the desktop shell's durable mirror of the
+/// browser build's localStorage preferences (theme, sidebar state, chats
+/// meta, hidden sessions). One JSON object keyed by storage key; values are
+/// parsed JSON when possible, else the raw string — the frontend round-trips
+/// them back into localStorage byte-for-byte. Same fail-loud conventions as
+/// the session store: corruption is an error, never silently re-created.
+fn app_config_path() -> std::path::PathBuf {
+  gasket_core::storage::config_dir().join("app_config.json")
+}
+
+#[tauri::command]
+fn get_app_config() -> Result<Option<serde_json::Value>, String> {
+  match std::fs::read(app_config_path()) {
+    Ok(bytes) => serde_json::from_slice(&bytes)
+      .map(Some)
+      .map_err(|e| format!("app config corrupt: {e}")),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(e) => Err(e.to_string()),
+  }
+}
+
+/// Atomic write (tmp + rename): a crash can never leave a torn config
+/// shadowing an intact one. The file is tiny and writes are debounced by the
+/// frontend, so a blocking std::fs write is noise.
+#[tauri::command]
+fn set_app_config(config: serde_json::Value) -> Result<(), String> {
+  let path = app_config_path();
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  let bytes = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+  let tmp = path.with_extension("json.tmp");
+  std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+  std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
 /// Delete the session's on-disk data wholesale (event log + meta sidecar).
 /// Returns false when the session never existed.
 #[tauri::command]
@@ -112,6 +148,9 @@ pub fn run() {
       chat::send_message,
       chat::cancel_turn,
       chat::approval_response,
+      chat::get_context,
+      get_app_config,
+      set_app_config,
     ])
     .setup(|app| {
       if cfg!(debug_assertions) {

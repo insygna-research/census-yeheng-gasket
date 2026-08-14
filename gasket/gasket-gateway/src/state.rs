@@ -18,7 +18,7 @@ pub(crate) struct AppState {
     pub(crate) store_root: PathBuf,
 }
 
-/// Per-connection state. The transcript itself is NOT kept here — the
+/// Per-connection state. The transcript itself is NOT kept here - the
 /// on-disk event log is the single source of truth and history is derived
 /// from it (`derive_messages`) wherever needed. Only connection-scoped
 /// stats and the approval registry live in memory.
@@ -31,5 +31,9 @@ pub(crate) struct WsSession {
     /// Most recent provider-reported input-token count for this turn (current
     /// window occupancy). Distinct from `usage_in/out` which accumulate cost.
     pub(crate) last_input_tokens: u64,
+    /// Turn start timestamp for the `done` summary line (elapsed time).
+    /// Set by the main loop just before `run_turn`, read by the forwarder
+    /// when it serializes the `done` event.
+    pub(crate) turn_start: Option<std::time::Instant>,
     pub(crate) registry: ApprovalRegistry,
 }

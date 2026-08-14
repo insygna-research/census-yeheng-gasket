@@ -4,8 +4,9 @@ import { useIMWebSocket } from '@/hooks/useIMWebSocket';
 import { useTauriChat } from '@/hooks/useTauriChat';
 import { isTauri } from '@/lib/platform';
 import { backendBaseUrl, fetchSessionMessages, sessionKey } from '@/lib/backend';
+import type { ApprovalRequest, ContextStats, Message, SubagentState } from '@/types';
 import { notifyTurnComplete } from '@/lib/notifications';
-import type { ApprovalRequest, Message, SubagentState } from '@/types';
+import { invoke } from '@tauri-apps/api/core';
 
 export function useChatSession(chatId: { value: string }) {
   const chatStore = useChatStore();
@@ -281,6 +282,15 @@ export function useChatSession(chatId: { value: string }) {
         // 到达这里时子面板必然已收尾，无需再检查 activeSubagents。
         pendingApprovals.value.clear();
         isReceiving.value = false;
+        // Turn summary: `done_with_summary` carries cumulative tokens + elapsed.
+        // Absent for slash-command replies and pre-summary turns.
+        if (msg.usage_in != null && msg.usage_out != null && msg.elapsed_ms != null) {
+          chatStore.setTurnSummary(chatId.value, botMsg.id, {
+            usageIn: msg.usage_in,
+            usageOut: msg.usage_out,
+            elapsedMs: msg.elapsed_ms,
+          });
+        }
         fetchContext();
         notifyTurnComplete(
           chatStore.getChat(chatId.value)?.name || 'Gasket',
@@ -388,6 +398,16 @@ export function useChatSession(chatId: { value: string }) {
 
   const fetchContext = async () => {
     try {
+      if (isTauri) {
+        // Tauri: invoke the in-process get_context command (mirrors the
+        // gateway's GET /api/sessions/:id/context). Returns the same
+        // { context_stats, watermark_info } JSON shape.
+        const data = await invoke<{ context_stats?: ContextStats; watermark_info?: unknown }>('get_context', { sessionId: chatId.value });
+        if (data?.context_stats) {
+          chatStore.setContextStats(chatId.value, data.context_stats);
+        }
+        return;
+      }
       const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context`);
       const data = await res.json();
       if (res.ok && data.context_stats) {
@@ -437,6 +457,11 @@ export function useChatSession(chatId: { value: string }) {
     if (isCompacting.value) return;
     isCompacting.value = true;
     try {
+      // Tauri has no compaction endpoint; refreshing context is enough.
+      if (isTauri) {
+        await fetchContext();
+        return;
+      }
       const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context/compact`, { method: 'POST' });
       const data = await res.json();
       if (res.ok && data.context_stats) {

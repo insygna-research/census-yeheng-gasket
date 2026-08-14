@@ -101,15 +101,30 @@ export interface Message {
   timestamp: number;
   status?: MessageStatus;
   pending?: boolean;
+  /** Turn summary: cumulative tokens + elapsed time, populated when the
+   * `done` event for this bot reply carries `usage_in`/`usage_out`/`elapsed_ms`.
+   * Absent for slash-command replies and pre-summary turns. */
+  turnSummary?: TurnSummary;
 }
 
+/** Usage line shown after a completed turn. */
+export interface TurnSummary {
+  /** Cumulative input tokens across the session so far. */
+  usageIn: number;
+  /** Cumulative output tokens across the session so far. */
+  usageOut: number;
+  /** Wall-clock duration of this turn in milliseconds. */
+  elapsedMs: number;
+}
+
+/** Mirrors the JSON shape sent by both the gateway's
+ * `GET /api/sessions/:id/context` and the Tauri `get_context` command. */
 export interface ContextStats {
-  token_budget: number;
-  compaction_threshold: number;
-  threshold_tokens: number;
   current_tokens: number;
   usage_percent: number;
   is_compressing: boolean;
+  cumulative_in: number;
+  cumulative_out: number;
 }
 
 export interface WatermarkInfo {

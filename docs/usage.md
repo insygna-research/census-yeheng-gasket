@@ -193,7 +193,7 @@ pnpm tauri:build    # = tauri build
 - 产物:`web/src-tauri/` 配置中 `productName=Gasket`、`identifier=com.gasket.desktop`、`bundle.targets=all`。macOS 出 `.dmg`,Windows 出 `.msi`/`.exe`。
 - 配置见 `web/src-tauri/tauri.conf.json`:`frontendDist=../dist`、`devUrl=http://localhost:1420`。
 
-> **桌面端仍需后端**:Tauri 壳不做本地推理、不内置 LLM。它和浏览器版一样,经 `VITE_WS_URL`(打包时写死或运行时配置)连接一个 gasket-gateway。换句话说,桌面应用 = 一个原生窗口壳 + 远端(或本机)的 gateway。
+> **桌面端是自包含的**:Tauri 桌面端内置进程内 Host(`src-tauri/src/chat.rs`),通过 IPC 直接做推理,不需要独立 gateway。但仍需 LLM API key 和 `~/.gasket` 配置(与 gateway 共用同一套)。浏览器版则需要独立部署的 gateway。
 
 ---
 
@@ -401,7 +401,7 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 | 端口 3000 被占用 | 用 `GASKET_GATEWAY_PORT=<其它端口>` 改网关端口,并把前端 `VITE_WS_URL`/`VITE_API_URL` 同步改掉。 |
 | 报 `orphan tool_call` / 工具结果错乱 | 通常与压缩有关;确认没有手动设异常小的 `GASKET_COMPACT_MAX_MESSAGES`。正常情况下原子组会保护 tool_call↔result。 |
 | 模型不支持 thinking | `GASKET_THINKING` 设了 `low/medium/high` 但模型不支持时自动无效化;`ModelSpec.supports_thinking` 控制是否发送 thinking 参数。 |
-| 桌面端打不开/不响应 | 桌面端仍依赖后端网关,确认 gateway 可达、`VITE_WS_URL` 正确;Tauri 壳本身不做推理。 |
+| 桌面端打不开/不响应 | 确认 LLM API key 已配置(`~/.gasket/config.toml` 或环境变量);桌面端通过进程内 Host 做 IPC 推理,不需要独立 gateway。 |
 | 想用 Claude(Anthropic) | `GASKET_LLM_API=anthropic`,`GASKET_LLM_BASE_URL=https://api.anthropic.com/v1`,`GASKET_LLM_MODEL=claude-...`。 |
 | 想接本地 Ollama/vLLM | `GASKET_LLM_API=openai`(默认),`GASKET_LLM_BASE_URL=http://localhost:11434/v1`(Ollama 示例),key 随意填。 |
 | Docker 构建失败 | 根 `Dockerfile` 已过时(见 §7),需按当前 5-crate 结构重写。 |

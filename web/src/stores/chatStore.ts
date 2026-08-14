@@ -1,48 +1,15 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { deleteSession, fetchSessionList, renameSession } from '@/lib/backend';
-import { readJSON, storageKeys, writeJSON } from '@/lib/storage';
-import type { Chat, Message, MessageStatus, SubagentState } from '@/types';
-
-const LEGACY_KEY = 'gasket_sessions';
-
-/** localStorage keeps chat metadata only; messages live on the backend. */
-interface ChatMeta {
-  id: string;
-  name: string;
-  updatedAt: number;
-}
-
-const loadLocalChats = (): Chat[] => {
-  const meta = readJSON<ChatMeta[]>(storageKeys.chatsMeta, []);
-  if (meta.length > 0) {
-    return meta.map(m => ({ ...m, messages: [] }));
-  }
-
-  // One-time migration from the full-transcript store: keep names and drop
-  // message bodies — the backend's events.jsonl is the authoritative copy.
-  const legacy = readJSON<(ChatMeta & { messages?: unknown })[]>(storageKeys.legacyChats, []);
-  if (legacy.length > 0) {
-    localStorage.removeItem(storageKeys.legacyChats);
-    localStorage.removeItem(LEGACY_KEY);
-    return legacy.map(c => ({
-      id: c.id,
-      name: c.name,
-      updatedAt: c.updatedAt || Date.now(),
-      messages: [],
-    }));
-  }
-
-  localStorage.removeItem(LEGACY_KEY);
-  return [];
-};
-
-const loadHiddenIds = (): Set<string> =>
-  new Set(readJSON<string[]>(storageKeys.hiddenSessions, []));
+import type { Chat, Message, MessageStatus, SubagentState, TurnSummary } from '@/types';
 
 export const useChatStore = defineStore('chat', () => {
-  const chats = ref<Chat[]>(loadLocalChats());
-  const hiddenIds = ref<Set<string>>(loadHiddenIds());
+  // The backend's session store (~/.gasket/sessions via list_sessions) is
+  // the single source of truth for the chat list; nothing is persisted
+  // client-side. The list starts empty and fills from syncFromBackend()
+  // (called on mount); message bodies hydrate lazily per chat from
+  // fetchSessionMessages.
+  const chats = ref<Chat[]>([]);
   const activeChatId = ref<string>('');
 
   const activeChat = computed(() => chats.value.find(c => c.id === activeChatId.value));
@@ -65,14 +32,11 @@ export const useChatStore = defineStore('chat', () => {
   };
 
   const deleteChat = (id: string) => {
-    // Backend delete is authoritative; when the gateway is unreachable (or
-    // too old to have the endpoint) fall back to the local hidden list so
-    // the session stays off the list after the next sync.
+    // The backend's on-disk store is authoritative; a failed delete means
+    // the session simply reappears on the next sync — honest, no local
+    // shadow list.
     deleteSession(id).then(ok => {
-      if (!ok) {
-        hiddenIds.value.add(id);
-        writeJSON(storageKeys.hiddenSessions, [...hiddenIds.value]);
-      }
+      if (!ok) console.warn('Failed to delete session on backend:', id);
     });
     chats.value = chats.value.filter(c => c.id !== id);
     if (activeChatId.value === id) {
@@ -92,8 +56,8 @@ export const useChatStore = defineStore('chat', () => {
     const trimmed = name.trim();
     if (chat && trimmed) {
       chat.name = trimmed;
-      // Persist backend-side so the name survives devices and localStorage
-      // loss; a failure just means the name stays local-only.
+      // Persist to the backend's meta.json sidecar — the only durable copy;
+      // a failure just means the name stays in-memory for this run.
       renameSession(id, trimmed).then(ok => {
         if (!ok) console.warn('Failed to sync session name to backend:', id);
       });
@@ -231,6 +195,13 @@ export const useChatStore = defineStore('chat', () => {
     if (chat) chat.watermarkInfo = info;
   };
 
+  const setTurnSummary = (chatId: string, messageId: string, summary: TurnSummary) => {
+    const chat = getChat(chatId);
+    if (!chat) return;
+    const msg = chat.messages.find(m => m.id === messageId);
+    if (msg) msg.turnSummary = summary;
+  };
+
   const abortToolCalls = (chatId: string) => {
     const chat = getChat(chatId);
     if (!chat) return;
@@ -276,15 +247,14 @@ export const useChatStore = defineStore('chat', () => {
   };
 
 
-  // Sync sessions from backend (discovery: CLI-created, other-device, or
-  // lost localStorage). The backend is authoritative for the session list;
-  // local meta only contributes names. Messages hydrate lazily on activate
-  // via fetchSessionMessages.
+  // Hydrate the chat list from the backend (discovery: CLI-created,
+  // other-device, or this-device sessions — the on-disk store is the only
+  // record). Names come from the meta.json sidecar; messages hydrate lazily
+  // on activate via fetchSessionMessages.
   const syncFromBackend = async () => {
     try {
       const sessions = await fetchSessionList();
       for (const s of sessions) {
-        if (hiddenIds.value.has(s.id)) continue;
         const existing = chats.value.find(c => c.id === s.id);
         if (existing) {
           existing.updatedAt = Math.max(existing.updatedAt, s.mtime || 0);
@@ -303,14 +273,14 @@ export const useChatStore = defineStore('chat', () => {
     } catch (e) {
       console.error('syncFromBackend failed:', e);
     }
+    // Initialize after the backend list lands (called on mount): an empty
+    // store gets a fresh local chat; otherwise activate the newest.
+    if (chats.value.length === 0) {
+      createChat();
+    } else if (!activeChatId.value) {
+      activeChatId.value = chats.value[0].id;
+    }
   };
-
-  // Initialize
-  if (chats.value.length === 0) {
-    createChat();
-  } else if (!activeChatId.value) {
-    activeChatId.value = chats.value[0].id;
-  }
 
   return {
     chats,
@@ -334,6 +304,7 @@ export const useChatStore = defineStore('chat', () => {
     setMessages,
     setContextStats,
     setWatermarkInfo,
+    setTurnSummary,
     abortToolCalls,
     ensureSubagents,
     pushSubagent,

@@ -59,8 +59,8 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
         ▼  (WebSocket + REST + 静态托管 web/dist)
 ┌──────────────────────────────────────────────────────────────┐
 │                web/  (Vue 3 + Vite + Tauri 2)                 │
-│   浏览器应用  ──┐                                             │
-│   Tauri 桌面壳 ─┴─ 同一份 src,经 ws://host:3000 连接 gateway │
+│   浏览器应用  ─── WS/HTTP ──┐                                │
+│   Tauri 桌面壳 ─── IPC ─────┴─ 同一份 src,运行时 isTauri 分支│
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -453,16 +453,23 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
        ┌───────┴────────┐
        ▼                ▼
   Vite dev/build     Tauri 打包
-  → dist/            → 桌面 App(.dmg/.msi/.exe)
+  -> dist/            -> 桌面 App(.dmg/.msi/.exe)
        │                │
-       └────────┬───────┘
-                ▼
-     都经 ws://<host>:3000 连接 gasket-gateway
+       ▼                ▼
+  WS/HTTP -> gateway   Tauri IPC -> 进程内 Host
+  (localhost:3000)     (src-tauri/chat.rs)
 ```
 
-**关键事实**:Tauri 桌面端是一个**轻量 WebView 壳**——`src-tauri/src/lib.rs` 里**没有定义任何 `#[tauri::command]`、没有 IPC、没有浏览器/桌面分支代码**。前端从不调用 Tauri 的 `invoke`。桌面端只是把同一份 Vite 产物装进一个窗口,仍像浏览器一样经 `localhost:3000` 的 WS/HTTP 与 gateway 通信。
+**关键事实**:Tauri 桌面端有**两种传输模式**,前端通过 `isTauri`(检查 `window.__TAURI_INTERNALS__`)在运行时自动切换:
 
-> **部署含义**:桌面应用**不是一个纯本地离线应用**,运行时仍需要一个可达的 gasket-gateway 后端(可在本机或远端)。
+- **浏览器模式**:经 `ws://<host>:3000` 的 WS/HTTP 与独立部署的 gasket-gateway 通信。
+- **桌面模式**:经 Tauri IPC(`invoke` + `chat-event` 监听)与 `src-tauri/src/chat.rs` 中的进程内 Host 通信,无需独立 gateway 进程。
+
+桌面端共 10 个 `#[tauri::command]`:`chat.rs` 4 个(`send_message`、`cancel_turn`、`approval_response`、`get_context`),`lib.rs` 6 个(`list_sessions`、`get_session_messages`、`rename_session`、`delete_session`、`get_app_config`、`set_app_config`)。前 8 个与 gateway 的 WS 消息类型和 REST 端点一一对应,确保前端逻辑共享。每个 session 拥有一个进程内 Host 实例(与 gateway 的 per-connection Host 完全一致:同一 config loader、system prompt、tool set、sub-agent wiring),事件经单一有序 IPC 通道(`WireEvent` 枚举 -> emitter task -> `app.emit`)流回前端。
+
+**持久化完全由 Rust 后端拥有,桌面端不使用 localStorage**:会话记录由 Host 的 `persist_fn` 逐事件追加到 `~/.gasket/sessions/{id}/events.jsonl`(append-only JSONL),显示名经 `rename_session` 原子写 `meta.json` 侧车,会话列表来自 `list_sessions`,删除即 `delete_session`——前端 chatStore 不再本地缓存任何会话记录。app 配置(主题、侧栏状态)由 `lib.rs` 的 `get_app_config`/`set_app_config` 读写 `~/.gasket/app_config.json`(tmp+rename 原子写):前端 `storage.ts` 是内存 KV,桌面模式启动时(`initStorage`,在动态 import 应用模块图之前执行,避免 useTheme 模块级初始化竞争)从后端载入,写入防抖落盘。浏览器模式(无内嵌后端)仍以 localStorage 为持久层,同一套 `storage.ts` 接口写透。
+
+> **部署含义**:浏览器模式需要独立 gateway;桌面模式自包含(进程内 Host 直接做推理),但桌面端仍需 LLM API key 和 `~/.gasket` 配置。
 
 ### 10.3 项目结构(`web/src/`)
 
@@ -554,7 +561,7 @@ src/
 | **事件溯源日志(逐事件追加)** | 副作用先于轮次完成落盘:崩溃 / 失败 / 取消的轮次仍保有已发生的全部事实(助手消息 + 工具结果)。`Assistant` 先于其中任何工具执行持久化(崩溃安全);`TurnEnd{reason}` 总是落盘。详见 [ADR 0001](./adr/0001-event-sourced-session-log.md) |
 | **JSONL torn-tail 自愈 + fail-closed** | 末行解析失败 = 崩溃截断 → 丢弃并截断;中行损坏 = 真实损坏 → 报错带行号。事件日志额外 fail-closed:未知 `type` 变体(版本错位)→ 加载失败带行号,绝不当 torn tail 抹掉 |
 | **审批双通道取消** | `AtomicBool` 驱动 loop 中止 + `watch` channel 解锁挂起审批,防止取消后闩锁毒化 |
-| **前端壳不 IPC** | Tauri 桌面端不定义 command、不分支,整套前端就是一个 PWA 风格客户端经 WS/HTTP 连后端——一套代码、零分支成本 |
+| **前端 isTauri 双传输** | Tauri 桌面端通过 `isTauri` 运行时分支在 WS/HTTP(浏览器)与 IPC(桌面)之间切换,8 个 `#[tauri::command]` 与 gateway 端点一一对应;单一 `WireEvent` 枚举 + emitter task 保证跨流有序,前端消息处理逻辑完全共享 |
 | **压缩只缩内存、不改盘;预算从日志恢复** | append-only 事件日志永远是真相源;工作内存压缩有损但不破坏 protocol(原子组保护 tool_call↔result)。`usage` 随 `Assistant` 事件持久化,token 预算每轮从日志尾部恢复,跨重启存活 |
 
 ---

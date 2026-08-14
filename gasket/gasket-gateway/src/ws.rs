@@ -93,6 +93,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         usage_in: 0,
         usage_out: 0,
         last_input_tokens: 0,
+        turn_start: None,
         registry: ApprovalRegistry::new(),
     }));
     state.sessions.insert(session_id.clone(), session.clone());
@@ -206,7 +207,25 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                 WireEvent::Done => {
                     // Turn boundary: the tool-name cache is per-turn.
                     tool_names.clear();
-                    let ev = OutgoingEvent::done();
+                    // Emit a usage summary line: cumulative tokens +
+                    // elapsed time. `turn_start` is set by the main loop
+                    // just before run_turn; None only if Done arrives
+                    // without a preceding turn (shouldn't happen, but
+                    // degrade to a plain done instead of crashing).
+                    let s = wire_session.lock().await;
+                    let elapsed_ms = s.turn_start
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let ev = if elapsed_ms > 0 {
+                        OutgoingEvent::done_with_summary(
+                            s.usage_in,
+                            s.usage_out,
+                            elapsed_ms,
+                        )
+                    } else {
+                        OutgoingEvent::done()
+                    };
+                    drop(s); // release lock before send_json below
                     Some(serde_json::to_string(&ev).unwrap_or_default())
                 }
                 WireEvent::Error(msg) => {
@@ -376,7 +395,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         Some("clear") => {
                             // Align with SessionManager::clear (same as the
                             // CLI's /clear): rotate to a fresh session id so
-                            // the next turn starts a new event log — the old
+                            // the next turn starts a new event log - the old
                             // log stays intact on disk under its old id.
                             // Reset the connection's log-derived view too.
                             host.session_mut().clear();
@@ -384,6 +403,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                             s.usage_in = 0;
                             s.usage_out = 0;
                             s.last_input_tokens = 0;
+                            s.turn_start = None;
                             Some(OutgoingEvent::content("(session cleared)".to_string()))
                         }
                         Some("help") => Some(OutgoingEvent::content(
@@ -394,12 +414,29 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         }
                         None => None,
                     };
-                    if let Some(ev) = reply {
+                    // Slash commands are not turns: clear turn_start so the
+                    // done event below renders without a stale elapsed/usage
+                    // summary from a previous turn.
+                    {
                         let mut s = session.lock().await;
-                        send_json(&mut s.sender, &ev).await;
+                        s.turn_start = None;
+                        if let Some(ev) = reply {
+                            send_json(&mut s.sender, &ev).await;
+                            // The content reply above skips the wire channel
+                            // (single-writer ordering), so a `done` must
+                            // follow through the same channel or the
+                            // frontend's isReceiving flag stays stuck after a
+                            // slash command.
+                            drop(s); // release lock before wire_tx.send
+                            let _ = wire_tx.send(WireEvent::Done);
+                        }
                     }
                     continue;
                 }
+
+                // Record turn start for the done-summary line. Set before
+                // run_turn begins so the elapsed time covers the whole turn.
+                session.lock().await.turn_start = Some(std::time::Instant::now());
 
                 // The event log is the source of truth: run_turn derives
                 // (and compacts) history from it internally.

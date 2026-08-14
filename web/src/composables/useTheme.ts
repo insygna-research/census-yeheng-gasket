@@ -1,5 +1,5 @@
 import { computed, ref, watch } from 'vue'
-import { readJSON, storageKeys, writeJSON } from '@/lib/storage'
+import { readJSON, readString, storageKeys, writeJSON } from '@/lib/storage'
 
 const STORAGE_KEY = storageKeys.theme
 const LEGACY_KEY = 'gasket_theme'
@@ -31,7 +31,7 @@ function getInitialState(): ThemeState {
   }
 
   // Migrate from legacy single-value theme
-  const legacy = localStorage.getItem(LEGACY_KEY) as ThemeMode | null
+  const legacy = readString(LEGACY_KEY) as ThemeMode | ''
   if (legacy === 'light' || legacy === 'dark') {
     return { mode: legacy, hue: 'zinc', markdownStyle: 'classic' }
   }
