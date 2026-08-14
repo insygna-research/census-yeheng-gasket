@@ -425,6 +425,11 @@ pub async fn send_message(
   // /clear and /help are handled server-side; everything else goes to
   // the LLM. Keep this list in sync with the ChatInput.vue completer.
   if let Some(cmd) = content.strip_prefix('/') {
+    // The swap above claimed the turn slot, but slash commands are not
+    // turns and never spawn the task whose Drop guard would release it.
+    // Free it here or /clear leaves the session permanently "busy":
+    // every later message is answered with Busy and nothing ever runs.
+    session.turn_active.store(false, Ordering::Release);
     let mut parts = cmd.split_whitespace();
     let reply = match parts.next() {
       Some("clear") => {

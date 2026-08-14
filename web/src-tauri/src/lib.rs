@@ -137,6 +137,19 @@ async fn delete_session(id: String) -> Result<bool, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  let _ = dotenvy::dotenv();
+  // gasket-core/gasket-host emit through `tracing`; without a global
+  // subscriber those records vanish. This is separate from tauri-plugin-log
+  // (fern, registered in setup) which handles `log`-crate records — the two
+  // coexist only because tracing-subscriber is built without `tracing-log`
+  // (see Cargo.toml). Bare `EnvFilter::from_default_env()` defaults to
+  // ERROR-only when RUST_LOG is unset, so fall back to `info`.
+  tracing_subscriber::fmt()
+    .with_env_filter(
+      tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    )
+    .init();
   tauri::Builder::default()
     .plugin(tauri_plugin_notification::init())
     .manage(chat::ChatState::new())
@@ -164,4 +177,35 @@ pub fn run() {
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  struct NoopLogger;
+
+  impl log::Log for NoopLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+      false
+    }
+    fn log(&self, _: &log::Record) {}
+    fn flush(&self) {}
+  }
+
+  /// The tracing subscriber init must NOT claim the global `log` logger —
+  /// tauri-plugin-log (fern) needs it, and losing that race aborts the app
+  /// during setup. Guards the `default-features = false` on
+  /// tracing-subscriber in Cargo.toml: re-enabling `tracing-log` makes
+  /// `fmt().init()` install LogTracer and fails this test.
+  #[test]
+  fn tracing_init_leaves_log_logger_free() {
+    tracing_subscriber::fmt()
+      .with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+          .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+      )
+      .init();
+    assert!(log::set_boxed_logger(Box::new(NoopLogger)).is_ok());
+  }
 }

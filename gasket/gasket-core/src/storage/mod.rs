@@ -994,7 +994,12 @@ mod tests {
         assert!(store.load_meta("s1").await.is_none());
 
         store
-            .write_meta("s1", &SessionMeta { name: Some("My chat".into()) })
+            .write_meta(
+                "s1",
+                &SessionMeta {
+                    name: Some("My chat".into()),
+                },
+            )
             .await
             .unwrap();
         let meta = store.load_meta("s1").await.unwrap();
@@ -1022,7 +1027,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .write_meta("s1", &SessionMeta { name: Some("x".into()) })
+            .write_meta(
+                "s1",
+                &SessionMeta {
+                    name: Some("x".into()),
+                },
+            )
             .await
             .unwrap();
 

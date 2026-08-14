@@ -13,7 +13,6 @@ import {
 } from 'lucide-vue-next';
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible';
 import type { Message, SubagentState, TimelineItem, ToolCall } from '../types';
-import SubagentGridPanel from './SubagentGridPanel.vue';
 import SubagentThoughtsPanel from './SubagentThoughtsPanel.vue';
 
 const props = defineProps<{
@@ -278,16 +277,12 @@ function iconForStatus(status: ToolCall['status']) {
         </div>
       </div>
 
-      <!-- subagent_* 协议已实现：当 spawn_subagents 工具被调用时，网关转发子 agent 事件，以下两块渲染 -->
+      <!-- subagent_* 协议已实现：当 spawn_subagents 工具被调用时，网关转发子 agent 事件，以下渲染 -->
       <!-- Subagent results -->
-      <SubagentGridPanel
-        v-if="subagents && subagents.length > 0 && ['running', 'synthesizing'].includes(subagentPhase || 'idle')"
-        :subagents="subagents"
-        :phase="(subagentPhase as 'running' | 'synthesizing') || 'running'"
-      />
       <SubagentThoughtsPanel
-        v-if="subagents && subagents.length > 0 && !['running', 'synthesizing'].includes(subagentPhase || 'idle')"
+        v-if="subagents && subagents.length > 0"
         :subagents="subagents"
+        :phase="subagentPhase || 'completed'"
       />
     </div>
   </div>

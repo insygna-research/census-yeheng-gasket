@@ -41,7 +41,6 @@ impl AgentMessage {
     }
 }
 
-
 /// A user-authored message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {

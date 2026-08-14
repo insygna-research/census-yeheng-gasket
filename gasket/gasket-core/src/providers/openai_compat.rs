@@ -171,8 +171,32 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
             Some(json!({"role": "user", "content": text}))
         }
         AgentMessage::Assistant(a) => {
-            let mut entry = json!({"role": "assistant"});
             let text = collect_text(&a.content);
+            let tool_calls: Vec<_> = a
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolCall { tool_call: tc } => Some(json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                    })),
+                    _ => None,
+                })
+                .collect();
+            // An assistant turn with neither text nor tool calls (a
+            // stream-error placeholder, or a reasoning model that ended
+            // inside thinking) must be dropped: OpenAI-compat APIs reject
+            // `{"role":"assistant"}` with no `content` and no `tool_calls`
+            // with HTTP 400. Matches the empty-drop in the Anthropic
+            // provider's `convert_message`.
+            if text.is_empty() && tool_calls.is_empty() {
+                return None;
+            }
+            let mut entry = json!({"role": "assistant"});
             if !text.is_empty() {
                 entry["content"] = json!(text);
             }
@@ -190,21 +214,6 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
             if !reasoning.is_empty() {
                 entry["reasoning_content"] = json!(reasoning);
             }
-            let tool_calls: Vec<_> = a
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolCall { tool_call: tc } => Some(json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                    })),
-                    _ => None,
-                })
-                .collect();
             if !tool_calls.is_empty() {
                 entry["tool_calls"] = json!(tool_calls);
             }
@@ -365,6 +374,35 @@ mod tests {
             timestamp: 0,
         });
         assert!(convert_message(&custom).is_none());
+    }
+
+    #[test]
+    fn convert_message_drops_empty_assistant() {
+        // Stream-error / aborted turns persist an assistant message with no
+        // content at all.
+        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+        a.stop_reason = crate::types::message::StopReason::Error("boom".into());
+        assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
+    }
+
+    #[test]
+    fn convert_message_drops_thinking_only_assistant() {
+        // Reasoning models can end a turn inside thinking: text and tool
+        // calls stay empty while thinking is not.
+        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+        a.append_thinking("reasoning only");
+        assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
+    }
+
+    #[test]
+    fn convert_message_keeps_assistant_with_text_and_thinking() {
+        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+        a.append_thinking("reasoning");
+        a.append_text("answer");
+        let entry = convert_message(&AgentMessage::Assistant(a)).expect("kept");
+        assert_eq!(entry["content"], json!("answer"));
+        assert_eq!(entry["reasoning_content"], json!("reasoning"));
+        assert!(entry.get("tool_calls").is_none());
     }
 
     #[test]

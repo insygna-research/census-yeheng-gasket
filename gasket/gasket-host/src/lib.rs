@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gasket_core::{
-    derive_messages, AgentError, AgentEvent, AgentMessage, CancelCause, ContentBlock, SessionEvent,
-    StopReason, StreamFn, ToolDefinition, TurnEndReason, UserMessage,
+    derive_messages, repair_unanswered_tool_calls, AgentError, AgentEvent, AgentMessage,
+    CancelCause, ContentBlock, SessionEvent, StopReason, StreamFn, ToolDefinition, TurnEndReason,
+    UserMessage,
 };
 
 pub mod approval;
@@ -175,11 +176,11 @@ impl Host {
     /// Assistant/ToolResult as it happens via the injected persist closure —
     /// so a crash or failed turn keeps every side effect that already
     /// happened, instead of rolling back to a pre-turn transcript.
-    ///
     /// Flow: persist(TurnStart) → persist(User) → history =
-    /// derive_messages(load_events) → budget.compact(&history) (in-memory
-    /// only; the log stays append-only full) → prepare_turn →
-    /// run_agent_loop → persist(TurnEnd{reason}) → [`TurnSummary`].
+    /// derive_messages(load_events) → repair dangling tool calls →
+    /// budget.compact(&history) (in-memory only; the log stays append-only
+    /// full) → prepare_turn → run_agent_loop → persist(TurnEnd{reason}) →
+    /// [`TurnSummary`].
     ///
     /// `on_event` receives every [`AgentEvent`](gasket_core::AgentEvent)
     /// as it happens (streaming text, tool calls, usage, errors).
@@ -221,7 +222,12 @@ impl Host {
         }) {
             budget.record_input_tokens(input_tokens);
         }
-        let history = budget.compact(&derive_messages(&events));
+        let mut history = derive_messages(&events);
+        // The log keeps partial facts by design (abort/crash mid-batch);
+        // the provider protocol does not tolerate them. Synthesize error
+        // results for tool calls that never got one before compacting.
+        repair_unanswered_tool_calls(&mut history);
+        let history = budget.compact(&history);
 
         let (mut context, config) = self.cfg.prepare_turn(
             TurnInputs {

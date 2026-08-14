@@ -305,6 +305,133 @@ async fn success_path_log_equals_legacy_messages() {
     );
 }
 
+/// The 400-repair regression: an abort between two calls of one batch
+/// leaves the assistant's second tool call unanswered in the log. The next
+/// turn's provider request must carry a synthesized error result for it —
+/// OpenAI-compat APIs reject `tool_calls` without matching `tool` messages.
+#[tokio::test]
+async fn next_turn_request_answers_every_tool_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = |name: &str| {
+        format!(
+            "{}/{name}",
+            work.path().file_name().unwrap().to_string_lossy()
+        )
+    };
+
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    // Turn 1: one batch of two write calls; the test flips the abort signal
+    // after the FIRST ToolExecutionEnd, so t2 never executes. The next
+    // provider request is skipped by the abort (one stream() call total).
+    // Turn 2: plain text answer (second stream() call) — its request is
+    // what we assert on.
+    let fake = Arc::new(FakeStream::new(vec![
+        vec![
+            write_call("t1", &rel("a.txt"), "one"),
+            write_call("t2", &rel("b.txt"), "two"),
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::TextDelta("ok".into()), StreamChunk::Done],
+    ]));
+    let host = Host::new(
+        test_cfg(false),
+        session,
+        Arc::new(full_auto_policy()),
+        "sys".into(),
+        gasket_core::built_in_tools(),
+    )
+    .with_stream_fn(fake.clone());
+
+    let signal = host.signal().clone();
+    let seen_ends = std::sync::atomic::AtomicU32::new(0);
+    let summary = host
+        .run_turn("write both", |ev| {
+            if matches!(ev, gasket_core::AgentEvent::ToolExecutionEnd { .. }) {
+                let n = seen_ends.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    signal.store(true, Ordering::Relaxed);
+                }
+            }
+        })
+        .await
+        .expect("aborted turn returns Ok");
+    assert!(
+        matches!(summary.reason, TurnEndReason::Aborted { .. }),
+        "expected abort, got {:?}",
+        summary.reason
+    );
+
+    let summary2 = host
+        .run_turn("continue", |_| {})
+        .await
+        .expect("second turn");
+    assert!(matches!(summary2.reason, TurnEndReason::Completed));
+
+    // The provider requests the host actually assembled, in call order.
+    let requests = fake.seen();
+    assert_eq!(requests.len(), 2, "abort skipped the follow-up request");
+
+    // Every assistant tool_call in the turn-2 request is answered by a
+    // tool result — the OpenAI-compat 400 contract.
+    let mut pending: Vec<String> = Vec::new();
+    for msg in &requests[1] {
+        match msg {
+            AgentMessage::Assistant(a) => {
+                for b in &a.content {
+                    if let ContentBlock::ToolCall { tool_call: tc } = b {
+                        pending.push(tc.id.clone());
+                    }
+                }
+            }
+            AgentMessage::ToolResult(tr) => {
+                let i = pending
+                    .iter()
+                    .position(|id| id == &tr.tool_call_id)
+                    .expect("tool result without a pending tool call");
+                pending.remove(i);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "turn-2 request still has unanswered tool calls: {pending:?}"
+    );
+    // And the synthesized t2 result is an error result placed after t1's.
+    let turn2_results: Vec<&gasket_core::ToolResultMessage> = requests[1]
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::ToolResult(tr) => Some(tr),
+            _ => None,
+        })
+        .collect();
+    let ids: Vec<&str> = turn2_results
+        .iter()
+        .map(|tr| tr.tool_call_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["t1", "t2"], "t1 real, t2 synthesized, in order");
+    assert!(turn2_results[1].is_error, "synthesized result is an error");
+
+    // The on-disk log keeps the partial facts — the repair is in-memory
+    // only, never written back.
+    let sid = host.session().current_id().to_string();
+    let events = EventStorage::new(tmp.path())
+        .load_events(&sid)
+        .await
+        .unwrap();
+    let answered: Vec<&str> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            SessionEvent::ToolResult(AgentMessage::ToolResult(tr)) => {
+                Some(tr.tool_call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answered, vec!["t1"], "t2 must stay unanswered on disk");
+}
+
 /// One-shot legacy migration: messages.jsonl is wrapped into events.jsonl in
 /// full, deleted only after the full write, and a second open loads
 /// events.jsonl directly (idempotent).

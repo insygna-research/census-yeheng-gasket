@@ -300,6 +300,11 @@ export function useChatSession(chatId: { value: string }) {
       case 'busy':
         // 发送时回合已在进行（竞态/打断）：只提示，不动会话状态——
         // 正在流式的回复和子面板不能被清掉。
+        // 但 processWebSocketMessage 顶部已把 isReceiving 置 true，busy
+        // 不是流式回合的一部分，不复位会让输入框永久锁死（sendMessage
+        // 的守卫从此静默拦截一切消息）。若确有回合在收尾，它的后续事件
+        // 会重新置位、done 会再清掉。
+        isReceiving.value = false;
         showError(msg.message || 'The agent is busy processing a request');
         break;
       // subagent_* 协议是 M2（core 子 agent 编排）的预留契约：网关当前

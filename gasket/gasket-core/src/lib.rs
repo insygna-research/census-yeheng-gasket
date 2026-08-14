@@ -30,7 +30,9 @@ pub use types::event::{AgentEvent, ContentDelta};
 pub use types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
 };
-pub use types::session_event::{derive_messages, CancelCause, SessionEvent, TurnEndReason};
+pub use types::session_event::{
+    derive_messages, repair_unanswered_tool_calls, CancelCause, SessionEvent, TurnEndReason,
+};
 pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,
     ToolResult,
