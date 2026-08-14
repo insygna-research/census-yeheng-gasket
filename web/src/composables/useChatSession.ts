@@ -1,5 +1,5 @@
-import { computed, nextTick, reactive, ref, watch } from 'vue';
-import { useChatStore } from '@/stores/chatStore';
+import { computed, reactive, ref, watch } from 'vue';
+import { useChatStore, uid } from '@/stores/chatStore';
 import { useIMWebSocket } from '@/hooks/useIMWebSocket';
 import { useTauriChat } from '@/hooks/useTauriChat';
 import { isTauri } from '@/lib/platform';
@@ -101,7 +101,7 @@ export function useChatSession(chatId: { value: string }) {
     const s = getBotSubagent(botMsg, msg.id);
     if (s) {
       const toolCall = {
-        id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11),
+        id: uid(),
         name: msg.name,
         arguments: msg.arguments,
         status: 'running' as const,
@@ -178,7 +178,7 @@ export function useChatSession(chatId: { value: string }) {
       case 'tool_start':
         isThinking.value = true;
         chatStore.ensureToolCalls(chatId.value, botMsg.id);
-        const toolId = msg.tool_call_id || (Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11));
+        const toolId = msg.tool_call_id || uid();
         chatStore.pushToolCall(chatId.value, botMsg.id, {
           id: toolId,
           name: msg.name,
@@ -209,7 +209,7 @@ export function useChatSession(chatId: { value: string }) {
         } else {
           chatStore.ensureToolCalls(chatId.value, botMsg.id);
           chatStore.pushToolCall(chatId.value, botMsg.id, {
-            id: msg.tool_call_id || (Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11)),
+            id: msg.tool_call_id || uid(),
             name: msg.name || 'unknown',
             arguments: '',
             status: 'error',
@@ -309,21 +309,8 @@ export function useChatSession(chatId: { value: string }) {
     isSending.value = false;
     isReceiving.value = true;
 
-    let botMsg = chatStore.activeMessages[chatStore.activeMessages.length - 1];
-    if (!botMsg || botMsg.role !== 'bot') {
-      chatStore.appendMessage(chatId.value, {
-        id: Date.now().toString(),
-        role: 'bot',
-        content: '',
-        timestamp: Date.now()
-      });
-      nextTick(() => {
-        botMsg = chatStore.activeMessages[chatStore.activeMessages.length - 1];
-        processWebSocketMessageInner(msg, botMsg);
-      });
-      return;
-    }
-
+    const botMsg = chatStore.getOrCreateBotMessage(chatId.value);
+    if (!botMsg) return;
     processWebSocketMessageInner(msg, botMsg);
   };
 
@@ -334,10 +321,8 @@ export function useChatSession(chatId: { value: string }) {
     } catch (e) {
       isThinking.value = false;
       isSending.value = false;
-      const lastMsg = chatStore.activeMessages[chatStore.activeMessages.length - 1];
-      if (lastMsg && lastMsg.role === 'bot') {
-        chatStore.appendToMessage(chatId.value, lastMsg.id, data, 'content');
-      }
+      console.error('Malformed gateway frame:', e, data.slice(0, 200));
+      showError('Received a malformed message from the server');
     }
   };
 
@@ -452,7 +437,9 @@ export function useChatSession(chatId: { value: string }) {
     // never arrives — without this the panels would spin until the 5-minute
     // client timeout.
     subagentPhase.value = 'idle';
-    const lastBotMsg = chatStore.getOrCreateBotMessage(chatId.value);
+    // Read-only lookup: getOrCreate would fabricate an empty bot bubble when
+    // the user hits stop with no reply in flight.
+    const lastBotMsg = [...chatStore.activeMessages].reverse().find(m => m.role === 'bot');
     if (lastBotMsg) chatStore.abortSubagents(chatId.value, lastBotMsg.id);
     Object.values(subagentTimers.value).forEach(clearTimeout);
     subagentTimers.value = {};
@@ -478,7 +465,7 @@ export function useChatSession(chatId: { value: string }) {
     // 契约错觉。
     if (!text.trim() || !isConnected.value || isSending.value || isReceiving.value) return false;
 
-    const msgId = Date.now().toString();
+    const msgId = uid();
     chatStore.appendMessage(chatId.value, {
       id: msgId,
       role: 'user',

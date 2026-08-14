@@ -34,6 +34,7 @@ export async function fetchSessionList(): Promise<BackendSessionInfo[]> {
     return invoke<BackendSessionInfo[]>('list_sessions');
   }
   const res = await fetch(`${backendBaseUrl()}/api/sessions`);
+  if (!res.ok) return [];
   const data = await res.json();
   return data.sessions || [];
 }

@@ -3,6 +3,9 @@ import { ref, computed } from 'vue';
 import { deleteSession, fetchSessionList, renameSession } from '@/lib/backend';
 import type { Chat, Message, MessageStatus, SubagentState, TurnSummary } from '@/types';
 
+/** Collision-resistant id for locally-created messages and tool calls. */
+export const uid = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 11);
+
 export const useChatStore = defineStore('chat', () => {
   // The backend's session store (~/.gasket/sessions via list_sessions) is
   // the single source of truth for the chat list; nothing is persisted
@@ -22,7 +25,7 @@ export const useChatStore = defineStore('chat', () => {
       id: 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
       name: 'New Chat',
       messages: [
-        { id: Date.now().toString(), role: 'system', content: 'Connected to gasket Gateway', timestamp: Date.now() }
+        { id: uid(), role: 'system', content: 'Connected to gasket Gateway', timestamp: Date.now() }
       ],
       updatedAt: Date.now()
     };
@@ -74,7 +77,7 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     const newBotMsg: Message = {
-      id: Date.now().toString(),
+      id: uid(),
       role: 'bot',
       content: '',
       timestamp: Date.now()
