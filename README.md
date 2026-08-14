@@ -9,11 +9,11 @@ gasket turns "an LLM agent that can call tools, stream output, manage sessions, 
 - **Stateless agent loop** — the core reasoning loop is a pure function; all state lives in the host layer. Inject any LLM via the `StreamFn` trait.
 - **8 built-in tools** — `read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch` / `spawn_subagents`, each with a risk level (`Low` / `Medium` / `High`).
 - **Hook chain & permissions** — `before_tool_call` (async, can block/modify) + `after_tool_call` (sync, can rewrite results). Three permission modes: `suggest` / `auto-edit` / `full-auto`.
-- **Context compaction** — token-aware, turn-boundary-safe (never splits a `tool_call` from its `tool_result`), with provider-reported usage. Memory-only — the on-disk JSONL transcript is always append-only and complete.
+- **Context compaction** — token-aware, turn-boundary-safe (never splits a `tool_call` from its `tool_result`), with provider-reported usage. Memory-only — the on-disk event log is always append-only and complete; the token budget is restored from the log tail each turn, so compaction survives restarts.
 - **MCP client** — connect [Model Context Protocol](https://modelcontextprotocol.io) tool servers (stdio + Streamable HTTP). Reuse existing Claude-Desktop-style `mcp.json` configs.
 - **Subagent orchestration** — `spawn_subagents` tool fans out parallel sub-agent loops with real-time event streaming to the frontend.
 - **Two frontends, one host** — a terminal REPL (`gasket` CLI) and a WebSocket gateway (`gasket-gateway`) both drive the same `Host::run_turn`. The Vue 3 frontend runs as a browser app or a Tauri desktop app from one codebase.
-- **Crash-safe storage** — JSONL sessions with torn-tail self-healing (truncated last line on crash is auto-discarded; mid-file corruption reports with line numbers).
+- **Crash-safe event log** — every session is an append-only `events.jsonl`: each side effect (assistant message, tool result) hits disk as it happens, so a crashed/aborted/errored turn keeps everything that already occurred. Torn-tail self-healing drops a truncated last line on crash; mid-file corruption reports with line numbers; unknown event variants fail closed. A `GET /api/sessions/{key}/messages` REST endpoint derives the transcript from disk on demand.
 
 ## Quick start (5 minutes)
 
@@ -50,10 +50,10 @@ gasket is a Cargo workspace with 5 crates, in a strict `core → host → fronte
 
 | Crate | Type | Responsibility |
 |---|---|---|
-| `gasket-core` | lib | Stateless kernel: agent loop, message/event/tool types, built-in tools, LLM providers, extension API, JSONL storage. |
+| `gasket-core` | lib | Stateless kernel: agent loop, message/event/tool types, built-in tools, LLM providers, extension API, event-log storage. |
 | `gasket-host` | lib | Reusable host: config, session management, permission policy, hook composition, context compaction, MCP client, subagent spawner, external tool bridge. |
 | `gasket-ext` | lib | Optional in-process extensions (`hello` / `todo` / `search` / `permission_gate`). |
-| `gasket-gateway` | bin | WebSocket gateway server: bridges the Vue frontend to the agent loop. |
+| `gasket-gateway` | bin | WebSocket gateway server: bridges the Vue frontend to the agent loop, plus a REST transcript endpoint (`GET /api/sessions/{key}/messages`) that derives history from the on-disk event log. |
 | `gasket-cli` | bin | Interactive terminal REPL. |
 
 The frontend (`web/`) is Vue 3 + Vite + Tauri 2 — one codebase for both browser and desktop.

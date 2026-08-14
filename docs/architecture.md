@@ -88,14 +88,17 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
 
 | 概念 | 定义 | 代码位置 |
 |---|---|---|
-| **Session** | 一次连续对话,对应磁盘上 `~/.gasket/sessions/<id>.jsonl` 的一份 append-only 全量记录 | `host/src/session.rs`(`SessionManager`) |
-| **Host** | 把 config/session/policy/hooks/stream_fn 组装在一起的驱动器;对外暴露 `run_turn` | `host/src/lib.rs:43` |
-| **Agent Loop** | 无状态的推理循环:调 LLM → 解析响应 → 执行工具 → 把工具结果喂回 → 直到结束或超限 | `core/src/agent_loop.rs` |
+| **Session** | 一次连续对话,对应磁盘上 `~/.gasket/sessions/<id>/events.jsonl` 的一份 append-only 事件日志(唯一真相源) | `host/src/session.rs`(`SessionManager`) |
+| **SessionEvent** | 事件日志的追加写词汇表:`TurnStart` / `User` / `Assistant{message,usage}` / `ToolResult` / `TurnEnd{reason}` | `core/src/types/session_event.rs:15` |
+| **derive_messages** | 纯投影:事件日志 → 模型可见消息列表(`TurnStart`/`TurnEnd` 不产出消息) | `core/src/types/session_event.rs:69` |
+| **EventStorage** | `events.jsonl` 的追加写 / 读取存储:`O_APPEND` 单次 `write_all`、torn-tail 自愈、未知变体 fail-closed、原子批量安装(tmp+rename) | `core/src/storage/mod.rs:315` |
+| **Host** | 把 config/session/policy/hooks/stream_fn 组装在一起的驱动器;对外暴露 `run_turn`(历史从日志派生,不由调用方携带) | `host/src/lib.rs:47` |
+| **Agent Loop** | 无状态的推理循环:调 LLM → 解析响应 → 执行工具 → 把工具结果喂回 → 直到结束或超限;经注入的 `persist` 回调逐事件落盘 | `core/src/agent_loop.rs` |
 | **Tool** | 一个带 JSON Schema 参数、风险等级、执行闭包的函数,LLM 可主动调用 | `core/src/types/tool.rs`(`ToolDefinition`) |
 | **Hook** | 围绕每次工具调用的拦截器:`before_tool_call` 可 Allow/Block/Modify,`after_tool_call` 可改写结果(如脱敏) | `core/src/types/tool.rs`(`HookChain`) |
 | **Provider** | 一个实现了 `StreamFn` 的 LLM 客户端;内核只认这个 trait,不认具体厂商 | `core/src/providers/mod.rs` |
-| **Compaction** | 在喂给 LLM 之前**压缩工作内存**(只缩内存,不改盘),避免上下文溢出 | `host/src/compact.rs`(`ContextBudget`) |
-| **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS | `gasket-gateway/src/ws.rs` |
+| **Compaction** | 在喂给 LLM 之前**压缩工作内存**(只缩内存、日志仍是 append-only 全量);预算从日志尾部恢复 | `host/src/compact.rs`(`ContextBudget`) |
+| **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS;历史按需从日志 `derive_messages` | `gasket-gateway/src/ws.rs` |
 
 ---
 
@@ -105,42 +108,51 @@ gasket 有两条入口路径,但都汇聚到同一个 `Host::run_turn` → `run_
 
 ### 4.1 共同内核:`run_turn`
 
-`Host::run_turn(user_msg, history, on_event)`(`host/src/lib.rs:142`)是整条流水线的枢纽:
+`Host::run_turn(user_msg, on_event)`(`host/src/lib.rs:183`)是整条流水线的枢纽。**历史不从调用方传入**——它由日志派生,磁盘 `events.jsonl` 是唯一真相源:
 
 ```
-run_turn(user_msg, history, on_event)
+run_turn(user_msg, on_event)
    │
-   1. cfg.prepare_turn(TurnInputs{ system_prompt, history, tools, cwd, session_id },
-                        signal, hooks, stream_fn, max_turns)
-        └─ 组装出 (AgentContext, AgentLoopConfig)
+   1. session.open_or_migrate(sid)        ← 读 events.jsonl(必要时迁移旧 messages.jsonl)
+      session.append_event(TurnStart)     ← 框定本轮开始
+      session.append_event(User)          ← 用户消息先于循环落盘
    │
-   2. run_agent_loop(vec![user_msg], context, config, on_event)
-        └─ 无状态推理循环(见 4.3),on_event 实时回调每个 AgentEvent
+   2. history = derive_messages(events)   ← 纯投影:事件日志 → 模型可见消息
+      budget 从日志尾部恢复(最后一条 Assistant 的 usage.input_tokens)
+      history = budget.compact(&history)  ← 只缩内存;日志仍是 append-only 全量
    │
-   3. 仅当成功: session.append(new_msgs)  ← 失败的 run 不写任何部分 transcript
+   3. cfg.prepare_turn(TurnInputs{ system_prompt, history, tools, cwd, session_id },
+                        signal, hooks, stream_fn, max_turns, Some(session.persist_fn()))
+        └─ persist 回调注入 AgentLoopConfig.persist(context.rs:68);逐事件同步落盘
    │
-   └─ 返回这一轮新增的 AgentMessage 列表(调用方把它 extend 进自己的 history)
+   4. run_agent_loop(vec![user], context, config, on_event)
+        └─ 无状态推理循环(见 4.3)。persist 按崩溃安全序调用:
+           Assistant(含 usage) 先于其中任何工具执行落盘;每个 ToolResult 定稿后即落盘
+   │
+   5. session.append_event(TurnEnd{reason})   ← 成功 / 失败 / 中止皆落盘(永远不静默半截对话)
+   │
+   └─ 返回 TurnSummary{ reason, new_messages }(reason: Completed / Aborted{cause} / Error{message})
 ```
 
-关键不变量:**`history` 是调用方拥有的 transcript**,`run_turn` 只把它 clone 进本次 context;**磁盘 JSONL 只在成功时追加**——失败不留下半截对话。
+关键不变量:**`history` 每轮从日志现派生**(`derive_messages`),调用方不再持有一份内存 transcript;**磁盘是逐事件追加**——已发生的副作用(助手消息、工具结果)在它们发生时就落盘,崩溃 / 失败 / 取消的轮次仍保有其已经发生的全部事实。`persist: None` 路径(裸 `agent_loop` / 既有测试)不落盘,行为与之前逐字节一致。
 
 ### 4.2 路径 A:CLI REPL
 
 ```
 用户在终端敲一行
-   │  Reedline 读行 (cli/src/main.rs:105)
+   │  Reedline 读行 (cli/src/main.rs:103)
    ▼
 若是 / 开头 → 斜杠命令 (/mode /resume /clear /sessions /reload-tools)
-否则构造 UserMessage
-   │  压缩检查: budget.needs_compaction() ? budget.compact(&history) : history   (cli/src/main.rs:119)
+否则:
+   │  工作历史与压缩都在 run_turn 内部从日志现派生
+      (cli/src/main.rs:115 起的 host.run_turn 调用)
    ▼
-host.run_turn(user_msg, &history, |ev| {
+host.run_turn(user_msg, |ev| {
      printer.on_event(&ev);                       ← 终端实时渲染
-     从 AfterProviderResponse 提取 usage.input_tokens → budget.record_input_tokens(...)
 })
-   │
+   │  ← persist 回调逐事件落盘(events.jsonl);usage 随 Assistant 事件持久化
    ▼
-history.extend(new_msgs)   ← 内存 transcript 更新;磁盘已是 append-only
+(日志即真相源:CLI 不再维护内存 transcript)
 ```
 
 ### 4.3 内核循环:`run_agent_loop` 单轮结构
@@ -158,6 +170,7 @@ for turn in 0..max_turns {                       ← 外层循环,受 GASKET_MAX
         ThinkingDelta  → on_event(思考过程)
         Usage{in,out}  → 记录用量
         Done / Error   → 结束本turn
+    persist(SessionEvent::Assistant{message, usage})   ← 崩溃安全:先于本消息内任何工具执行(agent_loop.rs:64)
 
     若 stop_reason == ToolUse 且未超 max_tool_calls_per_turn:
         for each tool_call:
@@ -166,6 +179,7 @@ for turn in 0..max_turns {                       ← 外层循环,受 GASKET_MAX
             match verdict:
                 Allow/Modify → execute(tool) → after_tool_call(result) → 追加 ToolResult
                 Block        → 追加带 reason 的 ToolResult(不执行)
+        (每个 ToolResult 经 record_tool_result 定稿后即 persist;落盘序 == 执行序)
         把所有 ToolResult 加入 messages,继续外层循环(再问 LLM)
 
     若 stop_reason == EndTurn → 跳出循环
@@ -204,15 +218,18 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `ContentBlock` | 消息内容块:`Text` / `ToolCall` / 图片等 | `types/message.rs` |
 | `AgentEvent` | 内核向外发出的事件流:`MessageUpdate`、`ToolExecutionStart/End`、`AfterProviderResponse`、`TurnStart`… | `types/event.rs` |
 | `ContentDelta` | 增量:`TextDelta` / `ToolCallDelta` / …(事件载荷) | `types/event.rs` |
+| `SessionEvent` | **事件日志词汇表**(每行一条):`TurnStart` / `User` / `Assistant{message,usage}` / `ToolResult` / `TurnEnd{reason}` | `types/session_event.rs:15` |
+| `TurnEndReason` / `CancelCause` | 轮次结束原因:`Completed` / `Aborted{cause}` / `Error{message}`;`CancelCause`:`User`/`Parent`/`Hook` | `types/session_event.rs:35,44` |
+| `derive_messages` | 纯投影:事件日志 → 模型可见消息(`TurnStart`/`TurnEnd` 不产出消息) | `types/session_event.rs:69` |
 | `ToolDefinition` | 工具定义:`name`/`label`/`description`/`parameters`(JSON Schema)/`risk`/`execute` | `types/tool.rs:28` |
 | `RiskLevel` | `Low` / `Medium` / `High`(默认 `High`) | `types/tool.rs:18` |
-| `HookChain` | 拦截器 trait:`before_tool_call`(async,返 verdict)+ `after_tool_call`(sync) | `types/tool.rs:138` |
-| `ToolCallVerdict` | `Allow` / `Block(reason)` / `Modify(args)` | `types/tool.rs:114` |
-| `AgentContext` | 一次 run 的输入:system_prompt、messages、tools、cwd、env、session_id | `types/context.rs:14` |
-| `AgentLoopConfig` | 一次 run 的配置:model、thinking、max_turns、max_tool_calls_per_turn、signal、**stream_fn**、hooks、retry | `types/context.rs:25` |
-| `StreamFn` | **provider 接缝**:trait,`stream(model,messages,system,tools,signal) -> Stream<StreamChunk>` | `types/context.rs:207` |
-| `StreamChunk` | provider 产出的事件:`TextDelta`/`ToolCallDelta`/`ThinkingDelta`/`Usage`/`Done`/`Error` | `types/context.rs:187` |
-| `ModelSpec` / `ProviderApi` | 模型规格 + 协议族(`OpenAiCompat` / `Anthropic`) | `types/context.rs:159,168` |
+| `HookChain` | 拦截器 trait:`before_tool_call`(async,返 verdict)+ `after_tool_call`(sync) | `types/tool.rs:154` |
+| `ToolCallVerdict` | `Allow` / `Block(reason)` / `Modify(args)` | `types/tool.rs:130` |
+| `AgentContext` | 一次 run 的输入:system_prompt、messages、tools、cwd、env、session_id | `types/context.rs:16` |
+| `AgentLoopConfig` | 一次 run 的配置:model、thinking、max_turns、max_tool_calls_per_turn、signal、**stream_fn**、hooks、retry、**persist**(注入则逐事件落盘) | `types/context.rs:43` |
+| `StreamFn` | **provider 接缝**:trait,`stream(model,messages,system,tools,signal) -> Stream<StreamChunk>` | `types/context.rs:232` |
+| `StreamChunk` | provider 产出的事件:`TextDelta`/`ToolCallDelta`/`ThinkingDelta`/`Usage`/`Done`/`Error` | `types/context.rs:212` |
+| `ModelSpec` / `ProviderApi` | 模型规格 + 协议族(`OpenAiCompat` / `Anthropic`) | `types/context.rs:184,193` |
 
 > **为什么 `HookChain` 定义在 `types` 而不是 `extension`?** 这样 `AgentLoopConfig` 能持有 `Option<Arc<dyn HookChain>>` 而**不引入循环依赖**(concrete 实现是 `ExtensionApiImpl`)。
 
@@ -248,7 +265,18 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ### 5.5 存储(`storage/`)
 
-`JsonlStorage`:会话存为 JSONL(每行一条 `AgentMessage`)。亮点是 **torn-tail 自愈**——最后一行解析失败(进程崩溃截断)会自动丢弃并截断文件;中间行损坏才报错带行号,从而区分"崩溃产物"和"真实损坏"。
+两层存储并存:
+
+- **`EventStorage`**(主,`storage/mod.rs:315`):会话存为 `events.jsonl`,每行一条 `SessionEvent`,由 `run_turn` 逐事件追加。写纪律:单次 `O_APPEND` 句柄 + 单次 `write_all` 的 `line\n`(`append_event` / `append_event_sync`);同步版本供 agent loop 的 `persist` 回调直接调用,无需桥接异步运行时。
+- **`JsonlStorage`**(遗留,`storage/mod.rs:65`):旧 `messages.jsonl`,每行一条 `AgentMessage`。仅作为迁移源被读取(`load_messages`),迁移后删除;格式契约与 torn-tail 行为冻结不变。
+
+**Torn-tail 自愈 + fail-closed**(`scan_jsonl`,`storage/mod.rs:217`):
+
+- 最后一行解析失败(进程崩溃截断 = `Syntax`/`Eof`)→ 当作 torn tail 丢弃并截断文件,使后续追加落在干净数据之后(崩溃产物,非数据损坏)。
+- 中间行损坏 → 报错带**文件 + 行号**(位腐 / 外部编辑 = 真实损坏)。
+- `EventStorage.load_events` 额外开启 `fail_closed_on_data`:一条**完整**但 `type` 不匹配任何已知 `SessionEvent` 变体的行(`serde_json::error::Category::Data`)→ 加载失败带行号(版本错位,绝不当 torn tail 抹掉)。
+
+**原子批量安装**(`append_events_atomic`,`storage/mod.rs:451`):整批先写 `events.jsonl.tmp` → `sync_all` → `rename`(POSIX 原子)。专用于**迁移**:旧 `messages.jsonl` 经 `SessionManager::open_or_migrate` 一次性包裹、原子写入 `events.jsonl`,成功后才 `delete_legacy` 删旧文件——崩溃要么只留 `.tmp`(下次重迁),要么 `events.jsonl` 已完整。详见 [ADR 0001](./adr/0001-event-sourced-session-log.md)。
 
 ---
 
@@ -256,9 +284,9 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 宿主层把内核的"无状态循环"包装成一个有状态、可复用的驱动器,目录 `host/src/`。
 
-### 6.1 `Host` 编排器(`lib.rs:43`)
+### 6.1 `Host` 编排器(`lib.rs:47`)
 
-`Host` 持有:配置 `HostConfig`、会话 `SessionManager`、权限策略 `Arc<PermissionPolicy>`、hook 链、协作中止信号 `Arc<AtomicBool>`、注入的 `stream_fn`、系统提示、工具列表、cwd、max_turns。
+`Host` 持有:配置 `HostConfig`、会话 `SessionManager`、权限策略 `Arc<PermissionPolicy>`、hook 链、协作中止信号 `Arc<AtomicBool>`、注入的 `stream_fn`、系统提示、工具列表、cwd、max_turns,以及压缩旋钮 `budget`(token 计数本身**不**留在 Host——每轮从日志尾部恢复,故 token 感知压缩跨重启存活)。
 
 设计要点:
 
@@ -272,7 +300,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | 模块 | 职责 | 关键导出 |
 |---|---|---|
 | `config.rs` | 从 env 读取并组装 `HostConfig`(`ProviderConfig` + `AgentTunables` + system prompt + cwd),产出 `TurnInputs` | `ConfigLoader` / `HostConfig` / `TurnInputs` |
-| `session.rs` | 会话 CRUD、列出、恢复(`resume`/`resume_last`)、append、clear;落盘 JSONL | `SessionManager` / `SessionInfo` |
+| `session.rs` | 会话 CRUD、列出、恢复(`resume`/`resume_last`)、事件追加、`open_or_migrate`(读 events.jsonl,首次打开迁移旧 messages.jsonl,失败 fail-closed)、clear(uuid 轮换);持有 `EventStorage` | `SessionManager` / `SessionInfo` |
 | `permission.rs` | 权限策略:三档 `Mode` × 工具 `RiskLevel` 决策,内部持 approver 回调 | `Mode` / `PermissionPolicy` |
 | `hooks.rs` | 把多个 `HookChain` 串成栈;`before` 取首个 Block / 末个 Modify,`after` 链式改写 | `HookStack` |
 | `compact.rs` | 上下文压缩(见第 9 章) | `ContextBudget` / `compact_by_count` |
@@ -280,7 +308,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `mcp.rs` | MCP(Model Context Protocol)客户端:连接外部 MCP 工具服务器(stdio),握手 → tools/list → tools/call | `McpBridge` / `load_all_mcp` / `McpServerConfig` |
 | `printer.rs` | 把 `AgentEvent` 渲染到终端(含 Error 分支与 flush) | `EventPrinter` |
 
-### 6.3 `install_ctrl_c`(`lib.rs:174`)
+### 6.3 `install_ctrl_c`(`lib.rs:312`)
 
 安装一个 SIGINT 处理器,把共享 `signal` 置位(协作式中止)。在 cooked tty 模式下流式输出中的 `Ctrl-C` 会被它捕获;在 prompt 行(raw 模式)下 `Ctrl-C` 是 reedline 的按键事件,不触发这里。
 
@@ -298,9 +326,11 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | 路由 | 方法 | 作用 |
 |---|---|---|
 | `/ws` | GET(升级 WS) | WebSocket 连接入口,每连接一会话 |
+| `/api/sessions` | GET | 列出磁盘上所有会话(id / 消息数 / mtime),不依赖活跃 WS 连接 |
 | `/api/commands` | GET | 斜杠命令列表(供前端补全) |
 | `/api/sessions/{key}/context` | GET | 上下文统计(token 占用、压缩标志、水印) |
-| `/api/sessions/{key}/context/compact` | POST | 手动触发压缩 |
+| `/api/sessions/{key}/context/compact` | POST | 手动触发压缩(现已在 `run_turn` 内每轮从日志现算,此端点保留为前端兼容,返回最新统计) |
+| `/api/sessions/{key}/messages` | GET | **后端真相端点(D3)**:对磁盘 `events.jsonl` 跑 `derive_messages`(必要时迁移旧文件);未知 key→404,损坏日志→500 |
 | *(fallback)* | — | 托管 `web/dist` 静态资源,SPA 回退到 `index.html` |
 
 - 端口 `GASKET_GATEWAY_PORT`(默认 **3000**),监听 `0.0.0.0`;静态目录 `GASKET_GATEWAY_STATIC_DIR`(默认 `../web/dist`);CORS 放开。
@@ -367,7 +397,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | **AutoEdit** | 自动放行 | 提示审批 | 提示审批 |
 | **FullAuto** | 自动放行 | 自动放行 | 自动放行 |
 
-审批入口:CLI 经 `stdin_approver`(`cli/src/main.rs:142`,stdin 读挪到 blocking 池避免卡 tokio worker);gateway 经 WS `approval_request`/`approval_response` 往返。
+审批入口:CLI 经 `stdin_approver`(`cli/src/main.rs:129`,stdin 读挪到 blocking 池避免卡 tokio worker);gateway 经 WS `approval_request`/`approval_response` 往返。
 
 ---
 
@@ -375,7 +405,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 压缩是**纯宿主策略**(`host/src/compact.rs`),目的是在喂给 LLM 前缩小工作 transcript。三个硬约束:
 
-1. **只缩内存,不改盘**——`~/.gasket/sessions/*.jsonl` 始终是 append-only 全量记录,压缩只作用于本次喂给 LLM 的 `history`。
+1. **只缩内存,不改盘**——`~/.gasket/sessions/<id>/events.jsonl` 始终是 append-only 事件日志,压缩只作用于本次喂给 LLM 的 `history`(每轮现派生)。
 2. **无 LLM 摘要**——不调用模型做总结,只做"丢弃最旧的若干组 + 前置一条 `[compacted N earlier messages]` 提示"。
 3. **永不切断 tool_call ↔ result**——见 `atomic_groups`。
 
@@ -387,14 +417,14 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 | 模式 | 触发 | 实现 |
 |---|---|---|
-| **Token 感知(主)** | provider 上报的 `usage.input_tokens` 超过 `window` 的 `threshold_pct`(默认 80%)时触发;压缩后留到 `target_pct`(默认 50%)——**带滞后**,避免在阈值附近反复压缩 | `ContextBudget`(`compact.rs:119`) |
-| **条数兜底** | 当尚无 usage 数据(`last_input_tokens==0`)时,按消息条数 `GASKET_COMPACT_MAX_MESSAGES`(默认 80)压缩 | `compact_by_count`(`compact.rs:55`) |
+| **Token 感知(主)** | provider 上报的 `usage.input_tokens` 超过 `window` 的 `threshold_pct`(默认 80%)时触发;压缩后留到 `target_pct`(默认 50%)——**带滞后**,避免在阈值附近反复压缩 | `ContextBudget`(`compact.rs:178`) |
+| **条数兜底** | 当尚无 usage 数据(`last_input_tokens==0`)时,按消息条数 `GASKET_COMPACT_MAX_MESSAGES`(默认 80)压缩 | `compact_by_count`(`compact.rs:56`) |
 
 `ContextBudget::compact` 在超阈值时,按 `target = messages.len() * target_pct / 100` 算出保留消息数,复用 `compact_by_count`(贪心保留最新整组 + 前置提示)。**一套算法,两个触发器**:token 感知(主)和条数兜底。无 tokenizer,不假装建模 per-message token 成本。
 
-### 9.3 数据来源
+### 9.3 数据来源:从日志恢复预算
 
-`usage.input_tokens` 由调用方从 `AgentEvent::AfterProviderResponse` 里提取,经 `ContextBudget::record_input_tokens` 喂入(CLI 在 `run_turn` 的 `on_event` 闭包里做,gateway 在 per-turn 处理里做)。这正是 commit `0ba96fc` 计划文档 "context-compaction" 落地的核心:用 provider 真实 usage 替代估算。
+`usage.input_tokens` 随 `SessionEvent::Assistant { usage }` **持久化进事件日志**。`run_turn` 每轮从日志尾部恢复预算(最后一条 `Assistant` 事件的 `usage.input_tokens`,经 `ContextBudget::record_input_tokens` 喂入),再对 `derive_messages` 出的 `history` 跑 `compact`。因此 token 感知压缩**跨重启存活**——重启不再丢失 usage、退化成条数兜底。预算计数本身不留在 `Host`(见 §6.1)。这正是 commit `0ba96fc` 计划文档 "context-compaction" 的延伸:用 provider 真实 usage 替代估算,且让该 usage 持久化。
 
 ---
 
@@ -521,11 +551,11 @@ src/
 |---|---|
 | **`stream_fn` 依赖注入** | agent loop 与具体 LLM 彻底解耦,测试用 `MockStream` 注入 canned chunk 序列(`agent_loop.rs` 测试)即可,不必打真实网络 |
 | **事件 vs hook 类型分离** | 观察与控流不可混淆:事件只 emit、hook 返 verdict。类型层强制,杜绝误用 |
-| **持久化仅在成功时** | 失败的 run 不写部分 transcript,避免磁盘上出现"半截对话"污染下次上下文 |
-| **JSONL torn-tail 自愈** | 进程崩溃常留下半行;按"末行坏=截断它、中行坏=报错"区分崩溃产物与真实损坏 |
+| **事件溯源日志(逐事件追加)** | 副作用先于轮次完成落盘:崩溃 / 失败 / 取消的轮次仍保有已发生的全部事实(助手消息 + 工具结果)。`Assistant` 先于其中任何工具执行持久化(崩溃安全);`TurnEnd{reason}` 总是落盘。详见 [ADR 0001](./adr/0001-event-sourced-session-log.md) |
+| **JSONL torn-tail 自愈 + fail-closed** | 末行解析失败 = 崩溃截断 → 丢弃并截断;中行损坏 = 真实损坏 → 报错带行号。事件日志额外 fail-closed:未知 `type` 变体(版本错位)→ 加载失败带行号,绝不当 torn tail 抹掉 |
 | **审批双通道取消** | `AtomicBool` 驱动 loop 中止 + `watch` channel 解锁挂起审批,防止取消后闩锁毒化 |
 | **前端壳不 IPC** | Tauri 桌面端不定义 command、不分支,整套前端就是一个 PWA 风格客户端经 WS/HTTP 连后端——一套代码、零分支成本 |
-| **压缩只缩内存不改盘** | 全量 JSONL 永远是真相源;工作内存压缩有损但不破坏 protocol(原子组保护 tool_call↔result) |
+| **压缩只缩内存、不改盘;预算从日志恢复** | append-only 事件日志永远是真相源;工作内存压缩有损但不破坏 protocol(原子组保护 tool_call↔result)。`usage` 随 `Assistant` 事件持久化,token 预算每轮从日志尾部恢复,跨重启存活 |
 
 ---
 
