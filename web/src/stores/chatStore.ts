@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import { fetchSessionList } from '@/lib/backend';
+import { deleteSession, fetchSessionList, renameSession } from '@/lib/backend';
 import { readJSON, storageKeys, writeJSON } from '@/lib/storage';
 import type { Chat, Message, MessageStatus, SubagentState } from '@/types';
 
@@ -65,11 +65,15 @@ export const useChatStore = defineStore('chat', () => {
   };
 
   const deleteChat = (id: string) => {
-    // No backend delete endpoint — hidden ids are filtered out of every
-    // sync, so a "deleted" chat stays off the list even though its
-    // events.jsonl remains on disk.
-    hiddenIds.value.add(id);
-    writeJSON(storageKeys.hiddenSessions, [...hiddenIds.value]);
+    // Backend delete is authoritative; when the gateway is unreachable (or
+    // too old to have the endpoint) fall back to the local hidden list so
+    // the session stays off the list after the next sync.
+    deleteSession(id).then(ok => {
+      if (!ok) {
+        hiddenIds.value.add(id);
+        writeJSON(storageKeys.hiddenSessions, [...hiddenIds.value]);
+      }
+    });
     chats.value = chats.value.filter(c => c.id !== id);
     if (activeChatId.value === id) {
       activeChatId.value = chats.value.length > 0 ? chats.value[0].id : '';
@@ -85,8 +89,14 @@ export const useChatStore = defineStore('chat', () => {
 
   const renameChat = (id: string, name: string) => {
     const chat = chats.value.find(c => c.id === id);
-    if (chat) {
-      chat.name = name.trim();
+    const trimmed = name.trim();
+    if (chat && trimmed) {
+      chat.name = trimmed;
+      // Persist backend-side so the name survives devices and localStorage
+      // loss; a failure just means the name stays local-only.
+      renameSession(id, trimmed).then(ok => {
+        if (!ok) console.warn('Failed to sync session name to backend:', id);
+      });
     }
   };
 
@@ -278,10 +288,13 @@ export const useChatStore = defineStore('chat', () => {
         const existing = chats.value.find(c => c.id === s.id);
         if (existing) {
           existing.updatedAt = Math.max(existing.updatedAt, s.mtime || 0);
+          // A backend-side name (renamed on any device) wins; otherwise the
+          // local name stands.
+          if (s.name) existing.name = s.name;
         } else {
           chats.value.push({
             id: s.id,
-            name: `Session (${s.msg_count} msgs)`,
+            name: s.name || `Session (${s.msg_count} msgs)`,
             messages: [],
             updatedAt: s.mtime || Date.now(),
           });

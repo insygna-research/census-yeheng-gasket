@@ -147,7 +147,7 @@ pub(crate) async fn get_messages(
     }
 }
 
-/// List all sessions on disk (id, msg_count, mtime). Does NOT depend on
+/// List all sessions on disk (id, msg_count, mtime, name). Does NOT depend on
 /// active WS connections — reads the JSONL store directly. Used by the
 /// frontend to discover sessions created by the CLI or other devices.
 pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -160,6 +160,7 @@ pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Va
                 "sessions": sessions.iter().map(|s| json!({
                     "id": s.id,
                     "msg_count": s.msg_count,
+                    "name": s.name,
                     "mtime": s.mtime
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -174,12 +175,88 @@ pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Va
     }
 }
 
+/// Rename a session: persist the display name in the session's `meta.json`
+/// sidecar. Creates the session directory if needed, so a chat can be named
+/// before its first turn lands on disk. 400 on an unsafe id or bad name.
+pub(crate) async fn rename_session(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = session_key(&key);
+    if !gasket_core::is_valid_session_id(key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid session id" })),
+        )
+            .into_response();
+    }
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if name.is_empty() || name.chars().count() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name must be 1..=200 chars" })),
+        )
+            .into_response();
+    }
+    let storage = gasket_core::EventStorage::new(state.store_root.clone());
+    let meta = gasket_core::SessionMeta {
+        name: Some(name.to_string()),
+    };
+    match storage.write_meta(key, &meta).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Delete a session's on-disk data wholesale (event log + meta sidecar).
+/// Refuses while a live WS connection holds the session (409) — deleting
+/// under a running turn would silently restart its log. Unknown key -> 404.
+pub(crate) async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let key = session_key(&key);
+    if !gasket_core::is_valid_session_id(key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid session id" })),
+        )
+            .into_response();
+    }
+    if state.sessions.contains_key(key) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "session has an active connection" })),
+        )
+            .into_response();
+    }
+    let storage = gasket_core::EventStorage::new(state.store_root.clone());
+    match storage.remove_session(key).await {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown session: {key}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{delete, get, put};
     use axum::Router;
     use dashmap::DashMap;
     use gasket_core::types::message::{ContentBlock, UserMessage};
@@ -200,9 +277,12 @@ mod tests {
         })
     }
 
-    fn messages_router(state: Arc<AppState>) -> Router {
+    fn api_router(state: Arc<AppState>) -> Router {
         Router::new()
+            .route("/api/sessions", get(list_sessions))
             .route("/api/sessions/{key}/messages", get(get_messages))
+            .route("/api/sessions/{key}/name", put(rename_session))
+            .route("/api/sessions/{key}", delete(delete_session))
             .with_state(state)
     }
 
@@ -224,7 +304,7 @@ mod tests {
             .await
             .unwrap();
 
-        let app = messages_router(test_state(tmp.path().to_path_buf()));
+        let app = api_router(test_state(tmp.path().to_path_buf()));
         // Frontend-style prefixed key exercises the prefix stripping.
         let res = app
             .oneshot(get_uri("/api/sessions/websocket:sess-1/messages"))
@@ -243,9 +323,99 @@ mod tests {
     #[tokio::test]
     async fn messages_unknown_session_is_404() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = messages_router(test_state(tmp.path().to_path_buf()));
+        let app = api_router(test_state(tmp.path().to_path_buf()));
         let res = app
             .oneshot(get_uri("/api/sessions/never-existed/messages"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rename_then_list_shows_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = EventStorage::new(tmp.path().to_path_buf());
+        storage
+            .append_event("sess-1", &user_event("hello"))
+            .await
+            .unwrap();
+
+        let app = api_router(test_state(tmp.path().to_path_buf()));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/sessions/sess-1/name")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Release notes"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app.oneshot(get_uri("/api/sessions")).await.unwrap();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["sessions"][0]["id"], "sess-1");
+        assert_eq!(v["sessions"][0]["name"], "Release notes");
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_empty_and_overlong_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = api_router(test_state(tmp.path().to_path_buf()));
+        for body in [r#"{"name":"  "}"#, r#"{"name":""}"#, r#"{"other":1}"#] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/sessions/sess-1/name")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = EventStorage::new(tmp.path().to_path_buf());
+        storage
+            .append_event("sess-1", &user_event("hello"))
+            .await
+            .unwrap();
+
+        let app = api_router(test_state(tmp.path().to_path_buf()));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sessions/sess-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!storage.has_events("sess-1"));
+
+        // Second delete is an honest 404, not a silent success.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/sessions/sess-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);

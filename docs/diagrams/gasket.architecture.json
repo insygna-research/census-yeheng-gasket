@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "gasket 分层架构",
+    "quality_profile": "showcase",
+    "viewBox": [1180, 560],
+    "repository": { "url": "https://github.com/YeHeng/gasket", "revision": "47dc12231b38c455f3c1f8ed90baa683509bfb51" },
+    "views": [
+      { "id": "request-path", "label": "请求主路径", "focus": ["web", "gateway", "host", "core", "llm"], "note": "从前端到 LLM 的完整请求链。" },
+      { "id": "dual-shell", "label": "双前端壳", "focus": ["cli", "gateway", "host"], "note": "CLI 与 gateway 共用同一套 host 驱动器。" },
+      { "id": "core-ext", "label": "内核与扩展", "focus": ["core", "ext", "storage"], "note": "core 是纯内核,ext 启动时注册工具与 Hook。" }
+    ]
+  },
+  "components": [
+    { "id": "web", "type": "frontend", "label": "Web 前端", "sublabel": "Vue 3 + Tauri · 浏览器/桌面同源", "pos": [440, 50], "size": [170, 56] },
+    { "id": "gateway", "type": "backend", "label": "gasket-gateway", "sublabel": "WebSocket :3000 · REST · 静态托管", "pos": [440, 150], "size": [170, 60], "sources": [{ "path": "gasket/gasket-gateway/src/ws.rs", "label": "ws.rs" }] },
+    { "id": "cli", "type": "backend", "label": "gasket-cli", "sublabel": "交互式 REPL · 斜杠命令", "pos": [740, 150], "size": [150, 60], "sources": [{ "path": "gasket/gasket-cli/src/main.rs", "label": "main.rs" }] },
+    { "id": "host", "type": "backend", "label": "gasket-host", "sublabel": "会话 · 权限 · Hook · 压缩 · MCP", "pos": [440, 258], "size": [170, 68], "sources": [{ "path": "gasket/gasket-host/src/lib.rs", "line": 47, "label": "Host::new" }] },
+    { "id": "storage", "type": "database", "label": "events.jsonl", "sublabel": "~/.gasket/sessions 事件日志", "pos": [120, 258], "size": [170, 60], "sources": [{ "path": "gasket/gasket-core/src/storage/mod.rs", "line": 315, "label": "EventStorage" }] },
+    { "id": "core", "type": "backend", "label": "gasket-core", "sublabel": "agent_loop · 内置工具 · providers", "pos": [440, 372], "size": [170, 68], "tag": "无内部依赖", "sources": [{ "path": "gasket/gasket-core/src/agent_loop.rs", "label": "agent_loop" }] },
+    { "id": "ext", "type": "backend", "label": "gasket-ext", "sublabel": "可选: hello · todo · search", "pos": [740, 372], "size": [150, 60], "sources": [{ "path": "gasket/gasket-ext/src/lib.rs", "label": "register_all" }] },
+    { "id": "llm", "type": "external", "label": "LLM Provider", "sublabel": "OpenAI 兼容 / Anthropic · SSE", "pos": [740, 258], "size": [150, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Rust Cargo Workspace", "wraps": ["gateway", "cli", "host", "core", "ext"] }
+  ],
+  "connections": [
+    { "id": "web-gateway", "from": "web", "to": "gateway", "label": "WebSocket + REST", "variant": "emphasis", "labelAt": [525, 120] },
+    { "id": "gateway-host", "from": "gateway", "to": "host", "label": "run_turn(on_event)", "labelAt": [525, 224] },
+    { "id": "cli-host", "from": "cli", "to": "host", "label": "run_turn" },
+    { "id": "host-core", "from": "host", "to": "core", "label": "run_agent_loop", "variant": "emphasis", "labelAt": [525, 340] },
+    { "id": "core-llm", "from": "core", "to": "llm", "label": "StreamFn · SSE", "labelAt": [675, 315] },
+    { "id": "host-storage", "from": "host", "to": "storage", "label": "会话事件 append-only", "fromSide": "left", "toSide": "right", "labelAt": [416, 340] },
+    { "id": "ext-core", "from": "ext", "to": "core", "label": "register 工具/Hook", "variant": "dashed", "fromSide": "left", "toSide": "right", "labelAt": [675, 460] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "内核哲学", "items": ["loop 是无状态纯函数,状态由 host 持有", "provider 经 StreamFn 依赖注入,内核不认具体厂商", "扩展用进程内 crate 注册工具与 Hook"] },
+    { "dot": "emerald", "title": "分层复用", "items": ["同一套 host::run_turn 既驱动 CLI 也驱动 gateway", "core 无内部依赖,是接缝最少的纯内核", "gateway / cli 是两种前端壳,共用 host"] },
+    { "dot": "amber", "title": "事件溯源", "items": ["events.jsonl 逐事件追加,磁盘是唯一真相源", "history 每轮从日志现派生,调用方不持有 transcript", "Tauri 桌面端不经 IPC,仍经 WS 连接 gateway"] }
+  ]
+}

@@ -1,16 +1,22 @@
+import { invoke } from '@tauri-apps/api/core';
+import { isTauri } from '@/lib/platform';
 import type { Message, ToolCall } from '@/types';
 
 /**
- * Backend gateway access layer.
- * The gateway (events.jsonl on disk) is the authoritative message store;
- * the frontend hydrates from here instead of persisting full transcripts
- * in localStorage.
+ * Session storage access layer.
+ * The on-disk event log (`~/.gasket/sessions`) is the authoritative message
+ * store; the frontend hydrates from here instead of persisting full
+ * transcripts in localStorage.
+ *
+ * Dual channel: inside the Tauri desktop shell the session API runs as
+ * native commands (self-contained app); in a plain browser (dev) it falls
+ * back to the gateway's HTTP endpoints.
  */
 
 export const backendBaseUrl = (): string =>
   import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
-/** Session keys on the wire carry a `websocket:` prefix the gateway strips. */
+/** Session keys on the HTTP wire carry a `websocket:` prefix the gateway strips. */
 export const sessionKey = (chatId: string): string =>
   encodeURIComponent(`websocket:${chatId}`);
 
@@ -18,12 +24,50 @@ export interface BackendSessionInfo {
   id: string;
   msg_count: number;
   mtime: number;
+  /** Display name from the session's meta sidecar; null when never renamed. */
+  name?: string | null;
 }
 
 export async function fetchSessionList(): Promise<BackendSessionInfo[]> {
+  if (isTauri) {
+    return invoke<BackendSessionInfo[]>('list_sessions');
+  }
   const res = await fetch(`${backendBaseUrl()}/api/sessions`);
   const data = await res.json();
   return data.sessions || [];
+}
+
+/** Persist the display name backend-side (meta.json sidecar). */
+export async function renameSession(chatId: string, name: string): Promise<boolean> {
+  try {
+    if (isTauri) {
+      await invoke('rename_session', { id: chatId, name });
+      return true;
+    }
+    const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}/name`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Delete the session's on-disk data. False when the request failed. */
+export async function deleteSession(chatId: string): Promise<boolean> {
+  try {
+    if (isTauri) {
+      return await invoke<boolean>('delete_session', { id: chatId });
+    }
+    const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ── Message mapping ─────────────────────────────────────────
@@ -113,11 +157,16 @@ export function mapBackendMessages(list: BackendMessage[]): Message[] {
 
 /**
  * Fetch the persisted transcript for a session.
- * Returns null when the session does not exist on the backend (404) or the
- * request fails — callers keep their local state in that case.
+ * Returns null when the session has no on-disk data (a local-only chat) or
+ * the request fails — callers keep their local state in that case.
  */
 export async function fetchSessionMessages(chatId: string): Promise<Message[] | null> {
   try {
+    if (isTauri) {
+      const list = await invoke<unknown[] | null>('get_session_messages', { id: chatId });
+      if (!list || list.length === 0) return null;
+      return mapBackendMessages(list as Parameters<typeof mapBackendMessages>[0]);
+    }
     const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}/messages`);
     if (!res.ok) return null;
     const list = await res.json();

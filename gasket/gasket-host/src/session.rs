@@ -18,6 +18,8 @@ pub struct SessionInfo {
     pub id: String,
     pub mtime: SystemTime,
     pub msg_count: usize,
+    /// Display name from the session's `meta.json` sidecar, if any.
+    pub name: Option<String>,
 }
 
 /// Cursor semantics: `new()` generates the initial `current_id`; only
@@ -201,9 +203,10 @@ impl SessionManager {
                 Err(_) => 0,
             };
             out.push(SessionInfo {
-                id,
+                id: id.clone(),
                 mtime,
                 msg_count,
+                name: self.storage.load_meta(&id).await.and_then(|m| m.name),
             });
         }
         Ok(out)

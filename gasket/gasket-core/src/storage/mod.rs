@@ -305,6 +305,14 @@ async fn repair_torn_tail(path: &Path, keep_until: usize) -> Result<(), AgentErr
     Ok(())
 }
 
+/// User-facing session metadata (the `meta.json` sidecar). Purely additive:
+/// every field is optional so older readers ignore newer fields.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Append-only JSONL session event store: `events.jsonl`, one
 /// [`SessionEvent`] per line, written with the same discipline (one
 /// `O_APPEND` handle, single `write_all` of `line\n`) and read with the same
@@ -500,6 +508,51 @@ impl EventStorage {
         match tokio::fs::remove_file(self.messages_path(session_id)).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Path to a session's `meta.json` sidecar (user-facing metadata such as
+    /// the display name), next to `events.jsonl`.
+    pub fn meta_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("meta.json")
+    }
+
+    /// Load the session's metadata sidecar. A missing or unreadable file is
+    /// not an error — metadata is optional decoration, never transcript data.
+    pub async fn load_meta(&self, session_id: &str) -> Option<SessionMeta> {
+        if !is_valid_session_id(session_id) {
+            return None;
+        }
+        let bytes = tokio::fs::read(self.meta_path(session_id)).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Persist session metadata (tmp + rename, the same crash discipline as
+    /// [`append_events_atomic`](Self::append_events_atomic)). Creates the
+    /// session directory if missing, so a session can be named before its
+    /// first turn lands on disk.
+    pub async fn write_meta(&self, session_id: &str, meta: &SessionMeta) -> Result<(), AgentError> {
+        validate_session_id(session_id)?;
+        let dest = self.meta_path(session_id);
+        let tmp = self.session_dir(session_id).join("meta.json.tmp");
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut payload = serde_json::to_vec(meta)?;
+        payload.push(b'\n');
+        tokio::fs::write(&tmp, payload).await?;
+        tokio::fs::rename(&tmp, &dest).await?;
+        Ok(())
+    }
+
+    /// Remove the session directory wholesale (event log, legacy transcript,
+    /// meta sidecar). Returns `Ok(false)` when the session never existed.
+    pub async fn remove_session(&self, session_id: &str) -> Result<bool, AgentError> {
+        validate_session_id(session_id)?;
+        match tokio::fs::remove_dir_all(self.session_dir(session_id)).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
@@ -930,5 +983,53 @@ mod tests {
         store.append_events_atomic("s1", &events).await.unwrap();
         assert_eq!(store.load_events("s1").await.unwrap(), events);
         assert!(!dir.join("events.jsonl.tmp").exists());
+    }
+
+    // ── Session meta sidecar & removal ────────────────────────
+
+    #[tokio::test]
+    async fn meta_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store.load_meta("s1").await.is_none());
+
+        store
+            .write_meta("s1", &SessionMeta { name: Some("My chat".into()) })
+            .await
+            .unwrap();
+        let meta = store.load_meta("s1").await.unwrap();
+        assert_eq!(meta.name.as_deref(), Some("My chat"));
+        // No staging file left behind.
+        assert!(!tmp.path().join("s1").join("meta.json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn write_meta_rejects_bad_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store
+            .write_meta("../evil", &SessionMeta::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_session_deletes_dir_and_reports_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        store
+            .append_event("s1", &SessionEvent::TurnStart)
+            .await
+            .unwrap();
+        store
+            .write_meta("s1", &SessionMeta { name: Some("x".into()) })
+            .await
+            .unwrap();
+
+        assert!(store.remove_session("s1").await.unwrap());
+        assert!(!tmp.path().join("s1").exists());
+        // A second delete reports the absence, not an error.
+        assert!(!store.remove_session("s1").await.unwrap());
+        assert!(store.remove_session("../evil").await.is_err());
     }
 }

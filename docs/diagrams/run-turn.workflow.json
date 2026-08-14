@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "run_turn 控制流",
+    "quality_profile": "showcase",
+    "viewBox": [720, 760],
+    "views": [
+      { "id": "main-path", "label": "主推理路径", "focus": ["input", "session", "stream", "consume", "endturn"], "note": "从用户输入到轮次结束的主干。" },
+      { "id": "approval-gate", "label": "工具审批门", "focus": ["consume", "gate", "execute"], "note": "工具调用前的 Hook 审批与执行。" },
+      { "id": "persist", "label": "事件落盘", "focus": ["execute", "persist"], "note": "工具结果逐事件追加写入日志。" }
+    ]
+  },
+  "lanes": [
+    { "id": "entry", "label": "入口" },
+    { "id": "host", "label": "宿主 run_turn" },
+    { "id": "loop", "label": "推理循环 agent_loop" },
+    { "id": "hook", "label": "工具 · Hook" },
+    { "id": "store", "label": "事件日志 Storage" }
+  ],
+  "phases": [
+    { "id": "setup", "label": "会话与历史", "fromCol": 0, "toCol": 1 },
+    { "id": "infer", "label": "推理 · 工具 · 落盘", "fromCol": 2, "toCol": 5, "variant": "emphasis" }
+  ],
+  "groups": [
+    { "id": "agent-loop-grp", "label": "agent loop", "lane": "loop", "fromCol": 2, "toCol": 5 },
+    { "id": "tool-gate-grp", "label": "工具与审批", "lane": "hook", "fromCol": 3, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["input", "session", "stream", "consume", "endturn"],
+  "nodes": [
+    { "id": "input", "lane": "entry", "col": 0, "type": "external", "label": "用户输入", "sublabel": "一行输入" },
+    { "id": "session", "lane": "host", "col": 1, "type": "backend", "label": "开会话·派生", "sublabel": "迁移 · 压缩", "tag": "预算从日志恢复" },
+    { "id": "stream", "lane": "loop", "col": 2, "type": "backend", "label": "调 LLM", "sublabel": "流式调用", "tag": "StreamFn 注入" },
+    { "id": "consume", "lane": "loop", "col": 3, "type": "backend", "label": "消费流", "sublabel": "累积 · 判停" },
+    { "id": "endturn", "lane": "loop", "col": 5, "type": "backend", "label": "结束轮次", "sublabel": "跳出循环" },
+    { "id": "gate", "lane": "hook", "col": 3, "type": "security", "label": "Hook 审批门", "sublabel": "拦截 · 审批", "tag": "Allow/Block/Modify" },
+    { "id": "execute", "lane": "hook", "col": 5, "type": "messagebus", "label": "执行工具", "sublabel": "内置工具" },
+    { "id": "persist", "lane": "store", "col": 4, "type": "database", "label": "事件落盘", "sublabel": "追加写日志" }
+  ],
+  "edges": [
+    { "id": "input-session", "from": "input", "to": "session", "variant": "default" },
+    { "id": "session-stream", "from": "session", "to": "stream", "label": "prepare_turn", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "drop", "labelAt": [260, 291] },
+    { "id": "stream-consume", "from": "stream", "to": "consume", "variant": "default" },
+    { "id": "consume-gate", "from": "consume", "to": "gate", "label": "ToolUse?", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "drop" },
+    { "id": "consume-endturn", "from": "consume", "to": "endturn", "label": "EndTurn", "variant": "default" },
+    { "id": "gate-execute", "from": "gate", "to": "execute", "label": "Allow/Modify", "variant": "emphasis" },
+    { "id": "execute-persist", "from": "execute", "to": "persist", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "route": "drop" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "事件溯源不变量", "items": ["Assistant(含 usage) 先于其中任何工具执行落盘", "每个 ToolResult 定稿后即落盘", "TurnEnd 无论成功 / 失败 / 中止皆落盘"] },
+    { "dot": "rose", "title": "审批 · 中止 · 循环", "items": ["before_tool_call 返回 Allow / Block / Modify", "signal 协作中止 + cancel channel 解锁审批挂起", "工具结果回喂 messages,外层 for..max_turns 再问 LLM"] },
+    { "dot": "emerald", "title": "关键函数", "items": ["Host::run_turn 是整条流水线枢纽", "derive_messages 日志 → 消息投影", "ContextBudget 预算从日志尾部恢复"] }
+  ]
+}

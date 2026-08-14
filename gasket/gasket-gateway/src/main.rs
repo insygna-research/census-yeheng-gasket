@@ -37,12 +37,15 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use dashmap::DashMap;
 use tracing::info;
 
-use crate::api::{compact_context, get_commands, get_context, get_messages, list_sessions};
+use crate::api::{
+    compact_context, delete_session, get_commands, get_context, get_messages, list_sessions,
+    rename_session,
+};
 use crate::state::AppState;
 use crate::ws::ws_handler;
 
@@ -77,6 +80,8 @@ async fn main() {
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))
         .route("/api/sessions/{key}/messages", get(get_messages))
+        .route("/api/sessions/{key}/name", put(rename_session))
+        .route("/api/sessions/{key}", delete(delete_session))
         .fallback_service(
             tower_http::services::ServeDir::new(&frontend_dist).not_found_service(
                 tower_http::services::ServeFile::new(format!("{frontend_dist}/index.html")),
