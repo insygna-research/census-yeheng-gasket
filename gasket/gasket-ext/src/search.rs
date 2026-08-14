@@ -9,6 +9,7 @@
 //! - GASKET_TAVILY_API_KEY: Tavily API key
 //! - GASKET_EXA_API_KEY: Exa API key
 //! - GASKET_FIRECRAWL_API_KEY: Firecrawl API key
+//! - GASKET_TOOL_PROXY: optional proxy (http/https/socks5/socks5h) for search traffic
 
 use std::sync::Arc;
 
@@ -512,7 +513,6 @@ where
 // ── Tool implementation ──────────────────────────────────────────────────
 
 pub fn register(api: &mut dyn ExtensionApi) {
-    let client = Arc::new(Client::new());
 
     api.register_tool(ToolDefinition {
         name: "web_search".into(),
@@ -528,8 +528,12 @@ pub fn register(api: &mut dyn ExtensionApi) {
         }),
         risk: RiskLevel::High,
         execute: Arc::new(move |ctx| {
-            let client = client.clone();
             Box::pin(async move {
+                // Built per call so the runtime tool proxy (desktop UI /
+                // GASKET_TOOL_PROXY) applies without re-registering.
+                let client = gasket_core::apply_tool_proxy(Client::builder())
+                    .build()
+                    .map_err(|e| ToolError::Message(format!("client build failed: {e}")))?;
                 let query = ctx.args["query"].as_str().unwrap_or_default();
                 let count = ctx.args["count"].as_u64().unwrap_or(5) as usize;
 
@@ -759,5 +763,104 @@ mod tests {
         assert!(!out.contains(&long), "full snippet must not appear");
         assert!(out.contains("1. **T**"));
         assert!(out.contains("https://u"));
+    }
+
+    /// Wiring proof: the tool must build its HTTP client at execute time so
+    /// the runtime tool proxy applies. A minimal in-test HTTP proxy observes
+    /// the tool's traffic. DuckDuckGo is fetched over https, so a conforming
+    /// client opens a CONNECT tunnel through the proxy (absolute-form GET
+    /// only happens for plain-http targets); the fake proxy grants the
+    /// tunnel but speaks no TLS, so the search surfaces as a tool error —
+    /// proving the request went through the proxy, never direct. The
+    /// response-parsing path is covered by the `parse_duckduckgo_html`
+    /// tests below.
+    #[tokio::test]
+    async fn web_search_goes_through_tool_proxy() {
+        use gasket_core::{ExtensionApiImpl, ToolCallCtx, ToolContext};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = String::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if head.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            // Grant the CONNECT tunnel, then close: no TLS is spoken, so a
+            // client that (incorrectly) connected directly would never reach
+            // this socket at all.
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+
+        // Mutates process env deliberately: the provider is selected at
+        // execute time. No other test in this crate reads env vars.
+        std::env::set_var("GASKET_SEARCH_PROVIDER", "duckduckgo");
+        gasket_core::set_tool_proxy(Some(&format!("http://{proxy_addr}"))).unwrap();
+
+        let mut api = ExtensionApiImpl::new();
+        super::register(&mut api);
+        assert_eq!(api.tools.len(), 1);
+        assert_eq!(api.tools[0].name, "web_search");
+        let tool = api.tools.remove(0);
+        let ctx = ToolCallCtx {
+            tool_call_id: "t1".into(),
+            args: serde_json::json!({"query": "rust language", "count": 2}),
+            signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+                spawner: None,
+            },
+        };
+        let result = (tool.execute)(ctx).await.unwrap();
+
+        // Cleanup before assertions so a failed assert can't leak state.
+        gasket_core::set_tool_proxy(None).unwrap();
+        std::env::remove_var("GASKET_SEARCH_PROVIDER");
+
+        assert!(result.is_error, "the TLS-less tunnel must fail: {result:?}");
+        match &result.content[0] {
+            gasket_core::ContentBlock::Text { text } => {
+                assert!(text.contains("Search failed"), "got: {text}");
+                assert!(
+                    text.contains("https://html.duckduckgo.com/"),
+                    "got: {text}"
+                );
+            }
+            _ => panic!("expected text content"),
+        }
+        // Bounded: with a reverted (registration-time, proxy-less) client the
+        // request goes direct and this proxy socket is never reached. Without
+        // the timeout the await below would block forever — the assertions
+        // above can all pass on a direct-connection failure, so this join is
+        // the real wiring check and must fail fast with a diagnosis.
+        let head = match tokio::time::timeout(std::time::Duration::from_secs(30), server).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => panic!(
+                "proxy socket never reached within 30s: the request did not go \
+                 through the tool proxy (is the client still built per call?). The \
+                 content assertions above passed on the direct-connection error: \
+                 is_error={}, content={:?}",
+                result.is_error, result.content
+            ),
+        };
+        assert!(
+            head.starts_with("CONNECT html.duckduckgo.com:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
     }
 }

@@ -99,6 +99,19 @@ fn app_config_path() -> std::path::PathBuf {
   gasket_core::storage::config_dir().join("app_config.json")
 }
 
+/// Extract `gasket_proxy` from the app config and install it as the
+/// fetch/web_search proxy override. Missing or empty clears the override
+/// (direct connection). Values may be raw strings (writeString path — not
+/// JSON) or JSON strings; `as_str` covers both.
+fn apply_proxy_from_config(config: &serde_json::Value) -> Result<(), String> {
+  let url = config
+    .get("gasket_proxy")
+    .and_then(|v| v.as_str())
+    .map(str::trim)
+    .filter(|s| !s.is_empty());
+  gasket_core::set_tool_proxy(url).map_err(|e| format!("gasket_proxy invalid: {e}"))
+}
+
 #[tauri::command]
 fn get_app_config() -> Result<Option<serde_json::Value>, String> {
   match std::fs::read(app_config_path()) {
@@ -115,6 +128,7 @@ fn get_app_config() -> Result<Option<serde_json::Value>, String> {
 /// frontend, so a blocking std::fs write is noise.
 #[tauri::command]
 fn set_app_config(config: serde_json::Value) -> Result<(), String> {
+  let proxy = apply_proxy_from_config(&config);
   let path = app_config_path();
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -122,7 +136,8 @@ fn set_app_config(config: serde_json::Value) -> Result<(), String> {
   let bytes = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
   let tmp = path.with_extension("json.tmp");
   std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-  std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+  std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+  proxy
 }
 
 /// Delete the session's on-disk data wholesale (event log + meta sidecar).
@@ -166,6 +181,11 @@ pub fn run() {
       set_app_config,
     ])
     .setup(|app| {
+      if let Ok(Some(config)) = get_app_config() {
+        if let Err(e) = apply_proxy_from_config(&config) {
+          log::warn!("skipping invalid stored proxy: {e}");
+        }
+      }
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()

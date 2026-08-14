@@ -42,7 +42,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         )));
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .user_agent("gasket-fetch/1.0")
         .build()
@@ -208,5 +208,67 @@ mod tests {
             }
             _ => panic!("expected text content"),
         }
+    }
+
+    /// End-to-end wiring proof: with the override set, fetch's request must
+    /// hit the proxy, not the target host. A real HTTP proxy in ~25 lines:
+    /// read the request head, reply with a canned page.
+    #[tokio::test]
+    async fn fetch_goes_through_tool_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = String::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if head.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "<html><body><article>via proxy</article></body></html>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            head
+        });
+
+        crate::proxy::set_tool_proxy(Some(&format!("http://{proxy_addr}"))).unwrap();
+        let ctx = ToolCallCtx {
+            tool_call_id: "t2".into(),
+            args: serde_json::json!({"url": "http://example.test/"}),
+            signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: crate::ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+                spawner: None,
+            },
+        };
+        let result = execute(ctx).await.unwrap();
+        crate::proxy::set_tool_proxy(None).unwrap();
+
+        assert!(!result.is_error);
+        match &result.content[0] {
+            ContentBlock::Text { text } => assert!(text.contains("via proxy")),
+            _ => panic!("expected text content"),
+        }
+        // A proxied http request carries the absolute target URI on the
+        // request line — proof the connection went through the proxy.
+        let head = server.await.unwrap();
+        assert!(head.starts_with("GET http://example.test/"), "proxy saw: {head}");
     }
 }

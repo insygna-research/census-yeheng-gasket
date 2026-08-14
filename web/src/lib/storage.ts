@@ -21,6 +21,7 @@ export const storageKeys = {
   theme: 'gasket_theme_v2',
   sidebarWidth: 'gasket_sidebar_width',
   sidebarCollapsed: 'gasket_sidebar_collapsed',
+  proxy: 'gasket_proxy',
 } as const;
 
 const memory = new Map<string, string>();

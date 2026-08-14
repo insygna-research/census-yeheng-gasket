@@ -318,6 +318,15 @@ async fn build_session(
     }
   };
   let mcp_tools = load_all_mcp().await;
+  // web_search from gasket-ext — same registration the CLI performs via
+  // register_all, scoped to the search tool only (hello/todo/
+  // permission_gate are CLI demos). Its HTTP client honors the runtime
+  // tool proxy (gasket_core::set_tool_proxy).
+  let search_tools = {
+    let mut api = gasket_core::ExtensionApiImpl::new();
+    gasket_ext::search::register(&mut api);
+    api.tools
+  };
   let built_in = built_in_tools();
   let subagent_tools: Vec<_> = built_in
     .iter()
@@ -328,6 +337,7 @@ async fn build_session(
     let mut t = built_in;
     t.extend(extra_tools.iter().cloned());
     t.extend(mcp_tools.iter().cloned());
+    t.extend(search_tools);
     t
   };
 

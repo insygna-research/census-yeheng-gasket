@@ -13,3 +13,6 @@ reqwest = { workspace = true, features = ["json"] }
 tracing = { workspace = true }
 urlencoding = "2.1"
 dom_query = "0.28"
+
+[dev-dependencies]
+tokio = { workspace = true }

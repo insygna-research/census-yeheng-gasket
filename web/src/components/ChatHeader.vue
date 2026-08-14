@@ -9,8 +9,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from 'radix-vue';
-import { computed } from 'vue';
-import { Cpu, Loader2, Moon, MoreVertical, Palette, RotateCcw, Sun, Trash2, Check } from 'lucide-vue-next';
+import { computed, ref } from 'vue';
+import { Cpu, Globe, Loader2, Moon, MoreVertical, Palette, RotateCcw, Sun, Trash2, Check } from 'lucide-vue-next';
+import NetworkProxyDialog from './NetworkProxyDialog.vue';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
 import type { ContextStats, WatermarkInfo } from '../types';
 
@@ -59,7 +60,10 @@ const menuContentClass =
   'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95';
 const menuItemClass =
   'flex w-full items-center px-3 py-2 text-xs th-text-secondary outline-none cursor-pointer select-none data-[highlighted]:bg-accent data-[disabled]:opacity-50 data-[disabled]:pointer-events-none';
-const menuLabelClass = 'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider';
+const menuLabelClass =
+  'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider';
+
+const showProxyDialog = ref(false);
 </script>
 
 <template>
@@ -124,6 +128,14 @@ const menuLabelClass = 'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppe
         </DropdownMenuPortal>
       </DropdownMenuRoot>
 
+      <!-- Network proxy -->
+      <button
+        class="p-2 rounded-md th-hover th-text-muted hover:th-text transition-colors"
+        title="Network proxy"
+        @click="showProxyDialog = true"
+      >
+        <Globe class="w-4 h-4" />
+      </button>
       <!-- Appearance -->
       <DropdownMenuRoot>
         <DropdownMenuTrigger as-child>
@@ -160,6 +172,8 @@ const menuLabelClass = 'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppe
           </DropdownMenuContent>
         </DropdownMenuPortal>
       </DropdownMenuRoot>
+
+      <NetworkProxyDialog :open="showProxyDialog" @close="showProxyDialog = false" />
     </div>
   </header>
 </template>

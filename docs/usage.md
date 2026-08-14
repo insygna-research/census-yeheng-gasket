@@ -78,6 +78,15 @@ cd web && pnpm install && pnpm dev
 
 代理优先级:按 scheme 的专用代理(`HTTP_PROXY`/`HTTPS_PROXY`)最高;`GASKET_LLM_PROXY` 填补缺失的那个 scheme。
 
+**工具代理(fetch / web_search)**:设置 `GASKET_TOOL_PROXY` 可让 `fetch` 与 `web_search` 工具的出站流量走代理,支持 `http` / `https` / `socks5` / `socks5h`(带认证的代理把 `user:pass` 写进 URL 即可):
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `GASKET_TOOL_PROXY` | 工具出站代理 | `socks5://127.0.0.1:1080` |
+
+桌面版在顶栏 Globe 按钮中配置代理,优先级高于该环境变量;保存后下一次工具调用即生效,无需重启。该代理不影响 LLM API 请求(那部分继续用上面的 `GASKET_LLM_PROXY` 系列)。
+点击 Disable 时若设置了 GASKET_TOOL_PROXY 则回退到该环境变量，而非直连。
+
 ---
 
 ## 4. 运行后端

@@ -28,5 +28,6 @@ tokio = { version = "1", features = ["sync", "time"] }
 dashmap = "6"
 gasket-core = { path = "../../gasket/gasket-core" }
 gasket-host = { path = "../../gasket/gasket-host" }
+gasket-ext = { path = "../../gasket/gasket-ext" }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
 dotenvy = "0.15.7"
