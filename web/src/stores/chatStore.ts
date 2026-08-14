@@ -1,72 +1,48 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import { storageKeys } from '@/lib/storage';
+import { fetchSessionList } from '@/lib/backend';
+import { readJSON, storageKeys, writeJSON } from '@/lib/storage';
 import type { Chat, Message, MessageStatus, SubagentState } from '@/types';
 
-const STORAGE_KEY = storageKeys.chats;
 const LEGACY_KEY = 'gasket_sessions';
 
-/** Migrate legacy steps format to simple thinking/toolCalls/content fields */
-const migrateLegacyMessage = (msg: any): Message => {
-  if (!msg.steps || msg.steps.length === 0) {
-    return msg as Message;
+/** localStorage keeps chat metadata only; messages live on the backend. */
+interface ChatMeta {
+  id: string;
+  name: string;
+  updatedAt: number;
+}
+
+const loadLocalChats = (): Chat[] => {
+  const meta = readJSON<ChatMeta[]>(storageKeys.chatsMeta, []);
+  if (meta.length > 0) {
+    return meta.map(m => ({ ...m, messages: [] }));
   }
 
-  let thinking = msg.thinking || '';
-  let toolCalls = msg.toolCalls || [];
-  let content = msg.content || '';
-
-  for (const step of msg.steps) {
-    if (step.type === 'thinking' && step.content) {
-      thinking += step.content;
-    } else if (step.type === 'tool_group' && step.tools) {
-      toolCalls = [...toolCalls, ...step.tools];
-    } else if (step.type === 'content' && step.content) {
-      content += step.content;
-    }
+  // One-time migration from the full-transcript store: keep names and drop
+  // message bodies — the backend's events.jsonl is the authoritative copy.
+  const legacy = readJSON<(ChatMeta & { messages?: unknown })[]>(storageKeys.legacyChats, []);
+  if (legacy.length > 0) {
+    localStorage.removeItem(storageKeys.legacyChats);
+    localStorage.removeItem(LEGACY_KEY);
+    return legacy.map(c => ({
+      id: c.id,
+      name: c.name,
+      updatedAt: c.updatedAt || Date.now(),
+      messages: [],
+    }));
   }
 
-  const { steps, ...rest } = msg;
-  return {
-    ...rest,
-    thinking: thinking || undefined,
-    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-    content: content
-  } as Message;
-};
-
-const loadChats = (): Chat[] => {
-  // Try new key first
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (saved) {
-    try {
-      return JSON.parse(saved);
-    } catch (e) {
-      console.error('Failed to parse chats from local storage:', e);
-    }
-  }
-
-  // Migrate from legacy sessions
-  const legacy = localStorage.getItem(LEGACY_KEY);
-  if (legacy) {
-    try {
-      const loadedSessions = JSON.parse(legacy);
-      const migrated = loadedSessions.map((session: any) => ({
-        ...session,
-        messages: session.messages.map(migrateLegacyMessage)
-      }));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
-      return migrated;
-    } catch (e) {
-      console.error('Failed to migrate legacy sessions:', e);
-    }
-  }
-
+  localStorage.removeItem(LEGACY_KEY);
   return [];
 };
 
+const loadHiddenIds = (): Set<string> =>
+  new Set(readJSON<string[]>(storageKeys.hiddenSessions, []));
+
 export const useChatStore = defineStore('chat', () => {
-  const chats = ref<Chat[]>(loadChats());
+  const chats = ref<Chat[]>(loadLocalChats());
+  const hiddenIds = ref<Set<string>>(loadHiddenIds());
   const activeChatId = ref<string>('');
 
   const activeChat = computed(() => chats.value.find(c => c.id === activeChatId.value));
@@ -89,6 +65,11 @@ export const useChatStore = defineStore('chat', () => {
   };
 
   const deleteChat = (id: string) => {
+    // No backend delete endpoint — hidden ids are filtered out of every
+    // sync, so a "deleted" chat stays off the list even though its
+    // events.jsonl remains on disk.
+    hiddenIds.value.add(id);
+    writeJSON(storageKeys.hiddenSessions, [...hiddenIds.value]);
     chats.value = chats.value.filter(c => c.id !== id);
     if (activeChatId.value === id) {
       activeChatId.value = chats.value.length > 0 ? chats.value[0].id : '';
@@ -223,6 +204,13 @@ export const useChatStore = defineStore('chat', () => {
     chat.updatedAt = Date.now();
   };
 
+  /** Replace a chat's transcript wholesale (backend hydration). */
+  const setMessages = (chatId: string, messages: Message[]) => {
+    const chat = getChat(chatId);
+    if (!chat) return;
+    chat.messages = messages;
+  };
+
   const setContextStats = (chatId: string, stats: any) => {
     const chat = getChat(chatId);
     if (chat) chat.contextStats = stats;
@@ -279,16 +267,18 @@ export const useChatStore = defineStore('chat', () => {
 
 
   // Sync sessions from backend (discovery: CLI-created, other-device, or
-  // lost localStorage). Merges disk sessions not in localStorage; messages
-  // lazy-load on switch (WS resume_or_adopt reads them back).
+  // lost localStorage). The backend is authoritative for the session list;
+  // local meta only contributes names. Messages hydrate lazily on activate
+  // via fetchSessionMessages.
   const syncFromBackend = async () => {
     try {
-      const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-      const res = await fetch(`${baseUrl}/api/sessions`);
-      const data = await res.json();
-      const sessions = data.sessions || [];
+      const sessions = await fetchSessionList();
       for (const s of sessions) {
-        if (!chats.value.find(c => c.id === s.id)) {
+        if (hiddenIds.value.has(s.id)) continue;
+        const existing = chats.value.find(c => c.id === s.id);
+        if (existing) {
+          existing.updatedAt = Math.max(existing.updatedAt, s.mtime || 0);
+        } else {
           chats.value.push({
             id: s.id,
             name: `Session (${s.msg_count} msgs)`,
@@ -328,6 +318,7 @@ export const useChatStore = defineStore('chat', () => {
     pushToolCall,
     updateToolCall,
     clearChatMessages,
+    setMessages,
     setContextStats,
     setWatermarkInfo,
     abortToolCalls,

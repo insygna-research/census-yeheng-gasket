@@ -1,6 +1,8 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue';
 import { useChatStore } from '@/stores/chatStore';
 import { useIMWebSocket } from '@/hooks/useIMWebSocket';
+import { backendBaseUrl, fetchSessionMessages, sessionKey } from '@/lib/backend';
+import { notifyTurnComplete } from '@/lib/notifications';
 import type { ApprovalRequest, Message, SubagentState } from '@/types';
 
 export function useChatSession(chatId: { value: string }) {
@@ -278,6 +280,10 @@ export function useChatSession(chatId: { value: string }) {
         pendingApprovals.value.clear();
         isReceiving.value = false;
         fetchContext();
+        notifyTurnComplete(
+          chatStore.getChat(chatId.value)?.name || 'Gasket',
+          botMsg.content
+        );
         break;
       case 'busy':
         // 发送时回合已在进行（竞态/打断）：只提示，不动会话状态——
@@ -373,12 +379,9 @@ export function useChatSession(chatId: { value: string }) {
 
   // ── Context API ─────────────────────────────────────────────
 
-  const baseUrl = () => import.meta.env.VITE_API_URL || 'http://localhost:3000';
-  const sessionKey = () => encodeURIComponent(`websocket:${chatId.value}`);
-
   const fetchContext = async () => {
     try {
-      const res = await fetch(`${baseUrl()}/api/sessions/${sessionKey()}/context`);
+      const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context`);
       const data = await res.json();
       if (res.ok && data.context_stats) {
         chatStore.setContextStats(chatId.value, data.context_stats);
@@ -391,18 +394,43 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
-  // Auto-fetch context when connection is established or restored
+  // Hydrate the transcript from the backend's authoritative store.
+  const fetchMessages = async () => {
+    // Hydrating over a live stream would clobber in-flight state — skip.
+    if (isSending.value || isReceiving.value || isThinking.value) return;
+    const targetId = chatId.value;
+    const messages = await fetchSessionMessages(targetId);
+    if (!messages) return; // 404 for local-only chats, or request failed
+    if (chatId.value !== targetId) return; // user switched chats mid-fetch
+    if (isSending.value || isReceiving.value || isThinking.value) return;
+    chatStore.setMessages(targetId, messages);
+    // Backend sessions have no names — derive one from the first user message.
+    const chat = chatStore.getChat(targetId);
+    if (chat && (chat.name === 'New Chat' || chat.name.startsWith('Session ('))) {
+      const firstUser = messages.find(m => m.role === 'user');
+      if (firstUser) {
+        const name = firstUser.content.slice(0, 50) + (firstUser.content.length > 50 ? '...' : '');
+        chatStore.renameChat(targetId, name);
+      }
+    }
+  };
+
+  // Auto-fetch context and transcript when connection is established or restored
   watch(isConnected, (connected, prev) => {
     if (connected && !prev) {
       fetchContext();
+      fetchMessages();
     }
   });
+
+  // Hydrate on chat switch and on mount
+  watch(chatId, () => fetchMessages(), { immediate: true });
 
   const forceCompact = async () => {
     if (isCompacting.value) return;
     isCompacting.value = true;
     try {
-      const res = await fetch(`${baseUrl()}/api/sessions/${sessionKey()}/context/compact`, { method: 'POST' });
+      const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context/compact`, { method: 'POST' });
       const data = await res.json();
       if (res.ok && data.context_stats) {
         chatStore.setContextStats(chatId.value, data.context_stats);
@@ -527,6 +555,7 @@ export function useChatSession(chatId: { value: string }) {
     stopGenerating,
     sendApprovalResponse,
     fetchContext,
+    fetchMessages,
     forceCompact,
     dismissError,
   });

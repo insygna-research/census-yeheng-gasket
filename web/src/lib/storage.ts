@@ -4,10 +4,13 @@
  * localStorage calls across components/composables.
  */
 export const storageKeys = {
-  chats: 'gasket_chats',
+  chatsMeta: 'gasket_chats_meta',
+  hiddenSessions: 'gasket_hidden_sessions',
   theme: 'gasket_theme_v2',
   sidebarWidth: 'gasket_sidebar_width',
   sidebarCollapsed: 'gasket_sidebar_collapsed',
+  /** Pre-migration full-transcript store; read once for names, then removed. */
+  legacyChats: 'gasket_chats',
 } as const;
 
 export function readJSON<T>(key: string, fallback: T): T {

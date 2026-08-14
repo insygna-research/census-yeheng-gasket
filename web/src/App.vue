@@ -18,12 +18,14 @@ onUnmounted(() => {
   if (saveTimer) clearTimeout(saveTimer);
 });
 
-// Persist to localStorage
+// Persist chat metadata (id/name/updatedAt) — message bodies live on the
+// backend and hydrate from it, so localStorage stays small.
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 const debouncedSave = () => {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    writeJSON(storageKeys.chats, chatStore.chats);
+    const meta = chatStore.chats.map(({ id, name, updatedAt }) => ({ id, name, updatedAt }));
+    writeJSON(storageKeys.chatsMeta, meta);
   }, 1000);
 };
 watch(() => chatStore.chats, debouncedSave, { deep: true });

@@ -29,7 +29,6 @@ export function useIMWebSocket(
 
   const maxReconnectAttempts = 5;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let isManualClose = false;
 
   const connect = () => {
     if (reconnectTimer) {
@@ -38,13 +37,18 @@ export function useIMWebSocket(
     }
 
     if (ws.value) {
-      isManualClose = true;
+      // Detach the old socket's handlers before closing it. Its onclose fires
+      // asynchronously — after this function returns. With a local (Tauri)
+      // gateway the new socket's onopen runs first and resets the reconnect
+      // state, so the stale socket's later onclose would spuriously kick off
+      // attemptReconnect, forming a self-sustaining reconnect loop. Nulling
+      // the handlers makes the replaced socket's close silent.
+      ws.value.onopen = null;
+      ws.value.onclose = null;
+      ws.value.onerror = null;
       ws.value.close();
-      // NOTE: do NOT reset isManualClose here.
-      // onclose is async; resetting it immediately causes the old socket's
-      // onclose to fire with isManualClose=false, triggering a spurious
-      // reconnect that races with the new socket.
     }
+    isConnected.value = false;
 
     const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:3000'}/ws?user_id=${encodeURIComponent(chatId.value)}`;
     ws.value = new WebSocket(wsUrl);
@@ -54,7 +58,6 @@ export function useIMWebSocket(
       reconnectAttempts.value = 0;
       showReconnectButton.value = false;
       isReconnecting.value = false;
-      isManualClose = false;
     };
 
     ws.value.onmessage = (event) => {
@@ -63,9 +66,7 @@ export function useIMWebSocket(
 
     ws.value.onclose = () => {
       isConnected.value = false;
-      if (!isManualClose) {
-        attemptReconnect();
-      }
+      attemptReconnect();
     };
 
     ws.value.onerror = () => {
@@ -106,7 +107,7 @@ export function useIMWebSocket(
 
   const close = () => {
     if (ws.value) {
-      isManualClose = true;
+      ws.value.onclose = null;
       ws.value.close();
     }
     if (reconnectTimer) {
