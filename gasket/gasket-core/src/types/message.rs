@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// The single internal message enum. Converted to provider protocol only at
 /// the LLM boundary (`convert_to_llm`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
     User(UserMessage),
@@ -17,9 +17,32 @@ pub enum AgentMessage {
     /// `convert_to_llm`). The `custom_type` namespace is owned by the plugin.
     Custom(CustomMessage),
 }
+impl AgentMessage {
+    /// User message carrying a single text block. Convenience constructor
+    /// for hosts and tests that don't build block lists by hand.
+    pub fn user(text: impl Into<String>) -> Self {
+        AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(text)],
+            timestamp: crate::now(),
+        })
+    }
+
+    /// Assistant message carrying a single text block, no usage, and an
+    /// empty model id (fill it in when the real model is known). Mirrors the
+    /// defaults of [`AssistantMessage::new`].
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::text(text)],
+            model: String::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            timestamp: crate::now(),
+        })
+    }
+}
 
 /// A user-authored message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub content: Vec<ContentBlock>,
     pub timestamp: u64,
@@ -27,7 +50,7 @@ pub struct UserMessage {
 
 /// An assistant (model) message. `content` may hold text, thinking, and tool
 /// calls simultaneously.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Vec<ContentBlock>,
     pub model: ModelId,
@@ -113,7 +136,7 @@ impl AssistantMessage {
 }
 
 /// A tool-result message, paired with the `tool_call_id` it answers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
@@ -124,7 +147,7 @@ pub struct ToolResultMessage {
 
 /// A plugin-private message. `custom_type` is the plugin's namespace
 /// (e.g. `"todo.list"`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CustomMessage {
     pub custom_type: String,
     pub content: serde_json::Value,
@@ -132,7 +155,7 @@ pub struct CustomMessage {
 }
 
 /// One block of message content. An assistant turn may hold several of these.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -156,19 +179,19 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageContent {
     pub mime_type: String,
     pub data: String, // base64
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub function: FunctionCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     /// Raw JSON arguments string from the model (validated at execution time).
@@ -196,7 +219,7 @@ pub enum StopReason {
 pub type ModelId = String;
 
 /// Token usage reported by the provider.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
