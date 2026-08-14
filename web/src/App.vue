@@ -85,7 +85,7 @@ const truncateTitle = (name: string) => {
   <div class="flex h-screen w-full th-app-bg overflow-hidden">
     <!-- Sidebar Drawer -->
     <aside
-      class="relative flex flex-col th-sidebar-bg backdrop-blur-xl border-r th-border shrink-0 transition-all duration-300 ease-in-out"
+      class="relative flex flex-col th-sidebar-bg border-r th-border shrink-0 transition-all duration-300 ease-in-out"
       :class="isCollapsed ? 'items-center overflow-hidden' : ''"
       :style="{ width: (isCollapsed ? 48 : sidebarWidth) + 'px' }"
     >
@@ -93,7 +93,7 @@ const truncateTitle = (name: string) => {
       <template v-if="isCollapsed">
         <div class="flex flex-col items-center gap-3 py-3 h-full">
           <button
-            class="w-8 h-8 rounded-lg th-gradient-brand flex items-center justify-center text-white hover:opacity-90 transition-opacity"
+            class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-primary-foreground hover:opacity-90 transition-opacity"
             @click="createNewChat"
             title="New Chat"
           >
@@ -129,8 +129,8 @@ const truncateTitle = (name: string) => {
       <template v-else>
         <div class="p-4 flex justify-between items-center border-b th-border">
           <h1 class="text-lg font-semibold flex items-center gap-2.5 th-text">
-            <div class="w-7 h-7 rounded-lg th-gradient-brand flex items-center justify-center">
-              <MessageSquare class="w-4 h-4 text-white" />
+            <div class="w-7 h-7 rounded-lg bg-primary flex items-center justify-center">
+              <MessageSquare class="w-4 h-4 text-primary-foreground" />
             </div>
             Chats
           </h1>
@@ -164,7 +164,7 @@ const truncateTitle = (name: string) => {
                     <span class="text-sm font-medium th-text-secondary">{{ truncateTitle(chat.name) }}</span>
                   </template>
                 </div>
-                <span class="text-[10px] th-text-dim">
+                <span class="text-[11px] th-text-dim">
                   {{ formatDate(chat.messages[chat.messages.length - 1]?.timestamp) }}
                 </span>
               </div>

@@ -17,6 +17,30 @@ pub enum AgentMessage {
     /// `convert_to_llm`). The `custom_type` namespace is owned by the plugin.
     Custom(CustomMessage),
 }
+impl AgentMessage {
+    /// User message carrying a single text block. Convenience constructor
+    /// for hosts and tests that don't build block lists by hand.
+    pub fn user(text: impl Into<String>) -> Self {
+        AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(text)],
+            timestamp: crate::now(),
+        })
+    }
+
+    /// Assistant message carrying a single text block, no usage, and an
+    /// empty model id (fill it in when the real model is known). Mirrors the
+    /// defaults of [`AssistantMessage::new`].
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::text(text)],
+            model: String::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            timestamp: crate::now(),
+        })
+    }
+}
+
 
 /// A user-authored message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,7 +220,7 @@ pub enum StopReason {
 pub type ModelId = String;
 
 /// Token usage reported by the provider.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

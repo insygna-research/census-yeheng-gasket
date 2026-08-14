@@ -79,7 +79,7 @@ const formatArgs = (args: string | undefined) => {
             </div>
 
             <div v-if="request.arguments" class="space-y-1">
-              <div class="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+              <div class="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground">
                 <Terminal class="w-3 h-3" />
                 <span>Arguments</span>
               </div>

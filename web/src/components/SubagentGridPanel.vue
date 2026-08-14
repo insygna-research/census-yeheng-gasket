@@ -104,10 +104,10 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
               :class="{ 'animate-spin': subagent.status === 'running' }"
             />
             <span class="font-medium text-[11px] truncate">{{ subagent.task }}</span>
-            <span class="text-[10px] opacity-60 shrink-0">#{{ subagent.index }}</span>
+            <span class="text-[11px] opacity-60 shrink-0">#{{ subagent.index }}</span>
           </div>
           <span
-            class="text-[10px] px-1.5 py-0.5 rounded-full border shrink-0"
+            class="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
             :class="statusBadgeClasses(subagent.status)"
           >
             {{ statusLabel(subagent.status) }}
@@ -116,7 +116,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
 
         <!-- Thinking -->
         <div v-if="subagent.thinking" class="px-2.5 pb-2">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider mb-1">
             <Sparkles class="w-3 h-3" />
             <span>Thinking</span>
           </div>
@@ -127,7 +127,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
 
         <!-- Tool Calls -->
         <div v-if="subagent.toolCalls.length > 0" class="px-2.5 pb-2 space-y-1">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
             <Wrench class="w-3 h-3" />
             <span>Tool Calls</span>
           </div>
@@ -146,7 +146,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
                   :class="{ 'animate-spin': tool.status === 'running' }"
                 />
                 <span class="font-medium truncate flex-1 text-[11px]">{{ tool.name }}</span>
-                <span v-if="tool.duration" class="text-[10px] opacity-70 shrink-0">{{ tool.duration }}</span>
+                <span v-if="tool.duration" class="text-[11px] opacity-70 shrink-0">{{ tool.duration }}</span>
                 <ChevronRight
                   class="w-3 h-3 shrink-0 opacity-60 transition-transform"
                   :class="{ 'rotate-90': isToolExpanded(tool.id) }"
@@ -156,20 +156,20 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
             <CollapsibleContent>
               <div class="px-2 pb-2 space-y-1.5">
                 <div v-if="tool.arguments" class="space-y-0.5">
-                  <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+                  <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
                     <Terminal class="w-2.5 h-2.5" />
                     <span>Input</span>
                   </div>
-                  <div class="font-mono text-[10px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-all max-h-32 overflow-auto">
+                  <div class="font-mono text-[11px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-all max-h-32 overflow-auto">
                     {{ tool.arguments }}
                   </div>
                 </div>
                 <div v-if="tool.output" class="space-y-0.5">
-                  <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+                  <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
                     <ArrowRight class="w-2.5 h-2.5" />
                     <span>Output</span>
                   </div>
-                  <div class="font-mono text-[10px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-words max-h-40 overflow-auto">
+                  <div class="font-mono text-[11px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-words max-h-40 overflow-auto">
                     {{ tool.output }}
                   </div>
                 </div>
@@ -180,7 +180,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
 
         <!-- Content -->
         <div v-if="subagent.content" class="px-2.5 pb-2">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider mb-1">
             <Users class="w-3 h-3" />
             <span>Response</span>
           </div>
@@ -191,7 +191,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
 
         <!-- Error -->
         <div v-if="subagent.error" class="px-2.5 pb-2">
-          <div class="flex items-center gap-1 text-[10px] text-destructive uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] text-destructive uppercase tracking-wider mb-1">
             <XCircle class="w-3 h-3" />
             <span>Error</span>
           </div>

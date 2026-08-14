@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Button } from '@/components/ui/button';
 import { Menu as HeadlessMenu, MenuButton, MenuItem, MenuItems } from '@headlessui/vue';
+import { computed } from 'vue';
 import { Cpu, Loader2, Moon, MoreVertical, Palette, RotateCcw, Sun, Trash2, Check } from 'lucide-vue-next';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
 import type { ContextStats, WatermarkInfo } from '../types';
@@ -32,27 +33,24 @@ const hueMeta: Record<ThemeHue, { label: string; dot: string }> = {
   violet:  { label: 'Violet',  dot: 'bg-violet-500' },
 };
 
-const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
-  classic:       { label: 'Classic',       icon: 'Type' },
-  github:        { label: 'GitHub',        icon: 'Github' },
-  hope:          { label: 'Hope',          icon: 'Waves' },
-  fancy:         { label: 'Fancy',         icon: 'Sparkles' },
-  journal:       { label: 'Journal',       icon: 'BookOpen' },
-  geek:          { label: 'Geek',          icon: 'Terminal' },
-  'vlook-hope':    { label: 'VLOOK Hope',    icon: 'Waves' },
-  'vlook-fancy':   { label: 'VLOOK Fancy',   icon: 'Sparkles' },
-  'vlook-geek':    { label: 'VLOOK Geek',    icon: 'Terminal' },
-  'vlook-joint':   { label: 'VLOOK Joint',   icon: 'Puzzle' },
-  'vlook-solaris': { label: 'VLOOK Solaris', icon: 'Sun' },
-  'vlook-thinking':{ label: 'VLOOK Thinking',icon: 'Brain' },
+const mdStyleMeta: Record<MarkdownStyle, { label: string }> = {
+  classic: { label: 'Classic' },
+  github:  { label: 'GitHub' },
 };
+
+const statusText = computed(() => {
+  if (props.sessionStatus === 'disconnected') return 'Disconnected';
+  if (props.sessionStatus === 'sending') return 'Sending...';
+  if (props.sessionStatus === 'receiving') return 'Thinking...';
+  return 'Online';
+});
 </script>
 
 <template>
   <header class="py-3 px-5 th-header-bg border-b th-border flex justify-between items-center shrink-0">
     <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
-        <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <div class="w-9 h-9 rounded-full bg-primary flex items-center justify-center">
+        <svg class="w-5 h-5 text-primary-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="3" y="3" width="18" height="18" rx="2" />
           <line x1="3" y1="9" x2="21" y2="9" />
           <line x1="9" y1="21" x2="9" y2="9" />
@@ -60,24 +58,10 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
       </div>
       <div>
         <div class="text-sm font-semibold th-text">Model</div>
-        <div class="text-[10px] th-text-muted flex items-center gap-1.5">
+        <div class="text-[11px] th-text-muted flex items-center gap-1.5">
           <span class="w-1.5 h-1.5 rounded-full" :class="isConnected ? 'bg-primary' : 'bg-destructive'" />
-          {{ isConnected ? 'Online' : 'Offline' }}
-          <span class="th-text-dim">|</span>
-          <span
-            class="flex items-center gap-1"
-            :class="{
-              'text-destructive': sessionStatus === 'disconnected',
-              'text-primary': sessionStatus === 'sending' || sessionStatus === 'receiving',
-              'th-text-dim': sessionStatus === 'idle'
-            }"
-          >
-            <Loader2 v-if="sessionStatus === 'sending' || sessionStatus === 'receiving'" class="w-3 h-3 animate-spin" />
-            <span v-if="sessionStatus === 'disconnected'">Disconnected</span>
-            <span v-else-if="sessionStatus === 'sending'">Sending...</span>
-            <span v-else-if="sessionStatus === 'receiving'">Thinking...</span>
-            <span v-else>Ready</span>
-          </span>
+          <Loader2 v-if="sessionStatus === 'sending' || sessionStatus === 'receiving'" class="w-3 h-3 animate-spin" />
+          <span>{{ statusText }}</span>
         </div>
       </div>
     </div>
@@ -85,21 +69,12 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
     <div class="flex items-center gap-2">
       <!-- Context stats inline -->
       <div v-if="contextStats" class="hidden md:flex items-center gap-2 mr-1">
-        <div class="text-[10px] th-text-secondary font-medium whitespace-nowrap">
+        <div class="text-[11px] th-text-secondary font-medium whitespace-nowrap">
           Context: {{ contextStats.usage_percent.toFixed(1) }}%
         </div>
         <div class="w-20 lg:w-28 h-1.5 bg-muted rounded-full overflow-hidden">
           <div class="h-full rounded-full transition-all duration-500" :class="usageColor" :style="{ width: Math.min(contextStats.usage_percent, 100) + '%' }" />
         </div>
-        <div v-if="watermarkInfo" class="hidden lg:block text-[10px] th-text-muted whitespace-nowrap">
-          {{ watermarkInfo.watermark }}/{{ watermarkInfo.max_sequence }}
-        </div>
-        <Button variant="outline" size="sm" class="h-6 text-[10px] px-2 th-surface th-border th-hover th-text-secondary"
-          :disabled="isCompacting" @click="emit('compact')">
-          <Cpu v-if="!isCompacting" class="w-3 h-3 mr-1" />
-          <Loader2 v-else class="w-3 h-3 mr-1 animate-spin" />
-          {{ isCompacting ? '...' : 'Compress' }}
-        </Button>
       </div>
 
       <Button v-if="showReconnectButton" variant="outline" size="sm" @click="emit('reconnect')"
@@ -120,7 +95,17 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
           leave-from-class="transform scale-100 opacity-100"
           leave-to-class="transform scale-95 opacity-0"
         >
-          <MenuItems class="absolute right-0 top-10 z-30 w-40 origin-top-right rounded-lg bg-popover border border-border shadow-lg focus:outline-none py-1">
+          <MenuItems class="absolute right-0 top-10 z-30 w-44 origin-top-right rounded-lg bg-popover border border-border shadow-lg focus:outline-none py-1">
+            <div v-if="watermarkInfo" class="px-3 py-1.5 text-[11px] th-text-dim">
+              Watermark: {{ watermarkInfo.watermark }}/{{ watermarkInfo.max_sequence }}
+            </div>
+            <MenuItem v-if="contextStats" v-slot="{ active }">
+              <button @click="emit('compact')" :disabled="isCompacting" :class="[active ? 'bg-accent' : '', 'group flex w-full items-center px-3 py-2 text-xs th-text-secondary disabled:opacity-50']">
+                <Loader2 v-if="isCompacting" class="w-3.5 h-3.5 mr-2 animate-spin th-text-dim" />
+                <Cpu v-else class="w-3.5 h-3.5 mr-2 th-text-dim" />
+                {{ isCompacting ? 'Compressing...' : 'Compress Context' }}
+              </button>
+            </MenuItem>
             <MenuItem v-slot="{ active }">
               <button @click="emit('clear-history')" :class="[active ? 'bg-accent' : '', 'group flex w-full items-center px-3 py-2 text-xs th-text-secondary']">
                 <Trash2 class="w-3.5 h-3.5 mr-2 th-text-dim" />
@@ -145,7 +130,7 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
         >
           <MenuItems class="absolute right-0 top-10 z-30 w-44 origin-top-right rounded-lg bg-popover border border-border shadow-lg focus:outline-none py-1">
             <!-- Mode -->
-            <div class="px-3 py-1.5 text-[10px] font-semibold th-text-muted uppercase tracking-wider">Mode</div>
+            <div class="px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider">Mode</div>
             <MenuItem v-slot="{ active }">
               <button
                 @click="setMode('light')"
@@ -168,7 +153,7 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
             </MenuItem>
             <div class="my-1 border-t border-border" />
             <!-- Hue -->
-            <div class="px-3 py-1.5 text-[10px] font-semibold th-text-muted uppercase tracking-wider">Hue</div>
+            <div class="px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider">Hue</div>
             <MenuItem v-for="h in hues" :key="h" v-slot="{ active }">
               <button
                 @click="setHue(h)"
@@ -181,7 +166,7 @@ const mdStyleMeta: Record<MarkdownStyle, { label: string; icon: string }> = {
             </MenuItem>
             <div class="my-1 border-t border-border" />
             <!-- Markdown Style -->
-            <div class="px-3 py-1.5 text-[10px] font-semibold th-text-muted uppercase tracking-wider">Markdown</div>
+            <div class="px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider">Markdown</div>
             <MenuItem v-for="s in markdownStyles" :key="s" v-slot="{ active }">
               <button
                 @click="setMarkdownStyle(s)"

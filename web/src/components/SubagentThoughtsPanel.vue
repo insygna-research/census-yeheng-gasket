@@ -119,22 +119,22 @@ function formatDuration(start: number, end?: number) {
           <span class="font-medium text-xs truncate">
             {{ subagent.task }}
           </span>
-          <span class="text-[10px] opacity-60 shrink-0">
+          <span class="text-[11px] opacity-60 shrink-0">
             #{{ subagent.index }}
           </span>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
           <span
-            class="text-[10px] px-1.5 py-0.5 rounded-full border"
+            class="text-[11px] px-1.5 py-0.5 rounded-full border"
             :class="statusClasses(subagent.status)"
           >
             {{ statusLabel(subagent.status) }}
           </span>
-          <span v-if="subagent.toolCount > 0" class="text-[10px] opacity-70 flex items-center gap-0.5">
+          <span v-if="subagent.toolCount > 0" class="text-[11px] opacity-70 flex items-center gap-0.5">
             <Wrench class="w-3 h-3" />
             {{ subagent.toolCount }}
           </span>
-          <span class="text-[10px] opacity-70">
+          <span class="text-[11px] opacity-70">
             {{ formatDuration(subagent.startTime, subagent.endTime) }}
           </span>
           <ChevronRight
@@ -152,7 +152,7 @@ function formatDuration(start: number, end?: number) {
       >
         <!-- Thinking -->
         <div v-if="subagent.thinking" class="pt-2">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider mb-1">
             <Sparkles class="w-3 h-3" />
             <span>Thinking</span>
           </div>
@@ -163,7 +163,7 @@ function formatDuration(start: number, end?: number) {
 
         <!-- Tool calls -->
         <div v-if="subagent.toolCalls.length > 0" class="space-y-1">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
             <Wrench class="w-3 h-3" />
             <span>Tool Calls</span>
           </div>
@@ -186,7 +186,7 @@ function formatDuration(start: number, end?: number) {
                 </span>
                 <span
                   v-if="tool.duration"
-                  class="text-[10px] opacity-70 shrink-0"
+                  class="text-[11px] opacity-70 shrink-0"
                 >
                   {{ tool.duration }}
                 </span>
@@ -199,20 +199,20 @@ function formatDuration(start: number, end?: number) {
             <CollapsibleContent>
               <div class="px-2 pb-2 space-y-1.5">
                 <div v-if="tool.arguments" class="space-y-0.5">
-                  <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+                  <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
                     <Terminal class="w-2.5 h-2.5" />
                     <span>Input</span>
                   </div>
-                  <div class="font-mono text-[10px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-all max-h-32 overflow-auto">
+                  <div class="font-mono text-[11px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-all max-h-32 overflow-auto">
                     {{ tool.arguments }}
                   </div>
                 </div>
                 <div v-if="tool.output" class="space-y-0.5">
-                  <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+                  <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
                     <ArrowRight class="w-2.5 h-2.5" />
                     <span>Output</span>
                   </div>
-                  <div class="font-mono text-[10px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-words max-h-40 overflow-auto">
+                  <div class="font-mono text-[11px] bg-black/5 dark:bg-white/5 rounded p-1.5 whitespace-pre-wrap break-words max-h-40 overflow-auto">
                     {{ tool.output }}
                   </div>
                 </div>
@@ -223,7 +223,7 @@ function formatDuration(start: number, end?: number) {
 
         <!-- Content / Response -->
         <div v-if="subagent.content" class="pt-1">
-          <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider mb-1">
             <Users class="w-3 h-3" />
             <span>Response</span>
           </div>
@@ -234,7 +234,7 @@ function formatDuration(start: number, end?: number) {
 
         <!-- Error -->
         <div v-if="subagent.error" class="pt-1">
-          <div class="flex items-center gap-1 text-[10px] text-destructive uppercase tracking-wider mb-1">
+          <div class="flex items-center gap-1 text-[11px] text-destructive uppercase tracking-wider mb-1">
             <XCircle class="w-3 h-3" />
             <span>Error</span>
           </div>

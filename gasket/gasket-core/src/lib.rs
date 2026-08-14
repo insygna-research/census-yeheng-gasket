@@ -28,7 +28,7 @@ pub use types::context::{
 };
 pub use types::event::{AgentEvent, ContentDelta};
 pub use types::message::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, UserMessage,
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
 };
 pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,

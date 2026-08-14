@@ -23,7 +23,7 @@ const formatDivider = (ts: number): string => {
 
 <template>
   <div class="flex items-center justify-center py-3">
-    <span class="text-[10px] th-text-muted th-active-bg px-2.5 py-1 rounded-full">
+    <span class="text-[11px] th-text-muted th-active-bg px-2.5 py-1 rounded-full">
       {{ formatDivider(timestamp) }}
     </span>
   </div>
