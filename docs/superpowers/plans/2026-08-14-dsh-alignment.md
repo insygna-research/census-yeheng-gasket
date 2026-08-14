@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个任务结束 `cd gasket && cargo test --all-features`、`cargo clippy --all-features -- -D warnings`、`cargo fmt --all` 全绿。
-- 存储切换是破坏性变更:旧 `messages.jsonl` 一次性迁移为 `events.jsonl`,旧文件重命名保留(`messages.jsonl.migrated`),不删除用户数据。
+- 存储切换是破坏性变更:旧 `messages.jsonl` 一次性迁移为 `events.jsonl`,迁移成功后**删除旧文件**(D1 决策:不保留备份);迁移中途失败则旧文件原样保留。
 - 未知事件类型解析失败 = 加载失败(fail closed),禁止静默丢弃或降级清空。
 - 不新增 crate、不新增外部依赖。
 - loop 保持无状态:`persist` 与 `emit` 同级,都是回调。
@@ -21,14 +21,14 @@
 
 ## 0. Review 决策点(先看这里)
 
-| # | 决策 | 我的建议 | 备选 |
-|---|---|---|---|
-| D1 | 迁移后旧文件 | 重命名 `.migrated` 保留 | 直接删(更干净,但丢回滚路径) |
-| D2 | 取消原因是否入日志 | 入(dsh 只存粗粒度 `aborted`;gasket 自有格式无兼容负担,`TurnEnd::Aborted{cause}` 对调试/审计有用) | 学 dsh 只存粗粒度 |
-| D3 | `GET /api/sessions/{key}/messages` 端点 | Phase 0 就加(后端真相出口,前端 true-up 延后单独做) | 连端点一起延后 |
-| D4 | 工具并发度 / 工具超时默认值 | k=4 并发;`GASKET_TOOL_TIMEOUT_S` 默认 120,0=关闭 | 更保守 k=2 |
-| D5 | Phase 4(并发)是否可与 Phase 1(收件箱)并行 | 可以(互不触碰同一文件的核心路径) | 串行 |
-| D6 | CLI 运行中输入队列(Phase 1 的 CLI 半边) | 延后(CLI 的 reedline 交互改造复杂度高、收益低;先做网关侧) | 一起做 |
+| # | 决策 | 结论(2026-08-14 已裁决) |
+|---|---|---|
+| D1 | 迁移后旧文件 | **不保留**——迁移成功即删除 `messages.jsonl` |
+| D2 | 取消原因是否入日志 | **入**——`TurnEndReason::Aborted{cause}` 落盘 |
+| D3 | `GET /api/sessions/{key}/messages` 端点 | **Phase 0 就加** |
+| D4 | 工具并发度 / 工具超时 | **k=4(`GASKET_TOOL_CONCURRENCY`)、120s(`GASKET_TOOL_TIMEOUT_S`,0=关),均走环境变量** |
+| D5 | Phase 4(并发)是否可与 Phase 1(收件箱)并行 | 可以(未否决,按建议执行) |
+| D6 | CLI 运行中输入队列(Phase 1 的 CLI 半边) | **延后,只做网关侧** |
 
 **阶段依赖**:
 
@@ -168,7 +168,7 @@ impl EventStorage {
     pub fn append_events(&self, session_id: &str, evs: &[SessionEvent]) -> Result<(), AgentError>;
     pub fn load_events(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError>;
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, AgentError>; // 迁移源
-    pub fn rename_legacy(&self, session_id: &str) -> Result<(), AgentError>; // messages.jsonl → .migrated
+    pub fn delete_legacy(&self, session_id: &str) -> Result<(), AgentError>; // 迁移成功后删除 messages.jsonl
 }
 
 // 从 parse_transcript 抽取的通用扫描(单实现,两个存储共用):
@@ -264,7 +264,7 @@ async fn blocked_tool_call_still_persists_result() {
 impl SessionManager {
     /// 打开或迁移:events.jsonl 存在 → load;否则 messages.jsonl 存在 →
     /// 旧消息逐条 SessionEvent::from_message 包裹写入 events.jsonl,
-    /// 旧文件 rename 为 messages.jsonl.migrated(D1);两者皆无 → 新会话。
+    /// 迁移成功后删除旧 messages.jsonl(D1:不保留);两者皆无 → 新会话。
     /// 中间行损坏 → Err(不再 adopt,fail closed)。
     pub async fn open_or_migrate(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError>;
 }
@@ -316,9 +316,9 @@ async fn success_path_log_equals_legacy_messages() {
 }
 
 #[tokio::test]
-async fn legacy_messages_migrate_once_and_keep_backup() {
-    // 造旧 messages.jsonl → open_or_migrate → events.jsonl 出现,
-    // messages.jsonl.migrated 保留,二次 open 不再迁移
+async fn legacy_messages_migrate_once_and_delete_legacy() {
+    // 造旧 messages.jsonl → open_or_migrate → events.jsonl 出现且内容等价,
+    // messages.jsonl 被删除,二次 open 直接 load events.jsonl(幂等)
 }
 
 #[tokio::test]
@@ -331,3 +331,124 @@ async fn corrupted_session_errors_instead_of_adopting() {
 - [ ] **Step 3: 实现**(CLI main.rs 的本地 `history: Vec` 与 `history.extend` 删除,压缩改作用于派生副本 —— CLI 属 Task 5 但编译需同步改,先最小接线)
 - [ ] **Step 4: host + core 全绿**
 - [ ] **Step 5: Commit** — `feat(host)!: event-sourced run_turn with one-shot legacy migration`
+
+### Task 5: Gateway + CLI 接线
+
+**Files:**
+- Modify: `gasket/gasket-gateway/src/ws.rs`、`state.rs`、`api.rs`
+- Modify: `gasket/gasket-cli/src/main.rs`
+
+**Changes:**
+- `ws.rs`:`WsSession.history: Vec<AgentMessage>` 字段删除,改为按需 `derive_messages`;连接建立走 `open_or_migrate`;损坏会话 → 推 `error` 帧 + 断开(不再静默 adopt);`/clear` 对齐 `SessionManager.clear` 的 uuid 轮换(scout 标记的"只清内存"疑点在此核实并修复)。
+- `api.rs`:新增 `GET /api/sessions/{key}/messages` → `derive_messages` 的 JSON(D3;前端 true-up 端点先备好)。
+- `cli/src/main.rs`:删本地 history/budget 兜底重接线(budget 记录仍从 `on_event` 提取 usage,不变)。
+- 事件顺序保证:现有单 writer mpsc 模型不动;`event_map.rs` 无需改(AgentEvent → WS 映射不变)。
+
+- [ ] **Step 1: api.rs 新端点测试(先失败)**:合法 key → 200 + derived 数组;未知 key → 404
+- [ ] **Step 2: 实现** — `cargo test -p gasket-gateway`
+- [ ] **Step 3: ws.rs 损坏会话路径测试**(可行的最小 handler 级测试;若 socket 级测试过重,以 `open_or_migrate` 的 host 测试为准并在 PR 说明)
+- [ ] **Step 4: 全 workspace 绿** — `cargo test --all-features`
+- [ ] **Step 5: Commit** — `feat(gateway,cli): wire event-sourced sessions; fail-loud on corruption`
+
+### Task 6: 文档 + ADR + 收尾验证
+
+**Files:**
+- Create: `docs/adr/0001-event-sourced-session-log.md`(决策记录:动机=副作用先于轮次完成落盘;与 dsh 的三点分歧=无 merge-extensible ignorable(单写者)、durable 记录 cancel cause(D2)、无 request/header 事件)
+- Modify: `docs/architecture.md`(§3 概念表、§4 生命周期、§5.5 存储、§12 决策表重写)、`docs/usage.md`、`README.md`(存储描述、Features 列表)
+- Modify: `gasket/.env.example`(如引入新 env,本 Phase 无)
+
+- [ ] **Step 1: ADR + 三处文档更新**(行号引用同步修正)
+- [ ] **Step 2: 全量验证** — `cd gasket && cargo test --all-features && cargo clippy --all-features -- -D warnings && cargo fmt --all -- --check`
+- [ ] **Step 3: 冒烟** — 本机 `.env` 配好后 `cargo run --bin gasket` 跑一轮带工具调用的对话,Ctrl-C 打断一轮,`ls ~/.gasket/sessions/*/events.jsonl` + `tail` 验证 Aborted 落盘;重启 `gasket` `/resume` 验证派生
+- [ ] **Step 4: Commit** — `docs: event-sourced session log architecture + ADR 0001`
+
+**Phase 0 验收清单:**
+- [ ] 崩溃/失败/取消的轮次,其已发生副作用全部可从磁盘派生(回归测试 `mid_turn_failure_preserves_side_effect` 为证)
+- [ ] 旧 `messages.jsonl` 会话首次打开即迁移,成功后旧文件删除,二次打开幂等
+- [ ] 未知事件类型导致加载失败,错误信息带文件+行号
+- [ ] usage 随 Assistant 事件落盘;重启后 token 感知压缩阈值生效(不退化为条数)
+- [ ] 14 个 agent_loop 既有测试、11 个存储既有测试、4 个 host 集成测试(改造后)全绿
+
+---
+
+## 2. Phase 1: 双目标收件箱(设计已定,落地前出详细计划)
+
+**问题**:turn 进行中收到 WS `message` → 回 `busy` 弹回(用错误数据结构制造的特殊情况)。
+
+**设计**:
+- 网关每会话收件箱:`next_turn`(普通消息排队下一轮)与 `next_step`(转向,下个 step 边界吃掉;V1 可先只做 `next_turn`,`next_step` 留给带 steering 的后续)。
+- 事件日志新增 `InboxEnqueued { target, content }` / `InboxClaimed { count }`(durable,重连不丢;dsh 同款思路)。
+- `busy` 帧删除;前端 `useChatSession` 的 busy 分支改为"已排队"UI。
+- turn 结束边界:若 `next_turn` 非空 → 自动开下一轮(驱动循环:`while let Some(msg) = inbox.claim_next_turn()`)。
+- CLI 半边按 D6 决策延后。
+
+**Files**: `gasket-gateway/src/ws.rs`、`wire.rs`(新帧 `queued_ack`)、`gasket-host/src/session.rs`(inbox 持久化挂 SessionManager)、`web/src/composables/useChatSession.ts`、`web/src/types/index.ts`。
+
+**验收**:turn 中发第二条消息 → 收 `queued_ack` 而非 `busy`;本轮结束后自动消费;杀进程重启后排队消息仍在(从日志派生)。
+
+## 3. Phase 2: 取消语义(设计已定)
+
+**问题**:取消是裸 bool,无 cause、无 keep_inbox;dsh 的运行时/持久两层分工值得抄。
+
+**设计**:
+- `Arc<AtomicBool>` → `Arc<CancelSignal>`:`CancelSignal { flag: AtomicBool, cause: Mutex<Option<CancelCause>> }`,`is_aborted()` 方法名不变(tools 的 `ctx.aborted()` 零改动),新增 `cancel(cause)` / `cause()`。
+- 网关 `cancel` 帧可选携带 `cause`(`{"type":"cancel","cause":"user"}`,默认 user);CLI Ctrl-C = `User`。
+- `keep_inbox`:与 Phase 1 联动 —— cancel 默认清空 `next_step`(转向意图随取消失效),保留 `next_turn`(普通排队);wire 上 `{"type":"cancel","keep_inbox":true}` 全保留。
+- `TurnEndReason::Aborted{cause}` 在 Phase 0 已落盘,本 Phase 只补运行时采集链。
+
+**Files**: `gasket-core/src/types/context.rs`、`agent_loop.rs`、各 tools 的 signal 用法(仅类型名)、`gasket-gateway/src/ws.rs`、`gasket-cli/src/main.rs`、`gasket-host/src/lib.rs`(install_ctrl_c)。
+
+**验收**:取消后日志 `turn_end` 携带 cause;取消不清 `next_turn` 队列(配合 Phase 1);`cargo test --all-features` 绿。
+
+## 4. Phase 3: 压缩进日志(设计已定)
+
+**问题**:压缩只缩内存,重启后压缩边界丢失、水位退化;dsh 的 `SurfaceOp::Replace` 是正解。
+
+**设计**:
+- 事件新增 `Compacted { notice: String, replaces: (usize, usize) }` —— `replaces` 为**事件索引区间**(闭区间,指向被覆盖的首尾消息事件;日志行号即索引,无需存 seq)。
+- `derive_messages` 增量维护"活跃面":遇 `Compacted` 将区间内消息事件替换为一条合成 `User`(notice),区间索引仍指向原事件(多次压缩可嵌套 shadow)。
+- `ContextBudget::compact` 触发时:计算丢弃区间 → 落 `Compacted` 事件 → 返回派生副本喂 LLM。磁盘仍是 append-only,永不改写。
+- 顺带(可选,独立小步):notice 从 `[compacted N earlier messages]` 升级为 LLM 摘要 —— provider 调用一次,失败回退计数提示。默认关,`GASKET_COMPACT_SUMMARY=llm|count`。
+
+**Files**: `gasket-core/src/types/session_event.rs`、`gasket-host/src/compact.rs`、`gasket-host/src/lib.rs`。
+
+**验收**:压缩后重启,派生历史仍以 notice 开头(不回胖);连续两次压缩区间 shadow 正确;压缩永不切断 tool_call↔result(既有 `atomic_groups` 测试扩到事件索引版)。
+
+## 5. Phase 4: 工具并发 + 超时 + backoff jitter(独立,可并行)
+
+**设计**:
+- `execute_tool_calls` 的串行 for-await → `futures_util::stream::iter(calls).buffer_unordered(k)`(k=`GASKET_TOOL_CONCURRENCY`,默认 4);**按调用序收集结果**(协议要求 tool_result 与 tool_call 可配对;收集保序,persist 顺序=调用顺序)。
+- 审批 hook 并发安全:`ApprovalRegistry` 已按 request_id 键控,天然支持;前端并发审批卡按 id 区分(已支持)。
+- 每工具超时:`tokio::time::timeout(dur, execute)` 包装,`GASKET_TOOL_TIMEOUT_S` 默认 120、0=关;超时 → is_error ToolResult(`tool timed out after Ns`),不终止轮次。
+- `backoff_ms` 加 ±20% jitter(一行)。
+
+**Files**: `gasket/gasket-core/src/agent_loop.rs`(`execute_tool_calls`、`backoff_ms`)、`types/context.rs`(`AgentTunables` 增两 env)、`gasket/.env.example`。
+
+**验收**:mock 三工具( sleep 不同时长 )总耗时≈max 而非 sum;结果顺序==调用顺序;超时工具产出 error result 且轮次继续;既有 14 个 loop 测试绿。
+
+## 6. Phase 5: 工程设施(独立,按需逐项)
+
+| 项 | 内容 | 验收 |
+|---|---|---|
+| ADR 目录 | Phase 0 Task 6 已 seed `docs/adr/`;此后每个 Phase 落地各写一条;`docs/architecture.md` §12 决策表迁入 | 每个 Phase 一条 ADR |
+| provider SSE 回放 fixture | `openai_compat`/`anthropic` 支持 `GASKET_RECORD_FIXTURES=dir` 录制真实 SSE 到 `tests/fixtures/*.sse`;新增解析测试走 `include_str!` 回放 | 无 key 测真协议;断流 fixture(半行 SSE)覆盖 torn-stream 路径 |
+| fault server | `gasket-core/tests/support/mod.rs`:本地 axum 测试服务器,可注入 mid-stream 断连/延迟/非 200 | provider 重试策略对真实 HTTP 行为的测试 |
+| doc-drift gate | `scripts/check-doc-refs.sh`:grep 文档中 `\.rs:\d+` 引用 → 校验该行 ±5 行内仍含所述符号;CI 加一步 | 故意挪动符号 → CI 红 |
+| provider 去重审计 | 人工 diff `openai_compat.rs`(379 行) vs `anthropic.rs`(396 行)的请求装配/SSE 组装;重复逻辑下沉 `providers/common.rs` | 两个 provider 文件各减 ≥80 行,行为不变(既有 12 个 provider 测试绿) |
+
+---
+
+## 7. 风险与回滚
+
+| 风险 | 缓解 |
+|---|---|
+| 存储格式破坏性变更伤到既有用户会话 | 迁移先完整写出 events.jsonl 再删旧文件(写失败则旧文件无损);迁移测试覆盖;README/usage 明示不可逆 |
+| persist 回调拖慢流式首 token | append 是 O_APPEND 单次 write;无需 fsync 每事件(崩溃窗口=OS 页缓存,与现状 JSONL 同级);如需更强可后加 `GASKET_FSYNC=1` |
+| loop 插桩引入回归 | 14 个既有 loop 测试 + `persist: None` 路径保持行为逐字节不变 |
+| 并发工具结果乱序破坏 provider 协议 | 保序收集 + persist 顺序断言测试 |
+| 前端仍依赖 localStorage 双写 | Phase 0 先给后端真相端点(D3);前端 true-up 单独小 Phase,期间双写无害(后端为准) |
+
+## 8. 建议执行顺序与相对规模
+
+Phase 0(大,~6 任务)> Phase 2(小)> Phase 1(中)> Phase 3(小)> Phase 4(中,可并行)> Phase 5(逐项)。
+Phase 0 完成后逐 Phase 出各自的详细 bite-sized 计划(本计划 §2-§6 已锁设计与验收)。
