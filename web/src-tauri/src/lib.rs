@@ -3,10 +3,15 @@
 //! The session-management API lives here as Tauri commands so the desktop
 //! app is self-contained: it reads/writes the on-disk session store
 //! (`~/.gasket/sessions`) directly through gasket-core/gasket-host instead of
-//! depending on a separately running gateway process. The gateway remains
-//! only the WebSocket chat/agent transport.
+//! depending on a separately running gateway process. The `chat` module goes
+//! one step further and hosts the agent loop itself: per-session Hosts stream
+//! turn events over Tauri IPC (`chat-event`), replacing the gateway's
+//! WebSocket transport inside the desktop shell. The gateway remains the
+//! transport for plain-browser (dev) usage.
 
 use gasket_core::{EventStorage, SessionMeta};
+
+mod chat;
 
 fn session_store() -> EventStorage {
   EventStorage::new(gasket_core::JsonlStorage::default_root().base_dir_clone())
@@ -98,11 +103,15 @@ async fn delete_session(id: String) -> Result<bool, String> {
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_notification::init())
+    .manage(chat::ChatState::new())
     .invoke_handler(tauri::generate_handler![
       list_sessions,
       get_session_messages,
       rename_session,
       delete_session,
+      chat::send_message,
+      chat::cancel_turn,
+      chat::approval_response,
     ])
     .setup(|app| {
       if cfg!(debug_assertions) {

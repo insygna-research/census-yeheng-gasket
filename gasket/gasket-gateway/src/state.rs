@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures_util::stream::SplitSink;
 use tokio::sync::Mutex;
 
-use crate::approval::ApprovalRegistry;
+use gasket_host::approval::ApprovalRegistry;
 
 pub(crate) struct AppState {
     pub(crate) sessions: DashMap<String, Arc<Mutex<WsSession>>>,

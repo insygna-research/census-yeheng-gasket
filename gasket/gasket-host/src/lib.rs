@@ -9,8 +9,10 @@ use gasket_core::{
     StopReason, StreamFn, ToolDefinition, TurnEndReason, UserMessage,
 };
 
+pub mod approval;
 pub mod compact;
 pub mod config;
+pub mod event_map;
 pub mod external_tool;
 pub mod hooks;
 pub mod mcp;
@@ -18,6 +20,7 @@ pub mod permission;
 pub mod printer;
 pub mod session;
 pub mod subagent;
+pub mod wire;
 
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};

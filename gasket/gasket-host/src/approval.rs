@@ -1,5 +1,6 @@
 //! 审批请求登记：id → oneshot 决策通道 + 按工具名的 remember 缓存。
-//! 纯逻辑、无 IO，可单测；WS 收发胶水在 main.rs 的 approver 闭包里。
+//! 纯逻辑、无 IO，可单测；传输胶水在各宿主的 approver 闭包里
+//! （gateway 走 WebSocket 往返，Tauri 桌面端走 IPC 事件）。
 
 use std::collections::HashMap;
 

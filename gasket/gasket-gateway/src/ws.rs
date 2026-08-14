@@ -14,16 +14,17 @@ use tracing::{error, info, warn};
 
 use gasket_core::{built_in_tools, AgentEvent};
 
+use gasket_host::approval::{self, ApprovalRegistry, RegisterOutcome};
+use gasket_host::event_map::event_to_ws;
 use gasket_host::permission::Approver;
+use gasket_host::wire::OutgoingEvent;
 use gasket_host::{
     load_all_mcp, ConfigLoader, Host, HostSubagentSpawner, Mode, PermissionPolicy, SessionManager,
 };
 
 use crate::api::load_external_tools;
-use crate::approval::{self, ApprovalRegistry, RegisterOutcome};
-use crate::event_map::event_to_ws;
 use crate::state::{AppState, WsSession};
-use crate::wire::{ApprovalResponse, IncomingMessage, OutgoingEvent};
+use crate::wire::{ApprovalResponse, IncomingMessage};
 
 /// Everything written to the socket flows through ONE ordered channel and a
 /// single writer task. A single writer guarantees cross-stream ordering:
@@ -186,7 +187,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         s.usage_out += output_tokens;
                         None
                     } else {
-                        crate::event_map::subagent_event_to_ws(&ev)
+                        gasket_host::event_map::subagent_event_to_ws(&ev)
+                            .map(|v| serde_json::to_string(&v).unwrap_or_default())
                     }
                 }
                 WireEvent::Approval {

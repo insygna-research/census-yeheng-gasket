@@ -1,6 +1,8 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue';
 import { useChatStore } from '@/stores/chatStore';
 import { useIMWebSocket } from '@/hooks/useIMWebSocket';
+import { useTauriChat } from '@/hooks/useTauriChat';
+import { isTauri } from '@/lib/platform';
 import { backendBaseUrl, fetchSessionMessages, sessionKey } from '@/lib/backend';
 import { notifyTurnComplete } from '@/lib/notifications';
 import type { ApprovalRequest, Message, SubagentState } from '@/types';
@@ -367,8 +369,13 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
+  // Transport selection: inside the desktop shell the chat runs in-process
+  // over Tauri IPC; in a plain browser (dev) it keeps using the gateway's
+  // WebSocket. Both transports deliver the same wire events to handleMessage.
   const { isConnected, showReconnectButton, connect, manualReconnect, send } =
-    useIMWebSocket(computed(() => chatId.value), handleMessage);
+    isTauri
+      ? useTauriChat(computed(() => chatId.value), handleMessage)
+      : useIMWebSocket(computed(() => chatId.value), handleMessage);
 
   const sessionStatus = computed<SessionStatus>(() => {
     if (!isConnected.value) return 'disconnected';
