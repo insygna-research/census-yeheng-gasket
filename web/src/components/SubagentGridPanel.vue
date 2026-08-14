@@ -214,7 +214,7 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
         class="flex items-center justify-center gap-2 py-6 text-sm th-text-muted"
       >
         <Loader2 class="w-4 h-4 animate-spin" />
-        <span>正在综合结果...</span>
+        <span>Synthesizing results...</span>
       </div>
     </Transition>
   </div>

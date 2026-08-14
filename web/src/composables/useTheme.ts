@@ -1,6 +1,7 @@
 import { computed, ref, watch } from 'vue'
+import { readJSON, storageKeys, writeJSON } from '@/lib/storage'
 
-const STORAGE_KEY = 'gasket_theme_v2'
+const STORAGE_KEY = storageKeys.theme
 const LEGACY_KEY = 'gasket_theme'
 
 export type ThemeMode = 'light' | 'dark'
@@ -23,16 +24,11 @@ function migrateMarkdownStyle(old: string | undefined): MarkdownStyle {
 
 function getInitialState(): ThemeState {
   // Try new format first
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
-      const parsed = JSON.parse(stored)
-      if (parsed.mode && parsed.hue && HUES.includes(parsed.hue)) {
-        const md: MarkdownStyle = migrateMarkdownStyle(parsed.markdownStyle)
-        return { mode: parsed.mode, hue: parsed.hue, markdownStyle: md }
-      }
-    }
-  } catch { /* ignore */ }
+  const parsed = readJSON<Partial<ThemeState> | null>(STORAGE_KEY, null)
+  if (parsed && parsed.mode && parsed.hue && HUES.includes(parsed.hue)) {
+    const md: MarkdownStyle = migrateMarkdownStyle(parsed.markdownStyle)
+    return { mode: parsed.mode, hue: parsed.hue, markdownStyle: md }
+  }
 
   // Migrate from legacy single-value theme
   const legacy = localStorage.getItem(LEGACY_KEY) as ThemeMode | null
@@ -57,7 +53,7 @@ const applyTheme = (s: ThemeState) => {
   }
   root.setAttribute('data-hue', s.hue)
   root.setAttribute('data-md-style', s.markdownStyle)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
+  writeJSON(STORAGE_KEY, s)
 }
 
 applyTheme(_state.value)

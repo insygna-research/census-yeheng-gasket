@@ -70,6 +70,14 @@ onUnmounted(() => {
 // Messages
 const messages = computed(() => chatStore.activeMessages);
 const hasUserMessages = computed(() => messages.value.some(m => m.role === 'user' || m.role === 'bot'));
+const chatTitle = computed(() => chatStore.getChat(props.chatId)?.name || 'Chat');
+
+// Esc stops an in-flight generation
+const onKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && (session.isReceiving || session.isThinking)) {
+    session.stopGenerating();
+  }
+};
 
 watch(() => messages.value.length, () => scrollToBottom());
 watch(() => props.chatId, () => {
@@ -83,6 +91,11 @@ onMounted(() => {
   session.fetchContext();
   nextTick(() => scrollToBottom(true));
   setupScrollObserver();
+  window.addEventListener('keydown', onKeydown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown);
 });
 
 const suggestedPrompts = [
@@ -120,6 +133,7 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
   <div class="flex h-full w-full relative">
     <div class="flex flex-col flex-1 min-w-0">
       <ChatHeader
+        :chat-title="chatTitle"
         :is-connected="session.isConnected"
         :session-status="session.sessionStatus"
         :show-reconnect-button="session.showReconnectButton"
