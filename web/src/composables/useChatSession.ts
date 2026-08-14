@@ -220,7 +220,7 @@ export function useChatSession(chatId: { value: string }) {
       case 'tool_start':
         isThinking.value = true;
         chatStore.ensureToolCalls(chatId.value, botMsg.id);
-        const toolId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
+        const toolId = msg.tool_call_id || (Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11));
         chatStore.pushToolCall(chatId.value, botMsg.id, {
           id: toolId,
           name: msg.name,
@@ -234,13 +234,14 @@ export function useChatSession(chatId: { value: string }) {
       case 'tool_end':
         isThinking.value = true;
         const toolCalls = chatStore.activeMessages.find(m => m.id === botMsg.id)?.toolCalls;
-        // A tool_end resolves exactly the running call it corresponds to. When
-        // the core emits ToolExecutionEnd without a preceding ToolExecutionStart
-        // (approval denied / timeout / cancel), no running entry exists — append
-        // a standalone errored entry instead of falling back to (and thus
-        // overwriting) an unrelated tool's result.
+        // Match by tool_call_id when the gateway provides it (exact); fall back to
+        // newest-running-by-name for older gateways. end-without-start (denied/
+        // timeout/cancel) still has no matching entry — append a standalone errored
+        // entry below with the real id.
         const runningTool = toolCalls
-          ? [...toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running')
+          ? (msg.tool_call_id
+              ? toolCalls.find(t => t.id === msg.tool_call_id && t.status === 'running')
+              : [...toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running'))
           : undefined;
         if (runningTool) {
           const updates: { status: 'error' | 'complete'; result: string; duration?: string } = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output };
@@ -252,7 +253,7 @@ export function useChatSession(chatId: { value: string }) {
         } else {
           chatStore.ensureToolCalls(chatId.value, botMsg.id);
           chatStore.pushToolCall(chatId.value, botMsg.id, {
-            id: Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9),
+            id: msg.tool_call_id || (Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11)),
             name: msg.name || 'unknown',
             arguments: '',
             status: 'error',

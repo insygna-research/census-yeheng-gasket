@@ -15,6 +15,7 @@ export interface WebSocketMessage {
   output?: string;
   error?: string;
   message?: string;
+  tool_call_id?: string;
 }
 
 export function useIMWebSocket(
