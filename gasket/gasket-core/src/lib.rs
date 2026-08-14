@@ -17,7 +17,7 @@ pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
 pub use extension::{ExtensionApi, ExtensionApiImpl};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
-pub use storage::{is_valid_session_id, JsonlStorage};
+pub use storage::{is_valid_session_id, EventStorage, JsonlStorage};
 pub use subagent::{
     NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
 };
@@ -30,6 +30,7 @@ pub use types::event::{AgentEvent, ContentDelta};
 pub use types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
 };
+pub use types::session_event::{derive_messages, CancelCause, SessionEvent, TurnEndReason};
 pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,
     ToolResult,

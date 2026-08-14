@@ -3,10 +3,10 @@
 //!
 //! ## Architecture
 //!
-//! Each WebSocket connection is one session. The main tokio task loops on
-//! incoming messages.  When a `"message"` arrives it spawns the agent loop in
-//! a background task and enters a secondary select loop that multiplexes agent
-//! events (forwarded to the WebSocket) and incoming messages (cancel, etc.).
+//! Each WebSocket connection is one session with one `Host`. The main tokio
+//! task loops on incoming messages. When a `"message"` arrives it runs the
+//! turn inline (`run_turn`) and multiplexes it against incoming frames
+//! (cancel, approvals) in a secondary select loop.
 //!
 //! ## Wire protocol (frontend ↔ gateway)
 //!
@@ -42,7 +42,7 @@ use axum::Router;
 use dashmap::DashMap;
 use tracing::info;
 
-use crate::api::{compact_context, get_commands, get_context, list_sessions};
+use crate::api::{compact_context, get_commands, get_context, get_messages, list_sessions};
 use crate::state::AppState;
 use crate::ws::ws_handler;
 
@@ -65,8 +65,8 @@ async fn main() {
 
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
+        store_root: gasket_core::JsonlStorage::default_root().base_dir_clone(),
     });
-
     let frontend_dist =
         std::env::var("GASKET_GATEWAY_STATIC_DIR").unwrap_or_else(|_| "../web/dist".to_string());
 
@@ -76,6 +76,7 @@ async fn main() {
         .route("/api/commands", get(get_commands))
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))
+        .route("/api/sessions/{key}/messages", get(get_messages))
         .fallback_service(
             tower_http::services::ServeDir::new(&frontend_dist).not_found_service(
                 tower_http::services::ServeFile::new(format!("{frontend_dist}/index.html")),

@@ -1,16 +1,26 @@
-//! Offline end-to-end integration tests driving the full host pipeline
-//! (Host, ConfigLoader, SessionManager, PermissionPolicy, EventPrinter,
-//! run_agent_loop) with a deterministic FakeStream: no network, no LLM keys,
-//! CI-mandatory.
+//! Offline end-to-end integration tests for the event-sourced host pipeline
+//! (Host, ConfigLoader, SessionManager, PermissionPolicy, run_agent_loop +
+//! persist callback, EventStorage) with a deterministic FakeStream: no
+//! network, no LLM keys, CI-mandatory.
+//!
+//! The log under `<root>/<session>/events.jsonl` is the single source of
+//! truth: `run_turn` derives history from it, the loop persists each
+//! Assistant/ToolResult as it happens, and the host frames each turn with
+//! TurnStart/User/TurnEnd. Legacy `messages.jsonl` migrates once, in full,
+//! and is then deleted.
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use common::FakeStream;
-use gasket_core::{AgentEvent, AgentMessage, ContentBlock, StreamChunk, UserMessage};
+use gasket_core::{
+    derive_messages, AgentMessage, ContentBlock, EventStorage, SessionEvent, StreamChunk,
+    TurnEndReason, UserMessage,
+};
 use gasket_host::{
-    ConfigLoader, ContextBudget, EventPrinter, Host, HostConfig, Mode, PermissionPolicy,
-    SessionManager,
+    ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
+    TurnSummary,
 };
 
 fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
@@ -44,207 +54,192 @@ fn full_auto_policy() -> PermissionPolicy {
     PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { false })))
 }
 
-/// Basic chat: one text script. Asserts the assistant message is produced,
-/// the printer renders it, and the transcript is persisted to JSONL.
-#[tokio::test]
-async fn host_basic_chat() {
-    let tmp = tempfile::tempdir().unwrap();
-    let session = SessionManager::with_root(tmp.path().to_path_buf());
-    let fake = FakeStream::new(vec![vec![
-        StreamChunk::TextDelta("pong".into()),
-        StreamChunk::Usage {
-            input: 1,
-            output: 1,
-        },
-        StreamChunk::Done,
-    ]]);
-    let mut host = Host::new(
-        test_cfg(false),
-        session,
-        Arc::new(full_auto_policy()),
-        "You are a helpful assistant.".into(),
-        vec![],
-    )
-    .with_stream_fn(Arc::new(fake));
-
-    let history: Vec<AgentMessage> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
-    let new_msgs = host
-        .run_turn(user_msg("hello"), &history, |ev| {
-            EventPrinter::new(&mut buf).on_event(&ev);
-        })
-        .await
-        .expect("basic chat turn should succeed");
-
-    assert!(
-        new_msgs.iter().any(|m| matches!(
-            m,
-            AgentMessage::Assistant(a) if a.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "pong"))
-        )),
-        "expected an assistant message with the streamed text"
-    );
-    let out = String::from_utf8_lossy(&buf);
-    assert!(
-        out.contains("pong"),
-        "printer must render the streamed text, got: {out}"
-    );
-
-    // Persisted: messages.jsonl exists under the current session dir.
-    let sid = host.session().current_id().to_string();
-    let path = tmp.path().join(&sid).join("messages.jsonl");
-    let raw = std::fs::read_to_string(&path).expect("session transcript must be persisted");
-    assert!(
-        raw.contains("pong"),
-        "persisted transcript missing assistant text"
-    );
+/// A `write` tool-call script chunk (args streamed as one delta, like the
+/// FakeStream's other scripts).
+fn write_call(id: &str, path: &str, content: &str) -> StreamChunk {
+    StreamChunk::ToolCallDelta {
+        id: id.into(),
+        name: Some("write".into()),
+        args_delta: serde_json::json!({ "path": path, "content": content }).to_string(),
+    }
 }
 
-/// Tool call: script 1 asks for `list`, script 2 closes with text. Asserts a
-/// ToolResult message is produced and executed under FullAuto, plus both
-/// assistant and tool result end up persisted.
+/// The reason of the log's only TurnEnd event.
+fn turn_end_reason(events: &[SessionEvent]) -> TurnEndReason {
+    let ends: Vec<&TurnEndReason> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            SessionEvent::TurnEnd { reason } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "expected exactly one TurnEnd, got {ends:?}");
+    ends[0].clone()
+}
+
+/// The reason this plan exists: a tool side effect that already happened must
+/// survive a turn whose second stream errors mid-flight. The log keeps every
+/// fact (user, assistant, tool result) and ends with TurnEnd=Error — never a
+/// silently adopted "fresh" session.
 #[tokio::test]
-async fn host_tool_call() {
+async fn mid_turn_failure_preserves_side_effect() {
     let tmp = tempfile::tempdir().unwrap();
+    // The `write` tool resolves within the process cwd, so the side-effect
+    // target must live in a dir under it.
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = format!(
+        "{}/side-effect.txt",
+        work.path().file_name().unwrap().to_string_lossy()
+    );
+
     let session = SessionManager::with_root(tmp.path().to_path_buf());
     let fake = FakeStream::new(vec![
+        vec![write_call("t1", &rel, "precious"), StreamChunk::Done],
+        // Mid-stream error AFTER content was emitted: not retried (would
+        // duplicate partial output), surfaced as stop_reason::Error.
         vec![
-            StreamChunk::ToolCallDelta {
-                id: "t1".into(),
-                name: Some("list".into()),
-                args_delta: "{}".into(),
-            },
-            StreamChunk::Done,
+            StreamChunk::TextDelta("partial".into()),
+            StreamChunk::Error("boom".into()),
         ],
-        vec![StreamChunk::TextDelta("done".into()), StreamChunk::Done],
     ]);
-    let mut host = Host::new(
-        test_cfg(false),
-        session,
-        Arc::new(full_auto_policy()),
-        "You are a helpful assistant.".into(),
-        gasket_core::built_in_tools(),
-    )
-    .with_stream_fn(Arc::new(fake));
-
-    let history: Vec<AgentMessage> = Vec::new();
-    let new_msgs = host
-        .run_turn(user_msg("list the cwd"), &history, |_| {})
-        .await
-        .expect("tool-call turn should succeed");
-
-    assert!(
-        new_msgs
-            .iter()
-            .any(|m| matches!(m, AgentMessage::ToolResult { .. })),
-        "expected a ToolResult message after the list call"
-    );
-    assert!(
-        new_msgs
-            .iter()
-            .any(|m| matches!(m, AgentMessage::Assistant(_))),
-        "expected the closing assistant message"
-    );
-
-    let sid = host.session().current_id().to_string();
-    let raw = std::fs::read_to_string(tmp.path().join(&sid).join("messages.jsonl"))
-        .expect("session transcript must be persisted");
-    assert!(
-        raw.contains("\"tool_result\""),
-        "tool result missing from transcript"
-    );
-}
-
-/// An errored stream with retry off must surface as `stop_reason::Error` on
-/// the assistant message (the loop feeds it back as a message event — it does
-/// NOT fail the run; that is deliberate core behavior). The errored turn is a
-/// complete transcript record, so it IS persisted; nothing is lost.
-#[tokio::test]
-async fn host_error_surfaces_and_persists() {
-    let tmp = tempfile::tempdir().unwrap();
-    let session = SessionManager::with_root(tmp.path().to_path_buf());
-    let fake = FakeStream::new(vec![vec![StreamChunk::Error("boom".into())]]);
-    let mut host = Host::new(
+    let host = Host::new(
         test_cfg(true),
         session,
         Arc::new(full_auto_policy()),
         "sys".into(),
-        vec![],
+        gasket_core::built_in_tools(),
     )
     .with_stream_fn(Arc::new(fake));
 
-    let history: Vec<AgentMessage> = Vec::new();
-    let mut surfaced = false;
-    let new_msgs = host
-        .run_turn(user_msg("hi"), &history, |ev| {
-            // The loop surfaces pre-content errors as an AfterProviderResponse
-            // whose message carries stop_reason::Error (AgentEvent::Error is
-            // reserved for hosts that emit their own errors).
-            if let AgentEvent::AfterProviderResponse { response, .. } = ev {
-                surfaced = matches!(response.stop_reason, gasket_core::StopReason::Error(_));
+    let summary = host
+        .run_turn("write the file please", |_| {})
+        .await
+        .expect("a mid-stream error surfaces as a message; it must not fail the turn");
+
+    // The side effect happened — nothing may erase that fact.
+    assert!(
+        std::path::Path::new(&rel).exists(),
+        "tool side effect must exist on disk after the failed turn"
+    );
+    assert!(
+        matches!(summary.reason, TurnEndReason::Error { .. }),
+        "expected TurnEnd::Error, got {:?}",
+        summary.reason
+    );
+
+    // Reopen: the derived history keeps user + assistant + tool result.
+    let sid = host.session().current_id().to_string();
+    let reopen = SessionManager::with_root(tmp.path().to_path_buf());
+    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let msgs = derive_messages(&events);
+    assert!(
+        msgs.iter().any(|m| matches!(m, AgentMessage::User(_))),
+        "user message missing from derived history"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, AgentMessage::Assistant(_))),
+        "assistant message missing from derived history"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult(_))),
+        "completed tool result missing from derived history"
+    );
+    assert!(matches!(
+        turn_end_reason(&events),
+        TurnEndReason::Error { .. }
+    ));
+}
+
+/// A cooperative abort between tool executions persists the partial facts:
+/// the completed ToolResult is in the log and TurnEnd{Aborted} is written.
+#[tokio::test]
+async fn aborted_turn_persists_partial_facts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = format!(
+        "{}/aborted.txt",
+        work.path().file_name().unwrap().to_string_lossy()
+    );
+
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    // One tool-call script: after its ToolExecutionEnd fires we set the abort
+    // signal, so the next provider request is skipped (StopReason::Aborted).
+    let fake = FakeStream::new(vec![vec![
+        write_call("t1", &rel, "done"),
+        StreamChunk::Done,
+    ]]);
+    let host = Host::new(
+        test_cfg(false),
+        session,
+        Arc::new(full_auto_policy()),
+        "sys".into(),
+        gasket_core::built_in_tools(),
+    )
+    .with_stream_fn(Arc::new(fake));
+
+    let signal = host.signal().clone();
+    let summary = host
+        .run_turn("go", move |ev| {
+            if matches!(ev, gasket_core::AgentEvent::ToolExecutionEnd { .. }) {
+                signal.store(true, Ordering::Relaxed);
             }
         })
         .await
-        .expect("error stream must not fail the run — it surfaces as a message");
+        .expect("an aborted turn returns Ok with partial facts");
 
     assert!(
-        new_msgs.iter().any(|m| matches!(
-            m,
-            AgentMessage::Assistant(a)
-                if matches!(a.stop_reason, gasket_core::StopReason::Error(_))
-        )),
-        "expected assistant message with stop_reason::Error"
+        matches!(summary.reason, TurnEndReason::Aborted { .. }),
+        "expected TurnEnd::Aborted, got {:?}",
+        summary.reason
     );
     assert!(
-        surfaced,
-        "the errored response must reach the on_event callback"
+        std::path::Path::new(&rel).exists(),
+        "the tool that completed before the abort must have run"
     );
 
-    // The errored turn is a complete transcript record and must persist.
-    let sid = host.session().current_id();
-    let path = tmp.path().join(sid).join("messages.jsonl");
-    let raw = std::fs::read_to_string(&path).expect("errored turn must still be persisted");
+    let sid = host.session().current_id().to_string();
+    let events = EventStorage::new(tmp.path())
+        .load_events(&sid)
+        .await
+        .unwrap();
     assert!(
-        raw.contains("assistant"),
-        "transcript must contain the errored turn"
+        events
+            .iter()
+            .any(|ev| matches!(ev, SessionEvent::ToolResult(_))),
+        "completed tool result must be persisted"
     );
+    assert!(matches!(
+        turn_end_reason(&events),
+        TurnEndReason::Aborted { .. }
+    ));
 }
 
-/// Multi-turn `run_turn` with token-driven compaction between turns (mirroring
-/// the CLI loop). The working history is compacted via `ContextBudget` before
-/// each turn once the provider-reported `input_tokens` trips the threshold, and
-/// the result must never contain an orphan `ToolCall` (no matching `ToolResult`)
-/// or orphan `ToolResult` (no matching `ToolCall`). A tiny context window makes
-/// a normal `Usage` report force compaction on the next turn, deterministically.
+/// A full successful turn: the event log projects to exactly the messages the
+/// loop returned (which is what the legacy history+new_msgs concatenation
+/// used to be), framed by TurnStart/User/TurnEnd{Completed}.
 #[tokio::test]
-async fn compaction_keeps_history_valid() {
+async fn success_path_log_equals_legacy_messages() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = format!(
+        "{}/ok.txt",
+        work.path().file_name().unwrap().to_string_lossy()
+    );
 
-    // 4 tool-call turns = 8 scripts (2 per turn: ToolCallDelta+Done triggers
-    // execution, then TextDelta+Usage+Done closes with EndTurn). input=90 trips
-    // the 80% threshold of window=100 on the following turn. Distinct tool_call
-    // ids per turn make an orphan split actually detectable.
-    let mut scripts: Vec<Vec<StreamChunk>> = Vec::new();
-    for id in ["t1", "t2", "t3", "t4"] {
-        scripts.push(vec![
-            StreamChunk::ToolCallDelta {
-                id: id.into(),
-                name: Some("list".into()),
-                args_delta: "{}".into(),
-            },
-            StreamChunk::Done,
-        ]);
-        scripts.push(vec![
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let fake = FakeStream::new(vec![
+        vec![write_call("t1", &rel, "data"), StreamChunk::Done],
+        vec![
             StreamChunk::TextDelta("done".into()),
             StreamChunk::Usage {
-                input: 90,
-                output: 1,
+                input: 10,
+                output: 2,
             },
             StreamChunk::Done,
-        ]);
-    }
-    let fake = FakeStream::new(scripts);
-    let mut host = Host::new(
+        ],
+    ]);
+    let host = Host::new(
         test_cfg(false),
         session,
         Arc::new(full_auto_policy()),
@@ -253,90 +248,156 @@ async fn compaction_keeps_history_valid() {
     )
     .with_stream_fn(Arc::new(fake));
 
-    let mut budget = ContextBudget::from_env_with(&fake_env(&[
-        ("GASKET_LLM_BASE_URL", "https://api.test/v1"),
-        ("GASKET_LLM_KEY", "sk-test"),
-        ("GASKET_LLM_MODEL", "m"),
-        ("GASKET_CONTEXT_WINDOW", "100"),
-        ("GASKET_COMPACT_THRESHOLD_PCT", "80"),
-        ("GASKET_COMPACT_TARGET_PCT", "50"),
-    ]));
-    let mut history: Vec<AgentMessage> = Vec::new();
-
-    for _ in 0..4 {
-        // Mirror the CLI: compact before the turn when over threshold.
-        if budget.needs_compaction() {
-            history = budget.compact(&history);
-        }
-        let new = host
-            .run_turn(user_msg("go"), &history, |ev| {
-                if let AgentEvent::AfterProviderResponse { response, .. } = ev {
-                    if let Some(u) = response.usage {
-                        budget.record_input_tokens(u.input_tokens);
-                    }
-                }
-            })
-            .await
-            .expect("turn should succeed");
-        history.extend(new);
-    }
-
-    // Compaction must have fired at least once: turn 1 reports input=90 (>80%
-    // of 100), so turns 2..4 enter the loop over threshold and compact.
-    let compacted = history.iter().any(|m| {
-        matches!(
-            m,
-            AgentMessage::User(u) if u.content.iter().any(|b| matches!(
-                b,
-                ContentBlock::Text { text } if text.contains("[compacted")
-            ))
-        )
-    });
+    let mut buf: Vec<u8> = Vec::new();
+    let summary: TurnSummary = host
+        .run_turn("write it", |ev| {
+            EventPrinter::new(&mut buf).on_event(&ev);
+        })
+        .await
+        .expect("success turn");
+    assert!(matches!(summary.reason, TurnEndReason::Completed));
     assert!(
-        compacted,
-        "expected at least one [compacted ...] notice in history"
+        String::from_utf8_lossy(&buf).contains("done"),
+        "printer must render the streamed text"
     );
 
-    // No orphan tool_call / tool_result pairs across the whole history.
-    assert_no_orphan_tool_pairs(&history);
+    let sid = host.session().current_id().to_string();
+    let events = EventStorage::new(tmp.path())
+        .load_events(&sid)
+        .await
+        .unwrap();
 
-    // History non-empty and the tail is not a dangling ToolResult.
-    assert!(!history.is_empty(), "history must be non-empty");
-    assert!(
-        !matches!(history.last(), Some(AgentMessage::ToolResult(_))),
-        "history must not end on a bare ToolResult"
+    // Framing: TurnStart first, User second, TurnEnd{Completed} last.
+    assert!(matches!(events.first(), Some(SessionEvent::TurnStart)));
+    assert!(matches!(events.get(1), Some(SessionEvent::User(_))));
+    assert!(matches!(events.last(), Some(SessionEvent::TurnEnd { .. })));
+
+    // The projection equals the loop's returned messages — i.e. the legacy
+    // "history + new_msgs" list the old API assembled in memory.
+    assert_eq!(
+        derive_messages(&events),
+        summary.new_messages,
+        "derived history must equal the loop's new messages"
+    );
+    // And it is the full legacy shape: user, assistant(tool call), tool
+    // result, closing assistant.
+    let kinds: Vec<&str> = summary
+        .new_messages
+        .iter()
+        .map(|m| match m {
+            AgentMessage::User(_) => "user",
+            AgentMessage::Assistant(_) => "assistant",
+            AgentMessage::ToolResult(_) => "toolresult",
+            AgentMessage::Custom(_) => "custom",
+        })
+        .collect();
+    assert_eq!(kinds, vec!["user", "assistant", "toolresult", "assistant"]);
+
+    // Usage travels with the persisted assistant event (restart-safe budget).
+    let last_usage = events.iter().rev().find_map(|ev| match ev {
+        SessionEvent::Assistant { usage, .. } => *usage,
+        _ => None,
+    });
+    assert_eq!(
+        last_usage.map(|u| u.input_tokens),
+        Some(10),
+        "assistant usage must be persisted for token-aware compaction restarts"
     );
 }
 
-/// Every `ContentBlock::ToolCall` id must have a matching `ToolResult`
-/// (`tool_call_id`), and vice versa. Scans the whole history; an orphan on
-/// either side fails with the offending id.
-fn assert_no_orphan_tool_pairs(history: &[AgentMessage]) {
-    let mut call_ids: Vec<String> = Vec::new();
-    let mut result_ids: Vec<String> = Vec::new();
-    for m in history {
-        match m {
-            AgentMessage::Assistant(a) => {
-                for b in &a.content {
-                    if let ContentBlock::ToolCall { tool_call } = b {
-                        call_ids.push(tool_call.id.clone());
-                    }
-                }
-            }
-            AgentMessage::ToolResult(r) => result_ids.push(r.tool_call_id.clone()),
-            _ => {}
-        }
+/// One-shot legacy migration: messages.jsonl is wrapped into events.jsonl in
+/// full, deleted only after the full write, and a second open loads
+/// events.jsonl directly (idempotent).
+#[tokio::test]
+async fn legacy_messages_migrate_once_and_delete_legacy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sid = "legacy1";
+    let dir = tmp.path().join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A legacy transcript: user + assistant rows.
+    let legacy = vec![user_msg("hello"), user_msg("again")];
+    let mut raw = String::new();
+    for m in &legacy {
+        raw.push_str(&serde_json::to_string(m).unwrap());
+        raw.push('\n');
     }
-    for id in &call_ids {
-        assert!(
-            result_ids.contains(id),
-            "orphan tool_call {id} has no matching result"
-        );
-    }
-    for id in &result_ids {
-        assert!(
-            call_ids.contains(id),
-            "orphan tool_result {id} has no matching call"
-        );
-    }
+    std::fs::write(dir.join("messages.jsonl"), raw).unwrap();
+
+    let sm = SessionManager::with_root(tmp.path().to_path_buf());
+    let events = sm.open_or_migrate(sid).await.unwrap();
+    assert_eq!(
+        derive_messages(&events),
+        legacy,
+        "migrated log must project to the legacy messages"
+    );
+    assert!(
+        dir.join("events.jsonl").exists(),
+        "events.jsonl must exist after migration"
+    );
+    assert!(
+        !dir.join("events.jsonl.tmp").exists(),
+        "the atomic-install staging file must not survive the migration"
+    );
+    assert!(
+        !dir.join("messages.jsonl").exists(),
+        "legacy messages.jsonl must be deleted after a successful migration (D1)"
+    );
+
+    // Second open: loads events.jsonl directly, no legacy to touch.
+    let events2 = sm.open_or_migrate(sid).await.unwrap();
+    assert_eq!(events, events2, "second open must be idempotent");
+    assert!(!dir.join("messages.jsonl").exists());
+}
+
+/// Corruption fails closed: a mid-file bad row makes open_or_migrate return
+/// Err — the old adopt-and-start-fresh behavior is gone, and a failed
+/// migration leaves the legacy file untouched.
+#[tokio::test]
+async fn corrupted_session_errors_instead_of_adopting() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Corrupt events.jsonl (bad middle line): has_events → load_events → Err.
+    let sid = "broken-events";
+    let dir = tmp.path().join(sid);
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = serde_json::to_string(&SessionEvent::User(user_msg("a"))).unwrap();
+    let mut raw = String::new();
+    raw.push_str(&good);
+    raw.push('\n');
+    raw.push_str("{\"type\":\"???\"\n"); // torn/corrupt middle row
+    raw.push_str(&good);
+    raw.push('\n');
+    std::fs::write(dir.join("events.jsonl"), raw).unwrap();
+    let sm = SessionManager::with_root(tmp.path().to_path_buf());
+    assert!(
+        sm.open_or_migrate(sid).await.is_err(),
+        "corrupt events.jsonl must fail closed, not adopt"
+    );
+
+    // Corrupt legacy messages.jsonl (bad middle line): migration input is
+    // unreadable → Err, and the legacy file must be left untouched.
+    let sid2 = "broken-legacy";
+    let dir2 = tmp.path().join(sid2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let mut raw2 = String::new();
+    raw2.push_str(&serde_json::to_string(&user_msg("a")).unwrap());
+    raw2.push('\n');
+    raw2.push_str("{\"role\":\"??\"\n");
+    raw2.push_str(&serde_json::to_string(&user_msg("b")).unwrap());
+    raw2.push('\n');
+    std::fs::write(dir2.join("messages.jsonl"), raw2).unwrap();
+    let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
+    assert!(
+        sm2.open_or_migrate(sid2).await.is_err(),
+        "corrupt legacy transcript must fail closed, not adopt"
+    );
+    assert!(
+        dir2.join("messages.jsonl").exists(),
+        "a failed migration must leave the legacy file untouched"
+    );
+    assert!(
+        !dir2.join("events.jsonl").exists(),
+        "no partial events.jsonl may be written from a corrupt source"
+    );
 }

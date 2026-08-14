@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::error::AgentError;
 use crate::types::message::ModelId;
+use crate::types::session_event::SessionEvent;
 use crate::types::tool::ToolDefinition;
 
 /// Everything the agent sees for one run. Deliberately has **no plugin-shared
@@ -57,6 +59,13 @@ pub struct AgentLoopConfig {
     /// (connection errors, non-2xx). Mid-stream failures are surfaced, not
     /// retried, to avoid duplicating partial output already emitted.
     pub retry: RetryPolicy,
+    /// Optional persistence callback: called with each `SessionEvent` as it
+    /// is produced, in crash-safe order (Assistant BEFORE any tool in it
+    /// executes; each ToolResult after any hook rewriting). `None` = no
+    /// persistence (bare `agent_loop` and tests). A persist `Err` aborts the
+    /// run (fail loud - storage failures are never silently swallowed).
+    #[allow(clippy::type_complexity)]
+    pub persist: Option<Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for AgentLoopConfig {

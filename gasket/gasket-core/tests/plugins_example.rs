@@ -66,6 +66,7 @@ async fn hello_extension_greets() {
         }),
         hooks: None,
         retry: gasket_core::RetryPolicy::default(),
+        persist: None,
     };
 
     let msgs = gasket_core::agent_loop(vec![], ctx, cfg).await.unwrap();
@@ -116,6 +117,7 @@ async fn permission_gate_blocks_bash() {
         }),
         hooks: Some(Arc::new(api) as Arc<dyn gasket_core::types::tool::HookChain>),
         retry: gasket_core::RetryPolicy::default(),
+        persist: None,
     };
 
     let mut saw_block = false;
