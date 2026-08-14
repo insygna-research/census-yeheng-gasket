@@ -272,13 +272,20 @@ impl Host {
                 }
             }
         };
-        // Even a failed turn gets its TurnEnd marker — the log keeps all
-        // facts, never a silent half conversation.
-        self.session
+        // The TurnEnd marker is best-effort: appending it must never shadow
+        // the loop's own outcome. If the write fails (disk full, permission,
+        // …) we log and carry on, returning the loop's result/error as-is —
+        // derive_messages tolerates a missing trailing TurnEnd, so the next
+        // open still reconstructs a coherent history.
+        if let Err(e) = self
+            .session
             .append_event(&SessionEvent::TurnEnd {
                 reason: reason.clone(),
             })
-            .await?;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to append TurnEnd marker; loop outcome preserved");
+        }
 
         outcome.map(|new_messages| TurnSummary {
             reason,
@@ -416,6 +423,71 @@ mod tests {
             vec![],
         )
         .with_stream_fn(Arc::new(PendingProvider))
+    }
+
+    /// StreamFn that emits one text delta then a stream error. Because content
+    /// was already emitted, the loop does not retry and returns an assistant
+    /// with `stop_reason::Error` (outcome == `Ok`).
+    struct ErroringProvider;
+    impl StreamFn for ErroringProvider {
+        fn stream(
+            &self,
+            _: &gasket_core::ModelSpec,
+            _: &[AgentMessage],
+            _: &str,
+            _: &[ToolDefinition],
+            _: Option<Arc<AtomicBool>>,
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = gasket_core::StreamChunk> + Send>>
+        {
+            Box::pin(futures_util::stream::iter([
+                gasket_core::StreamChunk::TextDelta("partial".into()),
+                gasket_core::StreamChunk::Error("provider-boom".into()),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_preserves_loop_outcome_when_turnend_append_fails() {
+        // The agent loop emits its own AgentEvent::TurnEnd AFTER the
+        // (errored) assistant is persisted but BEFORE run_turn appends the
+        // SessionEvent::TurnEnd marker. Replacing the log with a directory
+        // at that point makes ONLY that final append fail. The loop's outcome
+        // (the provider error, surfaced as TurnEndReason::Error) must still
+        // be returned — the storage error must not shadow it. Pre-fix, the
+        // `.await?` on the TurnEnd append returned the storage error instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+        let host = Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        )
+        .with_stream_fn(Arc::new(ErroringProvider));
+
+        let summary = host
+            .run_turn("hi", move |ev| {
+                if matches!(ev, AgentEvent::TurnEnd { .. }) {
+                    // Only the trailing SessionEvent::TurnEnd append should
+                    // fail; the assistant was already persisted above this.
+                    let _ = std::fs::remove_file(&events_path);
+                    let _ = std::fs::create_dir(&events_path);
+                }
+            })
+            .await
+            .expect("loop outcome must be returned, not the storage error");
+
+        assert_eq!(
+            summary.reason,
+            TurnEndReason::Error {
+                message: "provider-boom".into(),
+            }
+        );
     }
 
     #[tokio::test]

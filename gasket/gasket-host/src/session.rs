@@ -36,6 +36,28 @@ impl Default for SessionManager {
     }
 }
 
+/// Count model-visible messages in one transcript's raw contents. The event
+/// log carries `TurnStart`/`TurnEnd` marker rows that [`derive_messages`]
+/// projects away, so only `User`/`Assistant`/`ToolResult` rows count; a
+/// legacy `messages.jsonl` (pre-migration) holds one message per non-empty
+/// line. A torn/unparseable event row is not a message and is skipped.
+fn count_messages(raw: &str, is_events: bool) -> usize {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|line| {
+            if !is_events {
+                return true;
+            }
+            matches!(
+                serde_json::from_str::<SessionEvent>(line),
+                Ok(SessionEvent::User(_))
+                    | Ok(SessionEvent::Assistant { .. })
+                    | Ok(SessionEvent::ToolResult(_))
+            )
+        })
+        .count()
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::with_root(JsonlStorage::default_root().base_dir_clone())
@@ -159,7 +181,8 @@ impl SessionManager {
             // untouched, so dir mtime would freeze at first write. Prefer
             // events.jsonl; an unmigrated legacy session falls back to
             // messages.jsonl.
-            let path = if self.storage.has_events(&id) {
+            let is_events = self.storage.has_events(&id);
+            let path = if is_events {
                 self.storage.events_path(&id)
             } else {
                 self.storage.messages_path(&id)
@@ -169,9 +192,12 @@ impl SessionManager {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            // Count lines without serde-parsing the whole transcript.
+            // Count model-visible messages, not raw event lines: the event
+            // log carries TurnStart/TurnEnd marker rows that
+            // derive_messages projects away. A legacy messages.jsonl
+            // (pre-migration) still holds one message per non-empty line.
             let msg_count = match tokio::fs::read_to_string(&path).await {
-                Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
+                Ok(s) => count_messages(&s, is_events),
                 Err(_) => 0,
             };
             out.push(SessionInfo {
@@ -202,6 +228,13 @@ mod tests {
 
     fn user_event(t: &str) -> SessionEvent {
         SessionEvent::User(user_msg(t))
+    }
+
+    fn assistant_event(t: &str) -> SessionEvent {
+        SessionEvent::Assistant {
+            message: AgentMessage::assistant_text(t),
+            usage: None,
+        }
     }
 
     #[tokio::test]
@@ -267,6 +300,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sm = SessionManager::with_root(tmp.path().join("nope"));
         assert!(sm.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_counts_messages_not_turn_markers() {
+        // A minimal turn writes 4 event lines (TurnStart, User, Assistant,
+        // TurnEnd) but only 2 are model-visible messages. `msg_count` must
+        // report messages, not raw event lines (TurnStart/TurnEnd contribute
+        // nothing to derive_messages).
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = sm.current_id().to_string();
+        sm.append_event(&SessionEvent::TurnStart).await.unwrap();
+        sm.append_event(&user_event("hi")).await.unwrap();
+        sm.append_event(&assistant_event("hello")).await.unwrap();
+        sm.append_event(&SessionEvent::TurnEnd {
+            reason: gasket_core::TurnEndReason::Completed,
+        })
+        .await
+        .unwrap();
+
+        let info = sm
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .expect("session should be listed");
+        assert_eq!(
+            info.msg_count, 2,
+            "msg_count must count messages (User/Assistant/ToolResult), not event lines"
+        );
     }
 
     #[tokio::test]
