@@ -174,6 +174,20 @@ async fn append_line<T: serde::Serialize>(
     Ok(())
 }
 
+/// Sync twin of [`append_line`]: one `write_all` of `line\n` on a
+/// `std::fs` handle opened with `O_APPEND`. Same crash discipline — a torn
+/// write leaves a fragment that [`scan_jsonl`] heals as a torn tail.
+fn append_line_sync<T: serde::Serialize>(
+    file: &mut std::fs::File,
+    value: &T,
+) -> Result<(), AgentError> {
+    use std::io::Write;
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
 /// Parse a message transcript, applying the torn-tail recovery policy.
 ///
 /// Thin wrapper over the generic [`scan_jsonl`] scanner; see that function
@@ -373,6 +387,49 @@ impl EventStorage {
         Ok(())
     }
 
+    /// Synchronous single-event append — same `O_APPEND` + single
+    /// `write_all` discipline as [`append_event`](Self::append_event), on
+    /// `std::fs`. For sync persist callbacks (the agent loop's persist
+    /// closure) so they never have to bridge onto the async runtime.
+    pub fn append_event_sync(&self, session_id: &str, ev: &SessionEvent) -> Result<(), AgentError> {
+        validate_session_id(session_id)?;
+        let path = self.events_path(session_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        append_line_sync(&mut file, ev)
+    }
+
+    /// Synchronous batch twin of [`append_events`](Self::append_events):
+    /// rows stream onto the live log through one `O_APPEND` handle. An
+    /// empty batch is a no-op (no directory or file is created).
+    pub fn append_events_sync(
+        &self,
+        session_id: &str,
+        evs: &[SessionEvent],
+    ) -> Result<(), AgentError> {
+        if evs.is_empty() {
+            return Ok(());
+        }
+        validate_session_id(session_id)?;
+        let path = self.events_path(session_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        for ev in evs {
+            append_line_sync(&mut file, ev)?;
+        }
+        Ok(())
+    }
+
     /// Path to a session's in-flight `events.jsonl.tmp` — the staging file
     /// for [`append_events_atomic`](Self::append_events_atomic). A leftover
     /// from a crashed write is invisible to
@@ -548,6 +605,41 @@ mod tests {
         }
         // Nothing was written outside the store root.
         assert!(!tmp.path().join("../evil").exists());
+    }
+
+    #[tokio::test]
+    async fn event_sync_append_round_trips_through_async_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+
+        store
+            .append_event_sync("s1", &SessionEvent::TurnStart)
+            .unwrap();
+        store
+            .append_events_sync("s1", &[user_msg_event("a"), user_msg_event("b")])
+            .unwrap();
+
+        let loaded = store.load_events("s1").await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0], SessionEvent::TurnStart);
+        // Sync append is visible to a fresh async reader in append order.
+        assert!(matches!(&loaded[1], SessionEvent::User(m) if m == &user_msg("a")));
+    }
+
+    #[test]
+    fn event_sync_append_rejects_bad_id_and_empty_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store
+            .append_event_sync("../evil", &SessionEvent::TurnStart)
+            .is_err());
+        // Empty batch is a no-op: no directory or file is created.
+        store.append_events_sync("s1", &[]).unwrap();
+        assert!(!store.events_path("s1").exists());
+    }
+
+    fn user_msg_event(text: &str) -> SessionEvent {
+        SessionEvent::User(user_msg(text))
     }
 
     // ── Torn-tail recovery ────────────────────────────────────────

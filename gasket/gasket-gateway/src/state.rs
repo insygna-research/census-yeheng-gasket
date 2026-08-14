@@ -1,22 +1,29 @@
 //! Shared server state: the session map and per-connection WebSocket session.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use dashmap::DashMap;
 use futures_util::stream::SplitSink;
-use gasket_core::AgentMessage;
 use tokio::sync::Mutex;
 
 use crate::approval::ApprovalRegistry;
 
 pub(crate) struct AppState {
     pub(crate) sessions: DashMap<String, Arc<Mutex<WsSession>>>,
+    /// Root of the on-disk session store (`~/.gasket/sessions`). REST
+    /// endpoints that read disk (list, messages) and new WS connections
+    /// build their `SessionManager` from this root; tests inject a tempdir.
+    pub(crate) store_root: PathBuf,
 }
 
+/// Per-connection state. The transcript itself is NOT kept here — the
+/// on-disk event log is the single source of truth and history is derived
+/// from it (`derive_messages`) wherever needed. Only connection-scoped
+/// stats and the approval registry live in memory.
 pub(crate) struct WsSession {
     pub(crate) sender: SplitSink<WebSocket, Message>,
-    pub(crate) history: Vec<AgentMessage>,
     /// Provider-reported token usage accumulated across turns (fed by
     /// `AfterProviderResponse` events in the forwarder).
     pub(crate) usage_in: u64,

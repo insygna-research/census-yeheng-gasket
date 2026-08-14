@@ -101,27 +101,17 @@ impl SessionManager {
         self.storage.append_event(&self.current_id, ev).await
     }
 
-    /// Bridge the agent loop's sync `persist` callback onto the async store.
-    ///
-    /// `Handle::block_on` may not run on a runtime worker thread (tokio's
-    /// nested block-on guard), so each event hops to a short-lived scoped
-    /// thread. Events per turn are few (assistant + tool results), so the
-    /// spawn cost is noise next to an LLM round-trip.
+    /// The agent loop's sync `persist` callback, backed by the store's
+    /// synchronous `std::fs` append — no runtime bridging, no
+    /// thread-spawn-per-event, and safe to call from any thread (the
+    /// `Handle::block_on` nested-runtime panic risk is gone by
+    /// construction). Lines are small and events per turn are few, so the
+    /// brief blocking write is noise next to an LLM round-trip.
     #[allow(clippy::type_complexity)]
     pub fn persist_fn(&self) -> Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync> {
         let storage = self.storage.clone();
         let sid = self.current_id.clone();
-        let handle = tokio::runtime::Handle::current();
-        Arc::new(move |ev| {
-            let storage = storage.clone();
-            let sid = sid.clone();
-            let handle = handle.clone();
-            std::thread::scope(|s| {
-                s.spawn(move || handle.block_on(storage.append_event(&sid, ev)))
-                    .join()
-                    .expect("persist bridge thread panicked")
-            })
-        })
+        Arc::new(move |ev| storage.append_event_sync(&sid, ev))
     }
 
     /// Load (migrating if needed) a session and adopt it as the current one.

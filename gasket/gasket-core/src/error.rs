@@ -21,6 +21,8 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
     #[error("invalid session id: {0}")]
     InvalidSessionId(String),
+    #[error("a turn is already running on this host")]
+    TurnInProgress,
 }
 
 /// Error returned by a tool's `execute` closure.

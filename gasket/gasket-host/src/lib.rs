@@ -63,6 +63,12 @@ pub struct Host {
     /// Subagent spawner — built lazily; injected into AgentContext so the
     /// `spawn_subagents` tool can use it.
     spawner: Option<Arc<dyn gasket_core::SubagentSpawner>>,
+    /// Turn serialization slot: run_turn acquires it on entry and releases
+    /// it on completion or drop. The event log's format contract assumes a
+    /// single writer per session, and one Host drives one session — so a
+    /// second concurrent turn is rejected outright instead of interleaving
+    /// two event streams into one log.
+    turn_in_flight: AtomicBool,
 }
 
 impl Host {
@@ -92,6 +98,7 @@ impl Host {
             budget: ContextBudget::from_env(),
             spawner: None,
             cfg,
+            turn_in_flight: AtomicBool::new(false),
             session,
             policy,
             hooks,
@@ -181,6 +188,14 @@ impl Host {
     where
         E: FnMut(AgentEvent) + Send,
     {
+        // Turns are serialized per Host (single-writer event log). The
+        // guard is a Drop release: a dropped/cancelled turn still frees the
+        // host, so a cancelled connection cannot deadlock the next one.
+        if self.turn_in_flight.swap(true, Ordering::AcqRel) {
+            return Err(AgentError::TurnInProgress);
+        }
+        let _turn_guard = TurnGuard(&self.turn_in_flight);
+
         let sid = self.session.current_id().to_string();
         // Open (migrating a legacy transcript once, if any), fail closed on
         // corruption, then frame the turn.
@@ -272,6 +287,17 @@ impl Host {
     }
 }
 
+/// Releases the per-Host turn slot when the turn future completes *or* is
+/// dropped (ws close, cancellation): run_turn is cancel-safe, so a dropped
+/// turn must not leave the host permanently busy.
+struct TurnGuard<'a>(&'a AtomicBool);
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// What one `run_turn` produced. The event log remains the source of truth;
 /// `new_messages` is the loop's returned slice for UI/stats convenience.
 #[derive(Debug)]
@@ -358,5 +384,64 @@ mod tests {
         {
             unreachable!("not called in construction tests")
         }
+    }
+
+    /// StreamFn that never yields: keeps a turn in flight on demand.
+    struct PendingProvider;
+    impl StreamFn for PendingProvider {
+        fn stream(
+            &self,
+            _model: &gasket_core::ModelSpec,
+            _messages: &[AgentMessage],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<Arc<AtomicBool>>,
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = gasket_core::StreamChunk> + Send>>
+        {
+            Box::pin(futures_util::stream::pending())
+        }
+    }
+
+    fn test_host() -> Host {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        )
+        .with_stream_fn(Arc::new(PendingProvider))
+    }
+
+    #[tokio::test]
+    async fn run_turn_is_serialized_per_host() {
+        let host = test_host();
+        // Poll the first turn once: the guard is acquired synchronously at
+        // entry, before any await.
+        let mut first = Box::pin(host.run_turn("hello", |_ev| {}));
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+
+        // A second concurrent turn on the same Host is rejected outright.
+        match host.run_turn("again", |_ev| {}).await {
+            Err(e) => assert!(e.to_string().contains("already running"), "{e}"),
+            Ok(_) => panic!("second concurrent turn must be rejected"),
+        }
+
+        // Dropping the in-flight turn releases the slot (Drop guard): a
+        // fresh turn starts — it just never finishes on the pending
+        // provider, so the timeout elapsing is the pass condition.
+        drop(first);
+        let mut third = Box::pin(host.run_turn("third", |_ev| {}));
+        let raced =
+            tokio::time::timeout(std::time::Duration::from_millis(200), third.as_mut()).await;
+        assert!(
+            raced.is_err(),
+            "third turn should be in flight, not rejected"
+        );
     }
 }
