@@ -41,9 +41,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let mut spawns: Vec<SubagentSpawn> = tasks
         .iter()
         .filter_map(|t| {
-            t["task"]
-                .as_str()
-                .map(|s| SubagentSpawn { task: s.to_string() })
+            t["task"].as_str().map(|s| SubagentSpawn {
+                task: s.to_string(),
+            })
         })
         .collect();
 
@@ -77,7 +77,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         .collect::<Vec<_>>()
         .join("\n\n");
     if dropped > 0 {
-        summary.push_str(&format!("\n\n(Note: {dropped} additional task(s) beyond the max of 5 were dropped.)"));
+        summary.push_str(&format!(
+            "\n\n(Note: {dropped} additional task(s) beyond the max of 5 were dropped.)"
+        ));
     }
 
     Ok(ToolResult {
@@ -166,9 +168,15 @@ mod tests {
     async fn truncates_over_limit_tasks_and_reports() {
         let count = Arc::new(AtomicUsize::new(0));
         let spawner = Arc::new(CountingSpawner(Arc::clone(&count)));
-        let r = execute(ctx_with(Some(spawner), seven_tasks())).await.unwrap();
+        let r = execute(ctx_with(Some(spawner), seven_tasks()))
+            .await
+            .unwrap();
 
-        assert_eq!(count.load(Ordering::SeqCst), 5, "spawner must receive max 5");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            5,
+            "spawner must receive max 5"
+        );
         assert_eq!(r.details["subagent_count"], 5);
         assert_eq!(r.details["dropped"], 2);
         let text = r.content.first().and_then(|b| match b {

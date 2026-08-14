@@ -255,7 +255,9 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 [Model Context Protocol](https://modelcontextprotocol.io)(MCP)是一个开放协议,生态里有大量现成工具服务器(GitHub、文件系统、数据库、浏览器、Slack…)。gasket 作为 MCP 客户端,把这些 server 暴露的 tools 接进来,与内置工具同列供 agent 调用。
 
-**配置文件**:`~/.gasket/mcp.json`(或用 `$GASKET_MCP_CONFIG` 指定路径)。文件不存在 = 不加载任何 MCP 工具(静默,不报错)。格式与 Claude Desktop、Cline 等主流客户端一致,可直接复用现有配置:
+**配置文件**:`~/.gasket/mcp.json`(或用 `$GASKET_MCP_CONFIG` 指定路径)。文件不存在 = 不加载任何 MCP 工具(静默,不报错)。格式与 Claude Desktop、Cline 等主流客户端一致,可直接复用现有配置。支持两种传输方式,可在同一配置文件中混用:
+
+#### stdio 传输(本地子进程)
 
 ```json
 {
@@ -275,16 +277,34 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 每个 server 是 `mcpServers` map 里的一项,key 即 server 名(用于工具名前缀),`command` + `args` 指定如何启动子进程,`env` 里的环境变量会**追加**到子进程(不替换父进程环境)。
 
+#### Streamable HTTP 传输(远程服务器)
+
+```json
+{
+  "mcpServers": {
+    "remote-sentry": {
+      "url": "https://mcp.sentry.dev/mcp",
+      "headers": { "Authorization": "Bearer your-token-here" }
+    }
+  }
+}
+```
+
+`url` 指向远程 MCP server 的 HTTP 端点,`headers` 里的键值对会作为 HTTP 请求头随每个 JSON-RPC POST 发送(常用于 `Authorization: Bearer ...`)。stdio(`command`)和 HTTP(`url`)在同一 server 条目中互斥,但不同 server 可以混用两种传输。
+
 **工具命名**:MCP 工具名加前缀 `mcp__{server名}__{工具名}`(如 `mcp__github__create_issue`),避免与内置工具或跨 server 重名。所有 MCP 工具的**风险等级统一为 High**——在非 full-auto 模式下会请求审批。
 
-**工作原理**:启动时,gasket 为每个配置项 spawn 子进程,运行 MCP `initialize` 握手 → `tools/list` 发现工具 → 每个 MCP tool 包装成一个 `ToolDefinition`。Agent 调用工具时,gasket 发送 `tools/call`,server 返回结果(text/image 内容)。子进程在工具被 drop 时自动终止。
+**工作原理**:
+- **stdio**:gasket 为每个配置项 spawn 子进程,运行 MCP `initialize` 握手 → `tools/list` 发现工具 → 每个 MCP tool 包装成一个 `ToolDefinition`。Agent 调用工具时,gasket 发送 `tools/call`,server 返回结果(text/image 内容)。子进程在工具被 drop 时自动终止。
+- **Streamable HTTP**:gasket 向 server URL POST JSON-RPC 请求,响应可能是单个 JSON 或 SSE 流(`text/event-stream`)。无状态会话——每个请求独立 POST。支持 `GASKET_LLM_PROXY` / `HTTPS_PROXY` 代理。
 
 **支持范围**(当前版本):
 
-- 传输:**stdio**(子进程)。暂不支持 Streamable HTTP。
+- 传输:**stdio**(子进程)+ **Streamable HTTP**(远程服务器)。
 - 协议:**legacy era**(`initialize` 握手,协议版本 `2025-06-18`)。覆盖现存几乎所有 MCP server。
 - 原语:仅 **tools**。不接 resources / prompts / sampling / elicitation。
 - 内容:text + image。未知类型降级为文本描述(不丢信息)。
+- 超时:单次 `tools/call` 超时由 `GASKET_MCP_CALL_TIMEOUT_S` 控制(默认 60 秒)。
 
 > **安全提示**:`mcp.json` 可能含 API key 等密文。确保该文件不被提交到版本控制(`~/.gasket/` 默认在 home 目录外,不受仓库 gitignore 影响)。
 

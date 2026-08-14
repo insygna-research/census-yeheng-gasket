@@ -278,7 +278,7 @@ function iconForStatus(status: ToolCall['status']) {
         </div>
       </div>
 
-      <!-- M2：subagent_* 协议尚未实现，subagents 恒为空，以下两块不会渲染 -->
+      <!-- subagent_* 协议已实现：当 spawn_subagents 工具被调用时，网关转发子 agent 事件，以下两块渲染 -->
       <!-- Subagent results -->
       <SubagentGridPanel
         v-if="subagents && subagents.length > 0 && ['running', 'synthesizing'].includes(subagentPhase || 'idle')"

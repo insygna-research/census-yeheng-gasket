@@ -96,16 +96,14 @@ fn html_to_text(html: &str) -> String {
         .remove();
 
     // Prefer semantic content containers; fall back to body.
-    let content_sel = ["article", "main", "body"]
-        .into_iter()
-        .find_map(|sel| {
-            let nodes = doc.select(sel);
-            if nodes.iter().count() > 0 {
-                Some(nodes)
-            } else {
-                None
-            }
-        });
+    let content_sel = ["article", "main", "body"].into_iter().find_map(|sel| {
+        let nodes = doc.select(sel);
+        if nodes.iter().count() > 0 {
+            Some(nodes)
+        } else {
+            None
+        }
+    });
 
     let raw = match content_sel {
         Some(nodes) => nodes

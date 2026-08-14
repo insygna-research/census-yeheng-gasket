@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwd,
         env: std::env::vars().collect(),
         session_id: uuid::Uuid::new_v4().to_string(),
-            spawner: None,
+        spawner: None,
     };
 
     let user_msg = AgentMessage::User(UserMessage {

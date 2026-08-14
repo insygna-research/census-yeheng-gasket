@@ -12,14 +12,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use gasket_core::{
-    built_in_tools, AgentEvent, AgentMessage, ContentBlock, UserMessage,
-};
+use gasket_core::{built_in_tools, AgentEvent, AgentMessage, ContentBlock, UserMessage};
 
 use gasket_host::permission::Approver;
 use gasket_host::{
-    load_all_mcp, ConfigLoader, ContextBudget, Host, HostSubagentSpawner, Mode,
-    PermissionPolicy, SessionManager,
+    load_all_mcp, ConfigLoader, ContextBudget, Host, HostSubagentSpawner, Mode, PermissionPolicy,
+    SessionManager,
 };
 
 use crate::api::load_external_tools;
@@ -268,9 +266,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
             })
         };
         let spawner_stream_fn = spawner_cfg.provider_stream_fn();
-        let spawner_hooks: Arc<dyn gasket_core::HookChain> = Arc::new(
-            gasket_host::HookStack::new(vec![spawner_policy]),
-        );
+        let spawner_hooks: Arc<dyn gasket_core::HookChain> =
+            Arc::new(gasket_host::HookStack::new(vec![spawner_policy]));
         // Sub-agents get the built-in tool set minus `spawn_subagents`
         // (nesting is disabled — sub-agent contexts carry no spawner).
         // MCP/external tools are deliberately excluded: their servers are

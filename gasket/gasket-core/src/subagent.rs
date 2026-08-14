@@ -32,19 +32,51 @@ pub struct SubagentResult {
 /// only (provider token counts folded into the session counters).
 #[derive(Debug, Clone)]
 pub enum SubagentEvent {
-    AllStarted { count: usize },
-    Started { id: String, task: String, index: usize },
-    Thinking { id: String, content: String },
-    Content { id: String, content: String },
-    ToolStart { id: String, name: String, arguments: Option<String> },
-    ToolEnd { id: String, name: String, output: Option<String> },
-    Completed { id: String, index: usize, summary: String, tool_count: usize },
-    Error { id: String, index: usize, error: String },
+    AllStarted {
+        count: usize,
+    },
+    Started {
+        id: String,
+        task: String,
+        index: usize,
+    },
+    Thinking {
+        id: String,
+        content: String,
+    },
+    Content {
+        id: String,
+        content: String,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+        arguments: Option<String>,
+    },
+    ToolEnd {
+        id: String,
+        name: String,
+        output: Option<String>,
+    },
+    Completed {
+        id: String,
+        index: usize,
+        summary: String,
+        tool_count: usize,
+    },
+    Error {
+        id: String,
+        index: usize,
+        error: String,
+    },
     Synthesizing,
     /// Provider-reported token usage from a sub-agent's LLM calls. Never
     /// forwarded to the frontend — the gateway accumulates it into the
     /// session's usage counters.
-    Usage { input_tokens: u64, output_tokens: u64 },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Trait injected into `ToolContext` by the host. The `spawn_subagents` tool

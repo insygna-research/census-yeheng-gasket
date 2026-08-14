@@ -14,7 +14,6 @@ use crate::state::AppState;
 // ── External tools ─────────────────────────────────────────────
 use gasket_host::SessionManager;
 
-
 pub(crate) async fn load_external_tools() -> Vec<ToolDefinition> {
     let cmds = gasket_host::commands_from_env();
     if cmds.is_empty() {
@@ -124,7 +123,7 @@ pub(crate) async fn list_sessions() -> Json<Value> {
     match mgr.list().await {
         Ok(mut sessions) => {
             // Newest first.
-            sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
             Json(json!({
                 "sessions": sessions.iter().map(|s| json!({
                     "id": s.id,

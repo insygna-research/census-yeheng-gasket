@@ -44,13 +44,34 @@ pub enum McpError {
 // ── Config ──────────────────────────────────────────────────────
 
 /// One MCP server entry from `mcp.json`.
+///
+/// Two mutually-exclusive transport modes:
+/// - **stdio** (default): `command` + `args` + `env` — spawns a subprocess.
+/// - **Streamable HTTP**: `url` + `headers` — POSTs JSON-RPC to a remote server.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
-    pub command: String,
+    /// stdio: command to run (mutually exclusive with `url`).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// stdio: command arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// stdio: extra environment variables for the subprocess.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Streamable HTTP: server URL (mutually exclusive with `command`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Streamable HTTP: extra HTTP headers (e.g. `Authorization: Bearer ...`).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// True if this entry configures a Streamable HTTP server.
+    fn is_http(&self) -> bool {
+        self.url.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,7 +88,9 @@ pub fn load_config() -> Result<Vec<(String, McpServerConfig)>, McpError> {
 }
 
 /// Same as [`load_config`] but from an explicit path (tests).
-pub fn load_config_from(path: &std::path::Path) -> Result<Vec<(String, McpServerConfig)>, McpError> {
+pub fn load_config_from(
+    path: &std::path::Path,
+) -> Result<Vec<(String, McpServerConfig)>, McpError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -203,14 +226,12 @@ fn content_to_blocks(items: &[McpContent]) -> Vec<ContentBlock> {
         .iter()
         .filter_map(|c| match c.kind.as_str() {
             "text" => c.text.clone().map(ContentBlock::text),
-            "image" => {
-                Some(ContentBlock::Image {
-                    image: ImageContent {
-                        data: c.data.clone().unwrap_or_default(),
-                        mime_type: c.mime_type.clone().unwrap_or_default(),
-                    },
-                })
-            }
+            "image" => Some(ContentBlock::Image {
+                image: ImageContent {
+                    data: c.data.clone().unwrap_or_default(),
+                    mime_type: c.mime_type.clone().unwrap_or_default(),
+                },
+            }),
             _ => Some(ContentBlock::text(format!("{c:?}"))),
         })
         .collect();
@@ -303,20 +324,15 @@ impl McpBridge {
             write_notification(&mut guard.stdin, "notifications/initialized").await?;
 
             // 3. tools/list
-            write_request(
-                &mut guard.stdin,
-                2,
-                "tools/list",
-                serde_json::json!({}),
-            )
-            .await?;
+            write_request(&mut guard.stdin, 2, "tools/list", serde_json::json!({})).await?;
         }
 
-        let tools_list: ToolsListResult = bridge.call_typed(2, |result| {
-            serde_json::from_value(result).map_err(|e| {
-                McpError::Protocol(format!("tools/list parse error: {e}"))
+        let tools_list: ToolsListResult = bridge
+            .call_typed(2, |result| {
+                serde_json::from_value(result)
+                    .map_err(|e| McpError::Protocol(format!("tools/list parse error: {e}")))
             })
-        }).await?;
+            .await?;
 
         let tools = tools_list
             .list
@@ -327,11 +343,7 @@ impl McpBridge {
     }
 
     /// Send a request and wait for its response, deserializing the result.
-    async fn call_typed<T, F>(
-        &self,
-        id: u64,
-        map: F,
-    ) -> Result<T, McpError>
+    async fn call_typed<T, F>(&self, id: u64, map: F) -> Result<T, McpError>
     where
         F: FnOnce(serde_json::Value) -> Result<T, McpError>,
     {
@@ -358,9 +370,7 @@ impl McpBridge {
                 Err(_) => return Err(McpError::Timeout(self.timeout)),
             };
             if n == 0 {
-                return Err(McpError::Protocol(
-                    "server closed stdout".into(),
-                ));
+                return Err(McpError::Protocol("server closed stdout".into()));
             }
             let line = line.trim();
             if line.is_empty() {
@@ -429,10 +439,290 @@ impl McpBridge {
     }
 }
 
+// ── Streamable HTTP transport ───────────────────────────────────
+
+/// One long-lived MCP HTTP client. Each tool's `execute` closure holds an
+/// `Arc<McpHttpClient>`; calls are stateless POSTs to the server URL.
+pub struct McpHttpClient {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    timeout: Duration,
+    server_name: String,
+    next_id: tokio::sync::Mutex<u64>,
+}
+
+impl McpHttpClient {
+    /// Connect to a Streamable HTTP MCP server, run the handshake, discover tools.
+    pub async fn connect(
+        name: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<(Arc<Self>, Vec<ToolDefinition>), McpError> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(timeout)
+            .danger_accept_invalid_certs(false);
+        // Proxy support: respect GASKET_LLM_PROXY / HTTPS_PROXY for remote MCP servers.
+        if let Ok(proxy_url) = std::env::var("GASKET_LLM_PROXY")
+            .or_else(|_| std::env::var("HTTPS_PROXY"))
+            .or_else(|_| std::env::var("https_proxy"))
+        {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        let client = builder
+            .build()
+            .map_err(|e| McpError::Protocol(format!("http client build error: {e}")))?;
+
+        let http = Arc::new(Self {
+            client,
+            url: url.to_string(),
+            headers: headers.clone(),
+            timeout,
+            server_name: name.to_string(),
+            next_id: tokio::sync::Mutex::new(1),
+        });
+
+        // Handshake — same sequence as stdio, just over HTTP POST.
+        // 1. initialize
+        let _init = http
+            .request(
+                1,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "clientInfo": {
+                        "name": "gasket",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {},
+                }),
+            )
+            .await?;
+
+        // 2. notifications/initialized (no response expected, but we POST it)
+        http.notification("notifications/initialized").await?;
+
+        // 3. tools/list
+        let tools_result = http.request(2, "tools/list", serde_json::json!({})).await?;
+        let tools_list: ToolsListResult = serde_json::from_value(tools_result)
+            .map_err(|e| McpError::Protocol(format!("tools/list parse error: {e}")))?;
+
+        let tools = tools_list
+            .list
+            .into_iter()
+            .map(|t| http.tool_definition(t))
+            .collect();
+        Ok((http, tools))
+    }
+
+    /// POST a JSON-RPC request and parse the response (single JSON or SSE stream).
+    async fn request(
+        &self,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let send_fut = self.post_json(&body);
+        let resp = tokio::time::timeout_at(deadline, send_fut)
+            .await
+            .map_err(|_| McpError::Timeout(self.timeout))??;
+
+        // Parse based on Content-Type.
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("text/event-stream") {
+            // SSE: read body, find the `data:` line matching our id.
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| McpError::Protocol(format!("http body read error: {e}")))?;
+            self.parse_sse_response(&text, id)
+        } else {
+            // Single JSON response.
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| McpError::Protocol(format!("http response json parse error: {e}")))?;
+            match parse_jsonrpc_value(&v, id) {
+                Parsed::Result(result) => Ok(result),
+                Parsed::Error { code, message } => Err(McpError::ServerError { code, message }),
+                Parsed::Other => Err(McpError::Protocol(format!(
+                    "http response has no result/error for id {id}: {v}"
+                ))),
+            }
+        }
+    }
+
+    /// POST a notification (no id, no response expected).
+    async fn notification(&self, method: &str) -> Result<(), McpError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        self.post_json(&body).await?;
+        Ok(())
+    }
+
+    /// Send a POST and return the raw response.
+    async fn post_json(&self, body: &serde_json::Value) -> Result<reqwest::Response, McpError> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            );
+        for (k, v) in &self.headers {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(v) {
+                    req = req.header(name, val);
+                }
+            }
+        }
+        req.json(body)
+            .send()
+            .await
+            .map_err(|e| McpError::Protocol(format!("http post error: {e}")))
+    }
+
+    /// Parse an SSE response body, extracting the JSON-RPC message matching `id`.
+    fn parse_sse_response(&self, text: &str, id: u64) -> Result<serde_json::Value, McpError> {
+        for line in text.lines() {
+            let line = line.trim();
+            // SSE data lines start with "data:".
+            let Some(json_str) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let json_str = json_str.trim();
+            if json_str.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(json_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match parse_jsonrpc_value(&v, id) {
+                Parsed::Result(result) => return Ok(result),
+                Parsed::Error { code, message } => {
+                    return Err(McpError::ServerError { code, message });
+                }
+                Parsed::Other => continue,
+            }
+        }
+        Err(McpError::Protocol(format!(
+            "SSE stream ended without a response for id {id}"
+        )))
+    }
+
+    /// Invoke an MCP tool by its original (un-prefixed) name.
+    async fn call(
+        &self,
+        original_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<CallResult, McpError> {
+        let id = {
+            let mut guard = self.next_id.lock().await;
+            let id = *guard;
+            *guard += 1;
+            id
+        };
+        let result = self
+            .request(
+                id,
+                "tools/call",
+                serde_json::json!({"name": original_name, "arguments": args}),
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| McpError::Protocol(format!("tools/call parse error: {e}")))
+    }
+
+    fn tool_definition(self: &Arc<Self>, t: McpTool) -> ToolDefinition {
+        let client = Arc::clone(self);
+        let original_name = t.name.clone();
+        let prefixed_name = format!("mcp__{}__{}", self.server_name, t.name);
+        let label = format!("{}/{}", self.server_name, t.title.unwrap_or(t.name));
+        ToolDefinition {
+            name: prefixed_name,
+            label,
+            description: t.description,
+            parameters: t.input_schema,
+            risk: RiskLevel::High,
+            execute: Arc::new(move |ctx| {
+                let client = Arc::clone(&client);
+                let original_name = original_name.clone();
+                Box::pin(async move {
+                    if ctx.aborted() {
+                        return Ok(ToolResult::error("aborted"));
+                    }
+                    match client.call(&original_name, &ctx.args).await {
+                        Ok(resp) => Ok(ToolResult {
+                            content: content_to_blocks(&resp.content),
+                            details: serde_json::Value::Null,
+                            is_error: resp.is_error,
+                        }),
+                        Err(e) => Err(ToolError::Message(e.to_string())),
+                    }
+                })
+            }),
+        }
+    }
+}
+
+/// Parsed JSON-RPC message (shared by stdio and HTTP paths).
+enum Parsed {
+    Result(serde_json::Value),
+    Error { code: i64, message: String },
+    Other,
+}
+
+/// Parse a JSON-RPC value, matching by `id`.
+fn parse_jsonrpc_value(v: &serde_json::Value, expected_id: u64) -> Parsed {
+    let Some(id_val) = v.get("id") else {
+        return Parsed::Other; // notification
+    };
+    let id = id_val.as_u64().unwrap_or(u64::MAX);
+    if id != expected_id {
+        return Parsed::Other;
+    }
+    if let Some(err) = v.get("error") {
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+            .to_string();
+        Parsed::Error { code, message }
+    } else if v.get("result").is_some() {
+        Parsed::Result(v["result"].clone())
+    } else {
+        Parsed::Other
+    }
+}
+
 // ── Top-level loader ────────────────────────────────────────────
 
 /// Spawn every configured MCP server; collect tools. Per-server failures are
 /// logged and skipped (matching `load_external_tools`'s tolerance).
+///
+/// Dispatches by transport: `url` → Streamable HTTP, `command` → stdio.
 pub async fn load_all_mcp() -> Vec<ToolDefinition> {
     let configs = match load_config() {
         Ok(c) => c,
@@ -441,21 +731,43 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
             return Vec::new();
         }
     };
+    let timeout = mcp_call_timeout();
     let mut tools = Vec::new();
     for (name, cfg) in configs {
-        match McpBridge::spawn(&name, &cfg.command, &cfg.args, &cfg.env, DEFAULT_TIMEOUT).await {
-            Ok((_, defs)) => {
-                if !defs.is_empty() {
-                    eprintln!("(mcp {name}: {} tools)", defs.len());
+        let defs: Vec<ToolDefinition> = if cfg.is_http() {
+            let url = cfg.url.as_ref().expect("is_http guarantees url");
+            match McpHttpClient::connect(&name, url, &cfg.headers, timeout).await {
+                Ok((_, defs)) => defs,
+                Err(e) => {
+                    eprintln!("(mcp {name} load failed: {e})");
+                    continue;
                 }
-                tools.extend(defs);
             }
-            Err(e) => {
-                eprintln!("(mcp {name} load failed: {e})");
+        } else {
+            let command = cfg.command.as_deref().unwrap_or("");
+            match McpBridge::spawn(&name, command, &cfg.args, &cfg.env, timeout).await {
+                Ok((_, defs)) => defs,
+                Err(e) => {
+                    eprintln!("(mcp {name} load failed: {e})");
+                    continue;
+                }
             }
+        };
+        if !defs.is_empty() {
+            eprintln!("(mcp {name}: {} tools)", defs.len());
         }
+        tools.extend(defs);
     }
     tools
+}
+
+/// Read the MCP call timeout from `GASKET_MCP_CALL_TIMEOUT_S` (default 60s).
+fn mcp_call_timeout() -> Duration {
+    std::env::var("GASKET_MCP_CALL_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TIMEOUT)
 }
 
 #[cfg(test)]
@@ -478,10 +790,7 @@ mod tests {
     #[test]
     fn parse_incoming_skips_unmatched_id() {
         let line = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
-        assert!(matches!(
-            parse_incoming(line, 5),
-            IncomingMessage::Other
-        ));
+        assert!(matches!(parse_incoming(line, 5), IncomingMessage::Other));
     }
 
     #[test]
@@ -590,9 +899,126 @@ mod tests {
             .find(|(n, _)| n == "github")
             .map(|(_, c)| c)
             .unwrap();
-        assert_eq!(github.command, "npx");
+        assert_eq!(github.command.as_deref(), Some("npx"));
         assert_eq!(github.args, vec!["-y", "server-github"]);
         assert_eq!(github.env.get("TOKEN").unwrap(), "secret");
+    }
+
+    #[test]
+    fn config_parses_http_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "mcpServers": {
+                    "remote": {
+                        "url": "https://mcp.example.dev/mcp",
+                        "headers": { "Authorization": "Bearer tok123" }
+                    },
+                    "local": {
+                        "command": "npx",
+                        "args": ["-y", "server-fs"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = load_config_from(&path).unwrap();
+        assert_eq!(cfg.len(), 2);
+        let remote = cfg
+            .iter()
+            .find(|(n, _)| n == "remote")
+            .map(|(_, c)| c)
+            .unwrap();
+        assert!(remote.is_http());
+        assert_eq!(remote.url.as_deref(), Some("https://mcp.example.dev/mcp"));
+        assert_eq!(
+            remote.headers.get("Authorization").unwrap(),
+            "Bearer tok123"
+        );
+        assert!(remote.command.is_none());
+
+        let local = cfg
+            .iter()
+            .find(|(n, _)| n == "local")
+            .map(|(_, c)| c)
+            .unwrap();
+        assert!(!local.is_http());
+        assert_eq!(local.command.as_deref(), Some("npx"));
+        assert!(local.url.is_none());
+    }
+
+    // ── HTTP transport pure-function tests ─────────────────────
+
+    #[test]
+    fn parse_jsonrpc_value_matches_result_by_id() {
+        let v = serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"tools":[]}});
+        match parse_jsonrpc_value(&v, 3) {
+            Parsed::Result(r) => assert!(r["tools"].is_array()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn parse_jsonrpc_value_matches_error_by_id() {
+        let v =
+            serde_json::json!({"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"nope"}});
+        match parse_jsonrpc_value(&v, 5) {
+            Parsed::Error { code, message } => {
+                assert_eq!(code, -32601);
+                assert_eq!(message, "nope");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn parse_jsonrpc_value_skips_unmatched_id_and_notifications() {
+        // Wrong id
+        let v = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}});
+        assert!(matches!(parse_jsonrpc_value(&v, 99), Parsed::Other));
+
+        // Notification (no id)
+        let v = serde_json::json!({"jsonrpc":"2.0","method":"notifications/progress"});
+        assert!(matches!(parse_jsonrpc_value(&v, 1), Parsed::Other));
+    }
+
+    #[test]
+    fn sse_response_extracts_matching_data_line() {
+        // Simulate an SSE body: a notification line, then the matching response.
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}\n\n";
+        // We need a dummy McpHttpClient to call parse_sse_response, but that
+        // requires a reqwest::Client. Instead, test the logic inline: the
+        // function just scans `data:` lines and calls parse_jsonrpc_value.
+        // Verify the core logic by extracting data lines manually.
+        let matching = sse
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("data:"))
+            .map(|s| s.trim())
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .find_map(|v| match parse_jsonrpc_value(&v, 7) {
+                Parsed::Result(r) => Some(r),
+                _ => None,
+            })
+            .expect("should find matching response");
+        assert_eq!(matching["content"][0]["text"], "hi");
+        assert_eq!(matching["isError"], false);
+    }
+
+    #[test]
+    fn sse_response_missing_match_returns_error() {
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n";
+        let found = sse
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("data:"))
+            .map(|s| s.trim())
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .find_map(|v| match parse_jsonrpc_value(&v, 7) {
+                Parsed::Result(r) => Some(r),
+                _ => None,
+            });
+        assert!(found.is_none(), "should not find a match for id=7");
     }
 
     // ── Integration test (Python mock server) ────────────────────
@@ -653,15 +1079,10 @@ for line in sys.stdin:
     async fn mcp_handshake_list_and_call() {
         let script = fixture_mcp_server_script();
         let env = HashMap::new();
-        let (bridge, tools) = McpBridge::spawn(
-            "test",
-            "python3",
-            &[script],
-            &env,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("spawn");
+        let (bridge, tools) =
+            McpBridge::spawn("test", "python3", &[script], &env, Duration::from_secs(10))
+                .await
+                .expect("spawn");
 
         // tools/list → 1 tool, prefixed
         assert_eq!(tools.len(), 1);
@@ -685,10 +1106,7 @@ for line in sys.stdin:
     }
 
     /// Helper: build a ToolCallCtx for tests.
-    fn tool_call_ctx_for_test(
-        id: &str,
-        args: serde_json::Value,
-    ) -> gasket_core::ToolCallCtx {
+    fn tool_call_ctx_for_test(id: &str, args: serde_json::Value) -> gasket_core::ToolCallCtx {
         gasket_core::ToolCallCtx {
             tool_call_id: id.into(),
             args,
@@ -756,7 +1174,10 @@ for line in sys.stdin:
             "search_repositories returned error: {:?}",
             result.content
         );
-        eprintln!("(search_repositories ok, {} content blocks)", result.content.len());
+        eprintln!(
+            "(search_repositories ok, {} content blocks)",
+            result.content.len()
+        );
         drop(bridge);
     }
 }

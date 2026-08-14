@@ -1,12 +1,12 @@
-//! Built-in tools: read / write / edit / bash / list / grep.
+//! Built-in tools: read / write / edit / bash / list / grep / fetch / spawn_subagents.
 
 pub mod bash;
 pub mod edit;
 pub mod fetch;
 pub mod grep;
 pub mod list;
-pub mod subagent;
 pub mod read;
+pub mod subagent;
 pub mod write;
 
 use std::path::{Component, Path, PathBuf};

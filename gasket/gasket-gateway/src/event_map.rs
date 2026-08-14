@@ -74,7 +74,11 @@ pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option
         SubagentEvent::Content { id, content } => serde_json::json!({
             "type": "subagent_content", "id": id, "content": content
         }),
-        SubagentEvent::ToolStart { id, name, arguments } => serde_json::json!({
+        SubagentEvent::ToolStart {
+            id,
+            name,
+            arguments,
+        } => serde_json::json!({
             "type": "subagent_tool_start", "id": id, "name": name,
             "arguments": arguments
         }),
@@ -82,7 +86,12 @@ pub(crate) fn subagent_event_to_ws(event: &gasket_core::SubagentEvent) -> Option
             "type": "subagent_tool_end", "id": id, "name": name,
             "output": output
         }),
-        SubagentEvent::Completed { id, index, summary, tool_count } => serde_json::json!({
+        SubagentEvent::Completed {
+            id,
+            index,
+            summary,
+            tool_count,
+        } => serde_json::json!({
             "type": "subagent_completed", "id": id, "index": index,
             "summary": summary, "tool_count": tool_count
         }),

@@ -1,0 +1,493 @@
+# deepseek-harness (dsh) — Core Concepts & Implementation Logic
+
+> A study reference distilled from the repo (branch `master`, developer-preview state).
+> Purpose: teach an LLM (or engineer) how DeepSeek's agent harness actually works —
+> the data structures first, the mechanics second, the engineering system third.
+> Source paths point into the repo for deep reading. Quoted rules are verbatim from
+> the docs where marked.
+>
+> Companion opinion doc (what gasket should take from this): see
+> `docs/superpowers/plans/2026-08-14-dsh-alignment.md`.
+
+---
+
+## 0. What it is, in one paragraph
+
+`dsh` is an open-source **agent harness** by DeepSeek AI: a shell around LLMs that
+owns sessions, tool dispatch, permissions, sandboxing, and UI. Its architectural
+bet is "**everything is a plugin**" — the model adapter, tool registry, session
+log, even the agent loop itself are plugins mounted into a shared runtime
+([Cordis](https://github.com/cordiverse/cordis)), so every part is replaceable
+from configuration. Distribution is npm (`npx @deepseek-ai/dsh web`), plus a
+Python SDK that drives a bundled runtime binary over stdio JSON-RPC.
+
+- Runtime: Node.js / TypeScript, pnpm monorepo.
+- Scale: ~219 packages in 49 groups under `packages/<group>/<pkg>/`, 2 apps
+  (`apps/cli`, `apps/web`), 9 vendored+patched Cordis framework packages, ~150
+  gate/generator scripts.
+- Status: developer preview, compatibility-breaking changes expected.
+
+### The five ideas that matter (read this list twice)
+
+1. **The session log is the single source of truth.** Message history is
+   *derived* from an append-only event log, never stored separately.
+2. **"Model-visible means logged."** Anything a model sees in a request must be
+   reconstructable from the log — enforced by a runtime invariant.
+3. **Events are the only extension points.** Durable facts → session events;
+   live interception → agent events; capability swapping → capability events.
+   You never patch the loop; you listen beside it.
+4. **Capability seams come in three roles** — Service Definition, Service
+   Provider, Consumer — and swapping one provider moves a whole product surface
+   (e.g. remote sandbox moves Bash+PTY+LSP together).
+5. **Registrations are effects that unwind.** A plugin's contributions to the
+   shared context are reversible; unloading the plugin removes them.
+
+Everything below is these five ideas elaborated.
+
+---
+
+## 1. Cordis: the plugin runtime
+
+Cordis (vendored at `vendor/`, rescoped to `@deepseek-ai`, SHA-pinned with 18
+numbered local modifications) gives dsh its composition model:
+
+- A **context** (`ctx`) is passed to every plugin. Plugins contribute:
+  - **Services** — typed objects on `ctx` keys (`ctx.sessions`, `ctx.tools`,
+    `ctx.llm`, `ctx.agents`, `ctx.systemPrompt`, `ctx.agentLoop`).
+  - **Typed events** — `ctx.on()` listeners; **waterfalls** — `ctx.waterfall()`
+    chains where each listener must call `next()` to delegate.
+  - **Effects** — `ctx.effect()` registrations that unwind when the plugin
+    unloads. *There is no privileged core to patch*: you extend dsh by mounting
+    a plugin beside the others.
+- Plugins are declared as config rows (Cordis `cordis.yml` entries), composed at
+  boot, and patchable layer-by-layer (see §2).
+
+Key consequence: **the concrete agent loop (`dsh-agent-loop`) is a swappable
+plugin.** Extension plugins depend on the `dsh-agent` *interface* package and
+never on `agent-loop` directly.
+
+---
+
+## 2. Composition: profiles and bundles
+
+A running dsh is a **plugin tree composed at boot from ordered layers**:
+
+- A **profile** is a named composition stored in the Harness home: the list of
+  bundles it stacks, out-of-tree plugins it installs, and the user's own
+  `cordis.patch.yml`. `web` and `headless` ship as templates.
+- A **bundle** is a distribution format for config rows + the code they mount.
+  Declared in `package.json` under a `dsh` field: `dsh.profile` lists a
+  profile's bundles; `dsh.bundle` points at a bundle's patch file.
+- Layer application order (each layer may replace a row by id or insert rows):
+  1. each bundle in the profile's listed order,
+  2. the profile's `cordis.patch.yml`,
+  3. the home-level patch,
+  4. any `--patch` overlay.
+- `dsh --profile web --dump-config` prints the exact tree your machine boots;
+  any row it prints can be replaced by a patch.
+- `dsh-base` is the first layer of every profile (adapters, tools, persistence,
+  sandbox/approval policy, settings, credentials, telemetry);
+  `dsh-web-app` adds the browser app; `dsh-headless` adds a one-shot runner.
+
+---
+
+## 3. The session event log (the heart of the design)
+
+Source: `packages/core/session` (`ctx.sessions`);
+docs: `docs/subsystems/session.md`, `docs/subsystems/persistence.md`.
+
+### 3.1 The invariant
+
+> "A `Session` is an **append-only log** of typed `SessionEvent`s — the single
+> source of truth for an agent's whole interaction history. The LLM message
+> history is *derived* from the log, never stored separately; replay is
+> re-derivation from the same events."
+
+`deriveMessages()` projects `Message[]` from the log — cached (each surface
+node projected once when first seen; a surface rewrite rebuilds) and frozen.
+The per-node projection `deriveEventMessage` is public so external
+reconstructors and the dev invariant "project a log prefix with exactly the same
+rules and cannot disagree with the cache."
+
+**Model-visible means logged.** Anything that reaches a model request must be
+reconstructable from the log; a runtime invariant asserts it. This is why a new
+model-visible input *requires* a new session event.
+
+### 3.2 `SessionEventMap` — the vocabulary (merge-extensible)
+
+Core members (plugins add more via declaration merging, e.g. compaction adds
+`compaction/start|summary|end`):
+
+| Event | Payload (essence) | Notes |
+|---|---|---|
+| `turn/start` | `{ turn }` | Opens a turn before the loop claims input. May close with no step (rejection/empty/cancel/failure) — the log records the attempt. |
+| `turn/end` | `{ turn, reason: TurnEndReason }` | Success commits the turn. `TurnEndReason`: `completed | aborted | blocked | error(structured) | max-tokens | interrupted` (last one only written by crash recovery). |
+| `step/start` / `step/end` | `{ turn, step }` | A step = one model request + the tools it called. |
+| `user/message` | `UserMessage` | Direct prompt, injected context (`agent.inject()`), or goal continuation — `source` tells them apart. |
+| `assistant/chunk` | `{ turn, step, chunk }` | Raw stream chunk — "token-level replay fidelity"; skipped by derivation. |
+| `assistant/message` | `{ turn, step, message, usage? }` | Assembled message; carries the step's `usage` when reported — "the model output and its accounting travel together (there is no separate usage record)." |
+| `tool/call` | `{ turn, step, callId, name, arguments }` | `arguments` is the raw JSON string *exactly as the model produced it (unparsed)*; logged **before** execution. `callId` pairs with `tool/result`. |
+| `tool/result` | `{ turn, step, message, error?, meta? }` | Model-facing result + optional internal failure identity + tool-private opaque JSON `meta` (e.g. fs carries a result-time diff). |
+| `todo/write` | `{ todos: TodoItem[] }` | Whole-list snapshot, latest-write-wins; log-only UI state. |
+| `request/header` | `{ header: EpochHeader, reason }` | Full envelope of the next request: call config + adapter defaults + rendered system prompt + assembled tool schemas. "Every conversation request is a pure function of the log." Reconstructed by folding the latest snapshot. |
+| `request/context` | `RequestContext` | Route capacity metadata; separate from `EpochHeader` so a capacity change can't register as a request change. |
+| `session/end-seed` | `{}` | Marks the end of constructor seed (resume/fork/replay prefix). Position-only; locate the LAST one. |
+
+### 3.3 The envelope
+
+```ts
+type SessionEvent = { type; seq; time; data; ignorable?: true;
+  sourceEventSeqs?: number[]; surfaceOp?: SurfaceOp }
+```
+
+- `seq = log.length` — monotonic, contiguous, survives persistence verbatim.
+- **`ignorable` defaults to required.** A reader meeting an unrecognized type
+  without the marker *MUST refuse to reconstruct the session* rather than
+  silently dropping it. Rationale worth memorizing: "a forgotten marker
+  over-refuses (an inconvenience) rather than silently resuming a gutted
+  session." Fail-closed on unknown data.
+- `sourceEventSeqs` cites earlier events (e.g. the `assistant/chunk` seqs that
+  built an `assistant/message`); `surfaceOp` only on surface types.
+
+### 3.4 The surface and `SurfaceOp`
+
+`SurfaceEventType = 'user/message' | 'assistant/message' | 'tool/result'` —
+the only events that produce LLM messages.
+
+```ts
+type SurfaceOp = 'append' | { op: 'replace'; start: number; end: number }
+```
+
+`replace` shadows surface nodes `start..end` inclusive and inserts the new node
+in their place — used by compaction, available to any surface-replacing
+producer. The replacer's `sourceEventSeqs` must include every shadowed node.
+
+### 3.5 Persistence (the sibling concern)
+
+- `SessionPersistence` seam with **JSONL and SQLite backends**; the log is
+  stored verbatim (lossless JSON validated at `Session.append()` — "a bad event
+  fails at the append site rather than later during a backend flush").
+- Durability checkpoints are owned by `dsh-session-checkpoint-policy`
+  (`session/flush` = "awaited parallel durability checkpoint"); the loop does
+  not await a flush at turn boundaries; consumers that read storage after
+  `whenIdle()` flush themselves.
+- Crash recovery writes `turn/end { reason: 'interrupted' }` — the loop never
+  emits that marker itself. Legacy/unknown log shapes are **rejected at seed,
+  append, and load boundaries** rather than replayed incompletely.
+- Fork: `ctx.sessions.fork(source, boundary?)`; rejects prefixes ending inside
+  an open turn. Resume: seed = persisted prefix closed by `session/end-seed`.
+
+### 3.6 Why this design wins
+
+Fork, resume, transcripts, compaction, telemetry, persistence, and the UI are
+all **projections of one stream**. Nothing double-writes. A crash mid-turn
+loses nothing that happened — the executed tool calls and their results are
+already on the log; only the "turn finished" fact is missing.
+
+---
+
+## 4. Turn & step lifecycle
+
+Docs: `docs/architecture.md#turn-flow`, `docs/agent-lifecycle.md`.
+
+Definitions: a **step** is one model request plus the tools it calls; a
+**turn** is zero or more steps — "it opens before its first input is claimed
+and closes once nothing is owed."
+
+```text
+turn/start
+  claim next-step input plus one queued message
+  assemble prompt sections + tool schemas
+  -> agent/pre-step                   reject | enter(messages)
+     reject, or a first enter rewritten empty -> close the turn with no step
+     step/start
+     append entered messages as user/message
+     derive model history from the log
+     agent/request -> llm/stream -> assistant/chunk* -> assistant/message
+     tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
+     step/end
+     tools owe another request, or next-step input arrived -> claim -> next step
+  -> agent/turn-stopping
+turn/end
+```
+
+- `turn/*`, `step/*`, `user/message`, `assistant/*`, `tool/*` are **durable
+  session events**; the rest are live extension points.
+- `agent/pre-step`, `agent/request`, `llm/stream`, and the three `tools/*`
+  events are **waterfalls** — listeners must call `next()` to delegate.
+  `agent/turn-stopping` is **serial**, no `next()`.
+- Input reaches the driver through **one inbox** (two ordered lists:
+  `next-turn`, `next-step`). "Some messages wake it immediately; injected
+  context waits in the inbox until another message does." A rejected or empty
+  first claim still closes a durable turn that spent no step — the attempt is
+  recorded.
+- `agent/request-error` runs after a failed model step closes, before the turn
+  closes; a listener that owns recovery returns `{ kind: 'retry' }` *without
+  calling `next()`*.
+
+---
+
+## 5. The Agent handle
+
+Source: `packages/core/agent/src/types.ts`; docs: `docs/subsystems/core.md`.
+
+`Agent` is the surface every plugin programs against (the concrete loop
+implementation is package-internal to `dsh-agent-loop`):
+
+- `id: SessionId` — "the single identity shared with session".
+- `options: AgentOptions` — `provider?`, `model?`, `maxTokens?`.
+- `session: Session` — the live log ("its log is the durable source of truth").
+- `inbox: Inbox` — "the agent-owned projection of durable pending work";
+  targets `'next-turn' | 'next-step'`.
+- `status: 'idle' | 'running'` — mirrored on every `agent/status` transition.
+  `running` spans the whole driver drain, possibly several queued turns.
+- `ctx: Context` — agent-scoped context; contributions are agent-local, unwind
+  on disposal, and reject registration afterward.
+
+Methods:
+
+- `send(message, target, wakeup)` — the unified routing primitive;
+  `followup()` / `steer()` / `inject()` are fixed presets:
+  - `followup` — queue an ordinary next turn and wake.
+  - `steer` — "an idle driver starts a turn; a running driver consumes it at
+    its next step boundary."
+  - `inject` — queue model-facing context **without waking** the driver.
+- `cancel(cause, options?)` — aborts the active turn; `keepInbox` preserves
+  pending work; "with no active activity, cancellation is a no-op and does not
+  arm later work."
+- `whenIdle()` — resolves at whole-agent quiescence (follows replacement work
+  started before the observed driver retires).
+- `runMaintenance(task)` — one non-turn task from the true idle phase; public
+  status stays `idle` while it runs.
+
+**Cancellation semantics** (a masterclass in layer separation):
+
+```ts
+type AgentCancelCause =
+  | { kind: 'user' } | { kind: 'parent' }
+  | { kind: 'hook'; reason: string } | { kind: 'disposed' }
+```
+
+"The cause is a TypeScript-enforced same-process input. An active cancellation
+holder copies it into the runtime-only `AbortSignal.reason`; a signal grants
+cooperating listeners no classification authority. Durable `turn/end` retains
+the coarse `{ kind: 'aborted' }` outcome; recording who requested cancellation
+would require a separate durable event rather than overloading the terminal
+result." — runtime knows *who*, the log records *that*.
+
+**Ownership**: `ctx.agents.create()/resume()` returns an `AgentHandle`
+(`{ agent, dispose() }`). "The disposer is a CAPABILITY: among consumers, only
+the holder can tear this agent down." `dispose()` stops the loop, awaits exit,
+unregisters, removes the session, unwinds the scoped world. A `setup` callback
+composes the scoped world while both ids are still unpublished; any failure
+rolls the transaction back without publishing.
+
+**Initiator scope**: the process-local initiator is the exact `Agent`, not a
+copy — "Ambient presence is neither liveness proof nor authorization."
+
+---
+
+## 6. Tool execution pipeline
+
+Docs: `docs/tool-execution-pipeline.md`, `docs/subsystems/tools.md`.
+
+Stage order (all policy lives in listeners; the loop only dispatches):
+
+```text
+assistant message contains tool-call block
+  -> session event tool/call        (logged BEFORE execution)
+  -> UI pending card (presentCall)
+  -> tools/pre-execute waterfall    (hooks, permission, sandbox)
+  -> registered monotonic guards    (deny or abstain; identity protected)
+  -> ctx.approval one-shot prompt   (absent/unanswerable => deny)
+  -> tools/execute waterfall        (timeout, retry, metrics — AROUND dispatch)
+  -> tool execute() body
+       (fs tools also pass fs/write-intent | fs/edit-intent gates;
+        tools may append owned events: todo/write, fs/observed, hook/*)
+  -> tools/post-execute waterfall   (accept, block, replace, add context)
+  -> registry outer normalization   (snapshot throws become isError)
+  -> ToolDefinition.finalizeContent (last content-only invariant)
+  -> tools/result notification      (frozen authoritative outcome)
+  -> session event tool/result      (single model-facing outcome)
+  -> UI completed card (presentResult)
+  -> active-batch additionalContexts FIFO (injected user/message AFTER
+     recorded tool results)
+```
+
+Design rule encoded here: **pre-execute hosts policy** (hooks, approval,
+sandbox); **execute hosts around-dispatch concerns** (timeout, retry, metrics);
+**post-execute hosts result rewriting**. "This lets hooks span tool families
+without coupling the tools to one policy service." Owner policy that must not
+be reordered registers as a monotonic guard rather than a waterfall listener.
+
+Tools are authored via a typed `defineTool` DSL (`ValueSchemaSpec` /
+`ParameterSchemaSpec`) building `ToolDefinition` = model-facing `ToolSchema` +
+`execute` + optional final-content and UI callbacks. The registry snapshots
+candidate results losslessly and normalizes failures before the visible
+definition's `finalizeContent` runs.
+
+---
+
+## 7. Event taxonomy — picking the right extension point
+
+| Domain | Events | Use when |
+|---|---|---|
+| **Session events** | durable, appended to the log, broadcast via `session/event` | "the fact must survive a reload" |
+| **Agent events** (`agent/*`) | live `Agent` handle: inbox, step, status, request, validation, continuation | "observe or intercept work in flight" |
+| **Capability events** | attach policy/adapters to a seam (`fs/*`, `tools/*`, `telemetry/*`) | swap or guard a capability without importing the loop |
+
+Producers/consumers of every event are mapped in
+`docs/event-producer-consumer.md` — "Events are the extension points, and
+picking the right domain is the first decision in most changes."
+
+---
+
+## 8. Capability seams
+
+A **seam** is a swappable capability with three roles — **Service Definition**
+(declares the interface), **Service Provider** (implements it), **Consumer**
+(uses it, commonly a model-facing tool). "A package may combine roles, but one
+role alone is not a seam; adding a capability means designing all three."
+
+The payoff: **shared execution worlds**. "Filesystem and subprocess providers
+share one execution world, so pointing them at a remote sandbox moves Bash,
+PTY, and LSP with them, with no provider forks." Subagent providers vary just
+as widely behind one interface — "from a fresh child agent to a delegated turn
+in another product."
+
+Capability families ship as package groups: `llm/`, `shell/`, `terminal/`,
+`code-runtime/`, `sandbox/` (bwrap/Landlock/Seatbelt), `fs/`, `lsp/`, `skill/`,
+`compaction/`, `subagent/`, `jobs/`, `workflow/`, `web/`, `spill/`,
+`attachment/`, `session/` (persistence), `interaction/` (approval/ask-user),
+etc. — see `docs/capability-seams.md` (39KB) and the capability graph.
+
+---
+
+## 9. Type patterns (repo-wide)
+
+1. **`…Map` → derived-union.** Extensible sum types are interfaces keyed by a
+   discriminant; the union is `ThingMap[keyof ThingMap]`; plugins add variants
+   by declaration merging — no edit to the owning package. Six canonical maps:
+   `ContentBlockMap`, `MessageSourceMap`, `FinishReasonMap` (dsh-llm);
+   `TurnTriggerMap`, `TurnEndReasonMap`, `SessionEventMap` (dsh-session).
+2. **`assertNever` everywhere except merge-extensible unions.** Switches over
+   `SessionEvent` must NOT use `assertNever` — "a plugin-added variant is a
+   valid unknown value; handle the known cases and fall through `default`."
+3. **Branded ids** `Branded<B>` for SessionId/CallId/MessageId.
+4. **Validation boundaries.** "Trust TypeScript at typed same-process
+   boundaries" — validate only at parser/queue/model-JSON/durable/worker/
+   process/wire edges.
+5. **Source plane vs artifact plane**; one aggregate compiler face per package.
+6. **"An empty `catch` names what it swallows."**
+
+---
+
+## 10. "Where new behavior goes" (extension cookbook, verbatim)
+
+| Goal | Mechanism |
+|---|---|
+| Add a model provider | register its adapter on `ctx.llm` |
+| Add a model-facing capability | register on `ctx.tools`; its schema joins prompt assembly |
+| Give one session a different capability set | compose an agent preset; a service row there needs an `isolate` realm |
+| Add shell execution | register a `ctx.shell` backend; the local one spawns through `ctx.subprocess` |
+| Add persistent terminal execution | register a `ctx.terminals` backend plus `dsh-tool-terminal` |
+| Add a human command | register on `ctx.commands`; dispatches without a model turn |
+| Add background work | register on `ctx.jobs`; `job_*` tools collect or stop it |
+| Add filesystem access or policy | register a `ctx.fs` provider or listen to `fs/*` events |
+| Confine spawned processes | use a `ctx.sandbox` backend; consumers wrap argv before spawning |
+| Intercept a request, tool, or turn | use its `agent/*` or `tools/*` event; `agent/turn-stopping` stops a turn |
+| Add model-facing context | call `agent.inject()`; it lands in the next admitted request |
+| Add UI or editor integration | drive `ctx.agents` and render from `session/event` |
+| Add durable session state | extend `SessionEventMap`; render and replay from the log |
+| Generate session titles | register the sole `ctx.sessionTitle` provider |
+| Manage a same-session objective | use `ctx.goals`; continue through `agent/*` |
+| Fork a live session | `ctx.sessions.fork(source, boundary?, childSessionId?)` |
+| Scope a registration to one agent | use that agent's `agent.ctx` |
+
+---
+
+## 11. Engineering system (how it stays honest at 219 packages)
+
+**Test lanes** (vitest configs at root):
+
+- **Unit**: forked pools (`thread-safe` / `process-bound` — "Every suite forks
+  for Node stability"); setup injects runtime invariants (`test-invariants.ts`).
+- **Snapshot replay** (`vitest.snapshot.config.ts`): "Replay is the keyless
+  default: boot real subprocess paths from recorded model responses."
+  `DSH_SNAPSHOT=replay|record|refresh`; parallel replay bounded at 5, serial
+  record.
+- **Real-API e2e**: "Each test self-skips without its provider credential for
+  keyless CI"; env-bounded workers, retry 2.
+- **Browser lanes** for `apps/web` (serial Playwright), opt-in stress lane,
+  manual perf lane. Python SDK via pytest.
+- **Coverage**: v8, **per-file 100/100/100/100** — "100% or it doesn't merge…
+  Per-file so a well-covered big file can't subsidize a bare one" — with an
+  explicit, documented exclusion list.
+- **test-support packages**: `llm-mock-server` ("deterministic
+  OpenAI-compatible fault server"), `llm-replay`, `agent-loop-testkit`,
+  `acp-snapshot`, `client-runtime`, `loader-smoke`.
+
+**Gates** (~150 scripts, orchestrated by `run-gates.ts`): generated catalogs
+(tool/config/persistence/module-graph) freshness-gated in CI; `verify-*`
+contract gates (export JSDoc, `type-equiv` doc-snippet drift checking);
+`knip` unused-code hygiene; `jscpd` clone detection (minTokens 60);
+`oxlint` typeAware with `no-floating-promises` ("the repository's
+highest-value linted bug class") and exhaustive-switch rules.
+
+**Docs as a subsystem** (`docs/AGENTS.md`): tier taxonomy with
+"one home per fact"; word budgets (root AGENTS.md <= 1,600 words, gated);
+`ts type-equiv` fences drift-checked against source; "Document
+current state, not change history"; 44 subsystem pages each carrying a
+generated Cordis API section; bilingual en/zh with translation-pairing records;
+`.agents/notes/implemented/` — dated ADRs ("Agent Notes"), one per non-trivial
+change, required in the same PR.
+
+**Git hygiene** (root AGENTS.md): deliberate PR history; "Rewrites use
+`--force-with-lease`, abort on remote movement, never raw `--force`";
+`kind/*` + `area/*` labels; "Never default to the full suite… CI owns
+exhaustive coverage" (local hooks stay fast: staged oxlint --fix, doc/notice
+regen, typecheck on push via lefthook).
+
+**Pre-release stance**: "prefer the correct foundation over compatibility
+shims: rename or repackage freely and update every reference together" —
+allowed only before the first tagged release.
+
+---
+
+## 12. Distilled invariants (memorize these)
+
+1. The log is the truth; everything else is a projection.
+2. Model-visible <=> logged (runtime-asserted).
+3. Unknown durable data fails closed (`ignorable` opt-in, default refuse).
+4. Durable events record *what happened*; runtime signals carry *who/why*.
+5. Turn boundaries are durable facts, not UI state.
+6. A turn may close with zero steps — attempts are still recorded.
+7. `tool/call` is logged before execution; side effects never orphan their
+   record.
+8. Usage accounting travels with the assistant message it belongs to.
+9. Requests are pure functions of the log (`request/header` snapshots).
+10. Extend by mounting a plugin beside the others — never by patching the loop.
+11. Waterfall listeners MUST call `next()`; serial listeners decide in order.
+12. Capability = Definition + Provider + Consumer, or it isn't a seam.
+
+---
+
+## 13. Source index (for deep reading)
+
+| Topic | Path |
+|---|---|
+| Architecture overview | `docs/architecture.md` |
+| Session log spec | `docs/subsystems/session.md` |
+| Persistence | `docs/subsystems/persistence.md` |
+| Agent handle & loop contracts | `docs/subsystems/core.md` |
+| Tool pipeline | `docs/tool-execution-pipeline.md`, `docs/subsystems/tools.md` |
+| LLM streaming & message vocabulary | `docs/subsystems/llm-streaming.md` |
+| Event producer/consumer map | `docs/event-producer-consumer.md` |
+| Capability seams | `docs/capability-seams.md` |
+| Turn sequence diagrams | `docs/agent-lifecycle.md` |
+| Extension cookbook | `docs/cookbook/extension-cookbook.md` |
+| Cordis primer / tutorial | `docs/cordis-primer.md`, `docs/cordis-tutorial/` |
+| Conventions for agents | `AGENTS.md`, `packages/AGENTS.md` |
+| Testing policy | `docs/testing.md` |
+| Generated catalogs | `docs/config-catalog.md`, `docs/tool-catalog.md`, `docs/persistence-catalog.md`, `docs/module-graph.md` |
+| Core code | `packages/core/{session,agent,agent-loop,tools,system-prompt,scope}/src` |

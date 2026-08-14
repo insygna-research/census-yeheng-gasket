@@ -218,7 +218,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ### 5.2 内置工具(`tools/`)
 
-`built_in_tools()` 返回 6 个内置工具,均带风险分级:
+`built_in_tools()` 返回 8 个内置工具,均带风险分级:
 
 | 工具 | 文件 | 用途 | 典型风险 |
 |---|---|---|---|
@@ -228,6 +228,8 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `bash` | `tools/bash.rs` | 执行 shell | High |
 | `grep` | `tools/grep.rs` | 正则搜索(基于 `ignore`,尊重 .gitignore) | Low |
 | `list` | `tools/list.rs` | 列目录(基于 `ignore`+`glob`) | Low |
+| `fetch` | `tools/fetch.rs` | HTTP GET URL,HTML 转可读 markdown 文本(30s 超时,200KB 截断) | Low |
+| `spawn_subagents` | `tools/subagent.rs` | 并行子 agent 编排(maxItems 5,见 §11) | Medium |
 
 工具执行闭包签名(`ToolFn`):`Arc<dyn Fn(ToolCallCtx) -> Future<Output=Result<ToolResult,ToolError>>>`。`ToolContext.state_dir`(`~/.gasket/tool_state/<session>/<tool>/`)是每个工具的**私有**状态目录;`ToolCallCtx.aborted()` 用于长循环里协作式中止。
 
@@ -328,7 +330,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `error` | `content?`,`message?` | 错误横幅 |
 | `done` | — | 本轮结束 |
 | `approval_request` | `id`,`tool_name`,`description`,`arguments` | 请求人工审批 |
-| `subagent_*`(10 种) | — | ⏳ **M2 预留**:前端已有处理器,网关暂不发送 |
+| `subagent_*`(10 种) | — | ✅ **已实现**:子 agent 编排(`spawn_subagents` 工具)触发,网关经 `event_map::subagent_event_to_ws` 转发,前端 `SubagentGridPanel`/`SubagentThoughtsPanel` 渲染(见 §11) |
 
 ### 7.4 审批(`approval.rs`)
 
@@ -446,7 +448,7 @@ src/
 │   ├── MessageBubble.vue   消息渲染 (Markdown/mermaid/代码)
 │   ├── MessageThoughtsPanel.vue  思考 + 工具调用时间轴
 │   ├── ApprovalDialog.vue  工具审批模态框
-│   ├── SubagentGridPanel.vue        子 agent 面板(M2 预留)
+│   ├── SubagentGridPanel.vue        子 agent 面板(已实现,见 §10.7)
 │   └── SubagentThoughtsPanel.vue
 ├── composables/
 │   ├── useChatSession.ts        核心:WS 处理/消息流/REST 上下文/发送/审批/停止
@@ -494,9 +496,9 @@ src/
 
 流式输出期间(`isReceiving`),消息**只渲染为转义纯文本**(`MessageBubble.vue`),避免每个 chunk 都跑一遍 `marked.parse + DOMPurify`。完整的 Markdown / Mermaid 渲染**只在流结束后**触发。这是用一次首屏流畅度换渲染开销的务实取舍。
 
-### 10.7 预留特性:子 agent(M2)
+### 10.7 子 agent 面板(已实现)
 
-前端已内置完整的 `subagent_*` 消息类型、store 字段与 switch 分支(`types/index.ts`、`useChatSession.ts`),并标注为 **"M2"**。当前 gateway **从不发送**这些消息——这是为未来 core 层子 agent 编排预留的前端契约,目前是惰性代码。
+前端内置完整的 `subagent_*` 消息类型、store 字段与 switch 分支(`types/index.ts`、`useChatSession.ts`)。当 `spawn_subagents` 工具被调用时,gateway 经 `event_map::subagent_event_to_ws` 将 10 种 `SubagentEvent` 转发为 WS JSON,前端 `SubagentGridPanel`(运行中网格)与 `SubagentThoughtsPanel`(完成后详情)实时渲染。子 agent 编排实现见 `host/src/subagent.rs`(`HostSubagentSpawner`)与 `core/src/subagent.rs`(`SubagentSpawner` trait)。
 
 ---
 
@@ -531,8 +533,6 @@ src/
 
 阅读本文时请注意以下**当前状态**,避免误判:
 
-- **Dockerfile 已过时**:根 `Dockerfile` 引用的 crate 路径(`types/`、`storage/`、`engine/`...)是旧结构,`EXPOSE 18790` 也对不上 gateway 默认端口 3000。部署见 [使用文档 §Docker](./usage.md) 的说明。
-- **版本号不统一**:workspace `2.0.0` vs `web/package.json` `0.0.0` vs `tauri.conf.json` `0.0.0`。以 workspace `2.0.0` 为准。
-- **子 agent 协议为 M2 预留**:前端契约已就位,core/gateway 尚未发送 `subagent_*`。
-- **无顶层 README / docs 索引**:`docs/superpowers/` 下均为内部设计/实施文档(中文,带日期/状态元信息),本文与 [使用文档](./usage.md) 是首批面向用户的文档。
+- **子 agent 已实现**:`spawn_subagents` 工具 + `HostSubagentSpawner`(host 层)+ gateway 事件转发 + 前端面板均已落地(见 §11)。CLI 暂未接入(无多路事件通道)。
+- **MCP 支持 stdio + Streamable HTTP**:当前 `McpBridge`(stdio 子进程)与 `McpHttpClient`(HTTP POST)两种传输并存,可在 `mcp.json` 中混用。协议版本 `2025-06-18`(legacy era)。resources/prompts 原语、modern era(`2025-11-25`)为后续工作。
 - **Linux 桌面构建未在 CI**:Tauri 桌面产物 CI 仅覆盖 macOS(`.dmg`)与 Windows(`.msi`/`.exe`);Linux 桌面需本机具备 webkit2gtk 等系统依赖自行构建。

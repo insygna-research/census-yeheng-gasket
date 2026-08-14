@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use gasket_core::{
     run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock,
-    ContentDelta, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
-    ToolDefinition, UserMessage,
+    ContentDelta, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner, ToolDefinition,
+    UserMessage,
 };
 
 /// Max turns for a sub-agent (lower than the parent's default 50).
@@ -66,10 +66,7 @@ impl HostSubagentSpawner {
 
     /// Set an event forwarder (gateway). All subagent events are delivered to
     /// this callback.
-    pub fn with_ws_emit(
-        mut self,
-        ws_emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>,
-    ) -> Self {
+    pub fn with_ws_emit(mut self, ws_emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>) -> Self {
         self.ws_emit = Some(ws_emit);
         self
     }
@@ -115,8 +112,7 @@ impl SubagentSpawner for HostSubagentSpawner {
                 let index = i + 1;
                 let task_clone = task.task.clone();
 
-                let (event_tx, mut event_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
                 // Forwarder: AgentEvent → SubagentEvent → emit.
                 let emit_fwd = Arc::clone(&emit);
@@ -163,15 +159,11 @@ impl SubagentSpawner for HostSubagentSpawner {
                 let emit = Arc::clone(&emit);
 
                 let handle = tokio::spawn(async move {
-                    let result = run_agent_loop(
-                        vec![user_msg],
-                        sub_context,
-                        sub_config,
-                        move |ev| {
+                    let result =
+                        run_agent_loop(vec![user_msg], sub_context, sub_config, move |ev| {
                             let _ = event_tx.send(ev);
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
 
                     // Wait for forwarder to drain.
                     let _ = fwd_handle.await;
@@ -186,9 +178,9 @@ impl SubagentSpawner for HostSubagentSpawner {
                             // checkmark on work that never finished.
                             let failed = msgs.iter().rev().find_map(|m| match m {
                                 AgentMessage::Assistant(a) => match &a.stop_reason {
-                                    gasket_core::StopReason::Error(e) => Some(format!(
-                                        "sub-agent stream failed: {e}"
-                                    )),
+                                    gasket_core::StopReason::Error(e) => {
+                                        Some(format!("sub-agent stream failed: {e}"))
+                                    }
                                     gasket_core::StopReason::Aborted => {
                                         Some("sub-agent cancelled".into())
                                     }
@@ -211,8 +203,7 @@ impl SubagentSpawner for HostSubagentSpawner {
                                     error: Some(err_msg),
                                 }
                             } else {
-                                let (summary, tool_count) =
-                                    extract_summary_and_tools(&msgs);
+                                let (summary, tool_count) = extract_summary_and_tools(&msgs);
                                 emit(SubagentEvent::Completed {
                                     id: run_id.clone(),
                                     index: run_index,
@@ -426,8 +417,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use gasket_core::{
-        AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn,
-        ThinkingLevel, ToolDefinition,
+        AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn, ThinkingLevel,
+        ToolDefinition,
     };
 
     use crate::hooks::HookStack;
@@ -542,7 +533,9 @@ mod tests {
             }
         }
         assert!(
-            tool_ends.iter().any(|(n, o)| n == "bash" && o.contains("denied")),
+            tool_ends
+                .iter()
+                .any(|(n, o)| n == "bash" && o.contains("denied")),
             "blocked bash must be visible in events: {tool_ends:?}"
         );
     }
@@ -581,7 +574,10 @@ mod tests {
         assert!(results[0].error.is_none());
 
         let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
-        assert!(matches!(events.first(), Some(SubagentEvent::AllStarted { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(SubagentEvent::AllStarted { .. })
+        ));
         assert!(matches!(events.last(), Some(SubagentEvent::Synthesizing)));
         assert_eq!(
             events
@@ -669,9 +665,7 @@ mod tests {
         );
 
         let results = spawner
-            .spawn(vec![SubagentSpawn {
-                task: "t".into(),
-            }])
+            .spawn(vec![SubagentSpawn { task: "t".into() }])
             .await;
         assert_eq!(results.len(), 1);
         assert!(
@@ -682,7 +676,9 @@ mod tests {
 
         let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
         assert!(
-            events.iter().any(|e| matches!(e, SubagentEvent::Error { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, SubagentEvent::Error { .. })),
             "a failed stream must emit Error: {events:?}"
         );
         assert!(
@@ -714,9 +710,7 @@ mod tests {
         );
 
         let results = spawner
-            .spawn(vec![SubagentSpawn {
-                task: "t".into(),
-            }])
+            .spawn(vec![SubagentSpawn { task: "t".into() }])
             .await;
         let err = results[0].error.clone();
         assert!(
@@ -730,12 +724,12 @@ mod tests {
         );
 
         let events: Vec<SubagentEvent> = std::iter::from_fn(|| ev_rx.try_recv().ok()).collect();
-        assert!(events.iter().any(|e| matches!(e, SubagentEvent::Error { .. })));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, SubagentEvent::Completed { .. }))
-        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SubagentEvent::Error { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SubagentEvent::Completed { .. })));
     }
 
     /// Lifecycle: dropping the spawn future mid-flight must abort every

@@ -18,6 +18,9 @@ pub use error::{AgentError, ToolError};
 pub use extension::{ExtensionApi, ExtensionApiImpl};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
 pub use storage::{is_valid_session_id, JsonlStorage};
+pub use subagent::{
+    NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
+};
 pub use tools::built_in_tools;
 pub use types::context::{
     AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,
@@ -31,7 +34,6 @@ pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,
     ToolResult,
 };
-pub use subagent::{NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner};
 
 /// Current monotonically-increasing time in milliseconds since UNIX epoch.
 ///

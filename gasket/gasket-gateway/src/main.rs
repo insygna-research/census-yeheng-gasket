@@ -33,7 +33,7 @@
 //! | `message` / `cancel` | C->S | ✅ 已实现 |
 //! | `approval_request` / `approval_response` | 双向 | ✅ 已实现（本任务） |
 //! | `thinking` / `tool_start` / `tool_end` / `content` / `error` / `done` | S->C | ✅ 已实现 |
-//! | `subagent_*`（10 种） | S->C | ⏳ M2 规划（core 子 agent 编排落地后启用；前端处理器已存在，网关不发送） |
+//! | `subagent_*`（10 种） | S->C | ✅ 已实现（core 子 agent 编排 + gateway 事件转发 + 前端渲染） |
 
 use std::sync::Arc;
 

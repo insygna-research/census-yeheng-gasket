@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
 use gasket_host::{
-    commands_from_env, install_ctrl_c, load_external_tools, load_all_mcp, ConfigLoader,
+    commands_from_env, install_ctrl_c, load_all_mcp, load_external_tools, ConfigLoader,
     ContextBudget, EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
 };
 use reedline::{DefaultPrompt, Reedline, Signal};

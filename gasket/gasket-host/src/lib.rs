@@ -16,17 +16,16 @@ pub mod printer;
 pub mod session;
 pub mod subagent;
 
-
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use external_tool::{commands_from_env, load_all as load_external_tools, ExternalToolBridge};
-pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use gasket_core::RiskLevel;
 pub use hooks::HookStack;
-pub use subagent::HostSubagentSpawner;
+pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use session::{SessionInfo, SessionManager};
+pub use subagent::HostSubagentSpawner;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
