@@ -213,6 +213,21 @@ export const useChatStore = defineStore('chat', () => {
     }
   };
 
+  const abortSubagents = (chatId: string, messageId: string) => {
+    const chat = getChat(chatId);
+    if (!chat) return;
+    const msg = chat.messages.find(m => m.id === messageId);
+    if (msg?.subagents) {
+      msg.subagents.forEach(s => {
+        if (s.status === 'running') {
+          s.status = 'error';
+          s.error = 'Cancelled';
+          s.endTime = Date.now();
+        }
+      });
+    }
+  };
+
   const ensureSubagents = (chatId: string, messageId: string) => {
     const chat = getChat(chatId);
     if (!chat) return;
@@ -306,6 +321,7 @@ export const useChatStore = defineStore('chat', () => {
     setWatermarkInfo,
     setTurnSummary,
     abortToolCalls,
+    abortSubagents,
     ensureSubagents,
     pushSubagent,
     updateSubagent,

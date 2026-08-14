@@ -16,9 +16,6 @@ export function useChatSession(chatId: { value: string }) {
   const isReceiving = ref(false);
   const isCompacting = ref(false);
 
-  const toolStartTimes = ref<Record<string, number>>({});
-  const activeSubagents = ref<Map<string, SubagentState>>(new Map());
-  const hasActiveSubagents = computed(() => activeSubagents.value.size > 0);
   const subagentPhase = ref<'idle' | 'running' | 'synthesizing' | 'completed'>('idle');
   const subagentTimers = ref<Record<string, ReturnType<typeof setTimeout>>>({});
   const SUBAGENT_TIMEOUT_MS = 300_000; // 5 minutes client-side timeout as a safety net
@@ -53,14 +50,11 @@ export function useChatSession(chatId: { value: string }) {
 
   // ── Subagent handling ───────────────────────────────────────
 
-  const getOrCreateBotSubagent = (botMsg: Message, id: string): SubagentState | undefined => {
-    if (!botMsg.subagents) botMsg.subagents = [];
-    let s = botMsg.subagents.find(sa => sa.id === id);
-    return s;
-  };
+  const getBotSubagent = (botMsg: Message, id: string): SubagentState | undefined =>
+    botMsg.subagents?.find(sa => sa.id === id);
 
   const handleSubagentStarted = (msg: { id: string; task: string; index: number }, botMsg: Message) => {
-    const state: SubagentState = {
+    chatStore.pushSubagent(chatId.value, botMsg.id, {
       id: msg.id,
       index: msg.index,
       task: msg.task,
@@ -68,9 +62,7 @@ export function useChatSession(chatId: { value: string }) {
       toolCalls: [],
       toolCount: 0,
       startTime: Date.now(),
-    };
-    activeSubagents.value.set(msg.id, state);
-    chatStore.pushSubagent(chatId.value, botMsg.id, { ...state });
+    });
     if (subagentPhase.value !== 'running' && subagentPhase.value !== 'synthesizing') {
       subagentPhase.value = 'running';
     }
@@ -78,88 +70,73 @@ export function useChatSession(chatId: { value: string }) {
     // Client-side timeout: if backend never sends completed/error, force-finish the task
     if (subagentTimers.value[msg.id]) clearTimeout(subagentTimers.value[msg.id]);
     subagentTimers.value[msg.id] = setTimeout(() => {
-      const sub = activeSubagents.value.get(msg.id);
-      if (sub && sub.status === 'running') {
-        sub.status = 'error';
-        sub.error = 'Timed out';
-        sub.endTime = Date.now();
+      const s = getBotSubagent(botMsg, msg.id);
+      if (s && s.status === 'running') {
         chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
           status: 'error',
           error: 'Timed out',
           endTime: Date.now(),
         });
-        checkAndFinalizeSubagents();
+        checkAndFinalizeSubagents(botMsg);
       }
       delete subagentTimers.value[msg.id];
     }, SUBAGENT_TIMEOUT_MS);
   };
 
   const handleSubagentThinking = (msg: { id: string; content: string }, botMsg: Message) => {
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent) subagent.thinking = (subagent.thinking || '') + msg.content;
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
+    const s = getBotSubagent(botMsg, msg.id);
     if (s) {
-      s.thinking = (s.thinking || '') + msg.content;
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { thinking: s.thinking });
+      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { thinking: (s.thinking || '') + msg.content });
     }
   };
 
   const handleSubagentContent = (msg: { id: string; content: string }, botMsg: Message) => {
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent) subagent.content = (subagent.content || '') + msg.content;
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
+    const s = getBotSubagent(botMsg, msg.id);
     if (s) {
-      s.content = (s.content || '') + msg.content;
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { content: s.content });
+      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { content: (s.content || '') + msg.content });
     }
   };
 
   const handleSubagentToolStart = (msg: { id: string; name: string; arguments?: string }, botMsg: Message) => {
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent) {
-      const toolId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
-      subagent.toolCalls.push({ id: toolId, name: msg.name, arguments: msg.arguments, status: 'running', output: null });
-      subagent.toolCount++;
-    }
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
+    const s = getBotSubagent(botMsg, msg.id);
     if (s) {
-      const toolId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
-      const newTools = [...s.toolCalls, { id: toolId, name: msg.name, arguments: msg.arguments, status: 'running' as const, output: null }];
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { toolCalls: newTools, toolCount: s.toolCount + 1 });
+      const toolCall = {
+        id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 11),
+        name: msg.name,
+        arguments: msg.arguments,
+        status: 'running' as const,
+        output: null,
+        startTime: Date.now(),
+      };
+      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
+        toolCalls: [...s.toolCalls, toolCall],
+        toolCount: s.toolCount + 1,
+      });
     }
   };
 
   const handleSubagentToolEnd = (msg: { id: string; name: string; output?: string }, botMsg: Message) => {
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent && subagent.toolCalls.length > 0) {
+    const s = getBotSubagent(botMsg, msg.id);
+    if (s && s.toolCalls.length > 0) {
       // Sub-agents execute tools serially, so the newest running call with
       // this name is the one that just finished.
-      const tool = [...subagent.toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running');
-      if (tool) {
-        tool.status = 'complete';
-        tool.output = msg.output;
-        const elapsed = Date.now() - parseInt(tool.id.split('_')[0]);
-        tool.duration = (elapsed / 1000).toFixed(1) + 's';
+      const target = [...s.toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running');
+      if (target) {
+        const elapsed = target.startTime ? Date.now() - target.startTime : 0;
+        const newTools = s.toolCalls.map(t =>
+          t === target
+            ? { ...t, status: 'complete' as const, output: msg.output || null, duration: (elapsed / 1000).toFixed(1) + 's' }
+            : t
+        );
+        chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { toolCalls: newTools });
       }
-    }
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
-    if (s && s.toolCalls.length > 0) {
-      const newTools = s.toolCalls.map(t => {
-        if (t.name === msg.name && t.status === 'running') {
-          const elapsed = Date.now() - parseInt(t.id.split('_')[0]);
-          return { ...t, status: 'complete' as const, output: msg.output || null, duration: (elapsed / 1000).toFixed(1) + 's' };
-        }
-        return t;
-      });
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { toolCalls: newTools });
     }
   };
 
-  const checkAndFinalizeSubagents = () => {
-    const allCompleted = [...activeSubagents.value.values()].every(s => s.status !== 'running');
-    if (allCompleted && activeSubagents.value.size > 0) {
+  const checkAndFinalizeSubagents = (botMsg: Message) => {
+    const subs = botMsg.subagents;
+    if (subs && subs.length > 0 && subs.every(s => s.status !== 'running')) {
       subagentPhase.value = 'completed';
-      activeSubagents.value.clear();
     }
   };
 
@@ -168,23 +145,13 @@ export function useChatSession(chatId: { value: string }) {
       clearTimeout(subagentTimers.value[msg.id]);
       delete subagentTimers.value[msg.id];
     }
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent) {
-      subagent.status = 'completed';
-      subagent.summary = msg.summary;
-      subagent.toolCount = msg.tool_count;
-      subagent.endTime = Date.now();
-    }
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
-    if (s) {
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
-        status: 'completed',
-        summary: msg.summary,
-        toolCount: msg.tool_count,
-        endTime: Date.now(),
-      });
-    }
-    checkAndFinalizeSubagents();
+    chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
+      status: 'completed',
+      summary: msg.summary,
+      toolCount: msg.tool_count,
+      endTime: Date.now(),
+    });
+    checkAndFinalizeSubagents(botMsg);
   };
 
   const handleSubagentError = (msg: { id: string; index: number; error: string }, botMsg: Message) => {
@@ -192,21 +159,12 @@ export function useChatSession(chatId: { value: string }) {
       clearTimeout(subagentTimers.value[msg.id]);
       delete subagentTimers.value[msg.id];
     }
-    const subagent = activeSubagents.value.get(msg.id);
-    if (subagent) {
-      subagent.status = 'error';
-      subagent.error = msg.error;
-      subagent.endTime = Date.now();
-    }
-    const s = getOrCreateBotSubagent(botMsg, msg.id);
-    if (s) {
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
-        status: 'error',
-        error: msg.error,
-        endTime: Date.now(),
-      });
-    }
-    checkAndFinalizeSubagents();
+    chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
+      status: 'error',
+      error: msg.error,
+      endTime: Date.now(),
+    });
+    checkAndFinalizeSubagents(botMsg);
   };
 
   // ── WebSocket message processing ────────────────────────────
@@ -229,7 +187,6 @@ export function useChatSession(chatId: { value: string }) {
           result: null,
           startTime: Date.now()
         });
-        toolStartTimes.value[toolId] = Date.now();
         break;
       case 'tool_end':
         isThinking.value = true;
@@ -245,9 +202,8 @@ export function useChatSession(chatId: { value: string }) {
           : undefined;
         if (runningTool) {
           const updates: { status: 'error' | 'complete'; result: string; duration?: string } = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output };
-          if (toolStartTimes.value[runningTool.id]) {
-            updates.duration = ((Date.now() - toolStartTimes.value[runningTool.id]) / 1000).toFixed(1);
-            delete toolStartTimes.value[runningTool.id];
+          if (runningTool.startTime) {
+            updates.duration = ((Date.now() - runningTool.startTime) / 1000).toFixed(1);
           }
           chatStore.updateToolCall(chatId.value, botMsg.id, runningTool.id, updates);
         } else {
@@ -271,7 +227,7 @@ export function useChatSession(chatId: { value: string }) {
         isThinking.value = false;
         isReceiving.value = false;
         subagentPhase.value = 'idle';
-        activeSubagents.value.clear();
+        chatStore.abortSubagents(chatId.value, botMsg.id);
         Object.values(subagentTimers.value).forEach(clearTimeout);
         subagentTimers.value = {};
         showError(msg.content || msg.message || 'An error occurred');
@@ -280,7 +236,7 @@ export function useChatSession(chatId: { value: string }) {
         isThinking.value = false;
         // 回合结束（含审批超时/连接关闭后的 done）：清理残留审批弹窗。
         // 网关保证 done 排在全部 subagent 事件之后（单一有序通道），
-        // 到达这里时子面板必然已收尾，无需再检查 activeSubagents。
+        // 到达这里时子面板必然已收尾。
         pendingApprovals.value.clear();
         isReceiving.value = false;
         // Turn summary: `done_with_summary` carries cumulative tokens + elapsed.
@@ -496,7 +452,8 @@ export function useChatSession(chatId: { value: string }) {
     // never arrives — without this the panels would spin until the 5-minute
     // client timeout.
     subagentPhase.value = 'idle';
-    activeSubagents.value.clear();
+    const lastBotMsg = chatStore.getOrCreateBotMessage(chatId.value);
+    if (lastBotMsg) chatStore.abortSubagents(chatId.value, lastBotMsg.id);
     Object.values(subagentTimers.value).forEach(clearTimeout);
     subagentTimers.value = {};
   };
@@ -578,8 +535,6 @@ export function useChatSession(chatId: { value: string }) {
     watermarkInfo,
     usageColor,
     // Subagents
-    activeSubagents,
-    hasActiveSubagents,
     subagentPhase,
     // Approvals
     pendingApprovals,

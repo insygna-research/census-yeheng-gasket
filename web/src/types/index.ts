@@ -10,6 +10,8 @@ export interface SubagentToolCall {
   status: 'running' | 'complete' | 'error';
   output?: string | null;
   duration?: string;
+  /** Start timestamp (ms) — duration is derived from this, never parsed from id. */
+  startTime?: number;
 }
 
 /**
