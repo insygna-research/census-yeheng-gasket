@@ -336,6 +336,10 @@ async fn legacy_messages_migrate_once_and_delete_legacy() {
         "events.jsonl must exist after migration"
     );
     assert!(
+        !dir.join("events.jsonl.tmp").exists(),
+        "the atomic-install staging file must not survive the migration"
+    );
+    assert!(
         !dir.join("messages.jsonl").exists(),
         "legacy messages.jsonl must be deleted after a successful migration (D1)"
     );

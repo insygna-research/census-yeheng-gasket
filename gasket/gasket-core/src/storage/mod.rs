@@ -373,6 +373,49 @@ impl EventStorage {
         Ok(())
     }
 
+    /// Path to a session's in-flight `events.jsonl.tmp` — the staging file
+    /// for [`append_events_atomic`](Self::append_events_atomic). A leftover
+    /// from a crashed write is invisible to
+    /// [`has_events`](Self::has_events)/[`load_events`](Self::load_events),
+    /// which only ever look at `events.jsonl`.
+    fn events_tmp_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("events.jsonl.tmp")
+    }
+
+    /// Atomically install a full batch of events as the session's event log:
+    /// the batch is written to `events.jsonl.tmp`, synced, then renamed onto
+    /// `events.jsonl` (rename is atomic on POSIX). Unlike
+    /// [`append_events`](Self::append_events) — which streams rows onto the
+    /// live log and can leave a torn prefix if the process dies mid-batch —
+    /// a crash here can never produce a partial `events.jsonl`: either the
+    /// complete log exists or only the `.tmp` does, and the next
+    /// `append_events_atomic` call replaces the stale `.tmp` wholesale.
+    /// An empty batch is a no-op (no directory or file is created).
+    pub async fn append_events_atomic(
+        &self,
+        session_id: &str,
+        evs: &[SessionEvent],
+    ) -> Result<(), AgentError> {
+        if evs.is_empty() {
+            return Ok(());
+        }
+        validate_session_id(session_id)?;
+        let dest = self.events_path(session_id);
+        let tmp = self.events_tmp_path(session_id);
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        for ev in evs {
+            append_line(&mut file, ev).await?;
+        }
+        // Flush the data to disk before the rename so the rename boundary
+        // (not page cache luck) is what makes the log durable.
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp, &dest).await?;
+        Ok(())
+    }
+
     /// Load all events for a session, in append order. Returns empty vec for
     /// a session that has never been written. Same torn-tail policy as
     /// [`JsonlStorage::load_messages`], plus fail-closed version-skew
@@ -747,5 +790,53 @@ mod tests {
         assert!(matches!(err, AgentError::Transcript(_)));
         let raw = std::fs::read_to_string(store.events_path("s1")).unwrap();
         assert_eq!(raw, format!("{{\"type\":\"from_the_future\"}}\n{good}\n"));
+    }
+
+    // ── Atomic batch install ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn append_events_atomic_empty_batch_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        store.append_events_atomic("s1", &[]).await.unwrap();
+        assert!(!store.has_events("s1"));
+        assert!(!store.events_path("s1").exists());
+        assert!(!tmp.path().join("s1").exists());
+    }
+
+    #[tokio::test]
+    async fn append_events_atomic_installs_full_batch_and_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let events = sample_events();
+
+        store.append_events_atomic("s1", &events).await.unwrap();
+
+        assert_eq!(store.load_events("s1").await.unwrap(), events);
+        assert!(
+            !tmp.path().join("s1").join("events.jsonl.tmp").exists(),
+            "the staging file must be gone after the rename"
+        );
+    }
+
+    /// Crash before the rename: only a (possibly torn) `.tmp` exists. It is
+    /// invisible to `has_events`/`load_events`, and a retry replaces it
+    /// wholesale instead of appending behind it.
+    #[tokio::test]
+    async fn leftover_tmp_from_crash_is_ignored_and_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let dir = tmp.path().join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.jsonl.tmp"), "{\"type\":\"TurnSta").unwrap();
+
+        assert!(!store.has_events("s1"));
+        assert!(store.load_events("s1").await.unwrap().is_empty());
+
+        // The retry after the crash.
+        let events = sample_events();
+        store.append_events_atomic("s1", &events).await.unwrap();
+        assert_eq!(store.load_events("s1").await.unwrap(), events);
+        assert!(!dir.join("events.jsonl.tmp").exists());
     }
 }

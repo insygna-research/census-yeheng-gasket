@@ -54,10 +54,10 @@ impl SessionManager {
         &self.current_id
     }
 
-    /// 打开或迁移：events.jsonl 存在 → load；否则 messages.jsonl 存在 →
-    /// 旧消息逐条 `SessionEvent::from_message` 包裹写入 events.jsonl,
-    /// 迁移成功后删除旧 messages.jsonl(D1:不保留);两者皆无 → 新会话。
-    /// 中间行损坏 → `Err`(fail closed,绝不 adopt)。
+    /// 打开或迁移:events.jsonl 存在 → load;否则 messages.jsonl 存在 →
+    /// 旧消息逐条 `SessionEvent::from_message` 包裹,经 tmp+rename 原子
+    /// 写入 events.jsonl,迁移成功后删除旧 messages.jsonl(D1:不保留);
+    /// 两者皆无 → 新会话。中间行损坏 → `Err`(fail closed,绝不 adopt)。
     ///
     /// Does not change the current-session cursor; [`resume`](Self::resume)
     /// adopts the id on top of this.
@@ -79,9 +79,19 @@ impl SessionManager {
             })?;
             events.push(ev);
         }
-        // Full batch on one open handle; only after every row landed is the
-        // legacy file removed — a mid-migration failure leaves it untouched.
-        self.storage.append_events(session_id, &events).await?;
+        // Atomic install (tmp + rename): a crash can never leave a torn
+        // events.jsonl shadowing the intact legacy file. Crash windows:
+        //  * before the rename — only the `.tmp` exists, `has_events` stays
+        //    false, and the next open re-migrates from the untouched legacy
+        //    (idempotent; the stale `.tmp` is replaced wholesale).
+        //  * after the rename, before `delete_legacy` — events.jsonl is
+        //    complete and `has_events` short-circuits to it, so the leftover
+        //    legacy file is inert and is deliberately left in place: D1's
+        //    "delete after success" is satisfied at the rename boundary, and
+        //    a second opportunistic cleanup pass is not worth the code.
+        self.storage
+            .append_events_atomic(session_id, &events)
+            .await?;
         self.storage.delete_legacy(session_id).await?;
         Ok(events)
     }
@@ -290,5 +300,79 @@ mod tests {
 
         let events = sm.open_or_migrate("persisted").await.unwrap();
         assert_eq!(events, vec![user_event("via-callback")]);
+    }
+
+    fn write_legacy(dir: &std::path::Path, msgs: &[AgentMessage]) {
+        let mut raw = String::new();
+        for m in msgs {
+            raw.push_str(&serde_json::to_string(m).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("messages.jsonl"), raw).unwrap();
+    }
+
+    /// Crash window before the rename: `events.jsonl.tmp` exists (possibly
+    /// torn) but `events.jsonl` never materialized. `has_events` must be
+    /// false, the legacy file must still be intact, and the next open must
+    /// re-migrate the full transcript from scratch.
+    #[tokio::test]
+    async fn migration_crash_before_rename_re_migrates_from_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "crashed-migration";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = vec![user_msg("hello"), user_msg("again")];
+        write_legacy(&dir, &legacy);
+        // The torn staging file a kill -9 between write and rename leaves.
+        std::fs::write(dir.join("events.jsonl.tmp"), "{\"type\":\"TurnSta").unwrap();
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.open_or_migrate(sid).await.unwrap();
+        assert_eq!(
+            derive_messages(&events),
+            legacy,
+            "the retry must migrate the full legacy transcript"
+        );
+        assert!(dir.join("events.jsonl").exists());
+        assert!(
+            !dir.join("events.jsonl.tmp").exists(),
+            "the retry must replace the stale staging file wholesale"
+        );
+        assert!(
+            !dir.join("messages.jsonl").exists(),
+            "legacy removed only after the successful atomic install"
+        );
+    }
+
+    /// Crash window after the rename but before `delete_legacy`:
+    /// `events.jsonl` is complete, so the open short-circuits to it and the
+    /// leftover legacy file is inert and left in place (documented choice —
+    /// the rename boundary is the success point for D1).
+    #[tokio::test]
+    async fn migration_crash_after_rename_opens_events_and_leaves_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "crashed-cleanup";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The already-complete migrated log plus an orphaned legacy file.
+        let events = vec![user_event("migrated-a"), user_event("migrated-b")];
+        let mut raw = String::new();
+        for ev in &events {
+            raw.push_str(&serde_json::to_string(ev).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("events.jsonl"), raw).unwrap();
+        write_legacy(&dir, &[user_msg("old-a"), user_msg("old-b")]);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let loaded = sm.open_or_migrate(sid).await.unwrap();
+        assert_eq!(
+            loaded, events,
+            "must load the complete events.jsonl, never consult the legacy file"
+        );
+        assert!(
+            dir.join("messages.jsonl").exists(),
+            "the leftover legacy is inert cleanup, deliberately not deleted here"
+        );
     }
 }
