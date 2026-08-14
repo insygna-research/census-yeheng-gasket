@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_fn: Arc::new(MockThatCallsHello),
         hooks: Some(Arc::new(api)),
         retry: gasket_core::RetryPolicy::default(),
+        persist: None,
     };
 
     let msgs = gasket_core::agent_loop(vec![user_msg], context, config).await?;

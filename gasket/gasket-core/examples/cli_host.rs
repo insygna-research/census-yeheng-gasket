@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_fn,
         hooks: None,
         retry: tunables.retry,
+        persist: None,
     };
 
     let session_id = context.session_id.clone();

@@ -466,6 +466,7 @@ mod tests {
                 stream_fn: stream,
                 hooks: None,
                 retry: RetryPolicy::off(),
+                persist: None,
             },
         )
         .with_ws_emit(Arc::new(move |ev| {

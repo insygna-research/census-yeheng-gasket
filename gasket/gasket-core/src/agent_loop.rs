@@ -12,6 +12,7 @@ use crate::types::event::{AgentEvent, ContentDelta};
 use crate::types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
 };
+use crate::types::session_event::SessionEvent;
 use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext};
 
 /// Run the agent loop to completion.
@@ -56,6 +57,17 @@ where
         //    `stream_assistant_response`, before any provider request is made.)
         let assistant = stream_assistant_response(&context, &config, &mut emit).await?;
         let stop_reason = assistant.stop_reason.clone();
+        // Crash-safety invariant: the assembled assistant message (with this
+        // step's usage) hits the log BEFORE any tool in it executes, so a
+        // crash mid-tool leaves an honest "assistant asked, tool never
+        // answered" tail instead of a phantom.
+        persist_event(
+            &config,
+            &SessionEvent::Assistant {
+                message: AgentMessage::Assistant(assistant.clone()),
+                usage: assistant.usage,
+            },
+        )?;
         context
             .messages
             .push(AgentMessage::Assistant(assistant.clone()));
@@ -75,6 +87,10 @@ where
                 tracing::warn!("assistant output truncated (max_tokens); discarding tool calls");
                 let error_results = fail_all_tool_calls(&assistant);
                 for r in &error_results {
+                    persist_event(
+                        &config,
+                        &SessionEvent::ToolResult(AgentMessage::ToolResult(r.clone())),
+                    )?;
                     context.messages.push(AgentMessage::ToolResult(r.clone()));
                     new_messages.push(AgentMessage::ToolResult(r.clone()));
                 }
@@ -120,6 +136,44 @@ fn is_aborted(config: &AgentLoopConfig) -> bool {
         .signal
         .as_ref()
         .is_some_and(|s| s.load(Ordering::Relaxed))
+}
+
+/// Hand one [`SessionEvent`] to the loop's `persist` callback (if installed).
+/// A persist `Err` propagates: storage failures abort the run (fail loud),
+/// never silently swallowed. `persist: None` is a no-op.
+fn persist_event(config: &AgentLoopConfig, event: &SessionEvent) -> Result<(), AgentError> {
+    match &config.persist {
+        Some(persist) => persist(event),
+        None => Ok(()),
+    }
+}
+
+/// Emit `ToolExecutionEnd`, persist the completed tool result, and record it.
+/// Every finished result flows through here — successes, tool errors, hook
+/// blocks (a refusal is a fact), malformed args, unknown tools, over-limit
+/// drops — so the on-disk order always matches execution order. Called only
+/// after any `after_tool_call` rewriting, never before.
+fn record_tool_result<E>(
+    config: &AgentLoopConfig,
+    emit: &mut E,
+    results: &mut Vec<ToolResultMessage>,
+    result: ToolResultMessage,
+    is_error: bool,
+) -> Result<(), AgentError>
+where
+    E: FnMut(AgentEvent),
+{
+    emit(AgentEvent::ToolExecutionEnd {
+        tool_call_id: result.tool_call_id.clone(),
+        result: result.clone(),
+        is_error,
+    });
+    persist_event(
+        config,
+        &SessionEvent::ToolResult(AgentMessage::ToolResult(result.clone())),
+    )?;
+    results.push(result);
+    Ok(())
 }
 
 /// Build an error ToolResult for every tool call in `assistant` (used on
@@ -194,12 +248,7 @@ where
                 &tc.function.name,
                 format!("tool call limit reached ({limit} per turn); call dropped"),
             );
-            emit(AgentEvent::ToolExecutionEnd {
-                tool_call_id: tc.id.clone(),
-                result: result.clone(),
-                is_error: true,
-            });
-            results.push(result);
+            record_tool_result(config, emit, &mut results, result, true)?;
             continue;
         }
         // Cooperative abort between tool calls in a batch.
@@ -226,12 +275,7 @@ where
                         tc.function.arguments
                     ),
                 );
-                emit(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id.clone(),
-                    result: result.clone(),
-                    is_error: true,
-                });
-                results.push(result);
+                record_tool_result(config, emit, &mut results, result, true)?;
                 continue;
             }
         };
@@ -256,12 +300,7 @@ where
             ToolCallVerdict::Block(reason) => {
                 tracing::warn!(tool = %tc.function.name, "tool blocked by before_tool_call hook");
                 let result = error_tool_result(&tc.id, &tc.function.name, reason);
-                emit(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id.clone(),
-                    result: result.clone(),
-                    is_error: true,
-                });
-                results.push(result);
+                record_tool_result(config, emit, &mut results, result, true)?;
                 continue;
             }
             ToolCallVerdict::Modify(new_args) => args = new_args,
@@ -279,12 +318,7 @@ where
                     &tc.function.name,
                     format!("tool not found: {}", tc.function.name),
                 );
-                emit(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tc.id.clone(),
-                    result: result.clone(),
-                    is_error: true,
-                });
-                results.push(result);
+                record_tool_result(config, emit, &mut results, result, true)?;
                 continue;
             }
         };
@@ -333,14 +367,10 @@ where
             result = h.after_tool_call(&tc.id, &result);
         }
 
-        emit(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tc.id.clone(),
-            result: result.clone(),
-            is_error: result.is_error,
-        });
+        let is_error = result.is_error;
+        record_tool_result(config, emit, &mut results, result, is_error)?;
 
-        tracing::info!(tool = %tc.function.name, is_error = result.is_error, "tool done");
-        results.push(result);
+        tracing::info!(tool = %tc.function.name, is_error, "tool done");
     }
 
     Ok(results)
@@ -579,10 +609,12 @@ mod tests {
     use futures_util::stream;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use crate::types::session_event::SessionEvent;
 
     /// A mock StreamFn that replays a fixed chunk sequence.
     struct MockStream(Vec<StreamChunk>);
-
     impl StreamFn for MockStream {
         fn stream(
             &self,
@@ -611,6 +643,7 @@ mod tests {
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
             hooks: None,
             retry: crate::RetryPolicy::off(),
+            persist: None,
         }
     }
 
@@ -855,6 +888,7 @@ mod tests {
                 StreamChunk::Done,
             ])),
             hooks: Some(std::sync::Arc::new(api)),
+            persist: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -916,6 +950,7 @@ mod tests {
                 StreamChunk::Done,
             ])),
             hooks: Some(std::sync::Arc::new(api)),
+            persist: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -1118,6 +1153,7 @@ mod tests {
             signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
+            persist: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -1457,6 +1493,166 @@ mod tests {
                 AgentMessage::Assistant(a) if a.stop_reason == StopReason::Aborted
             )),
             "pre-set signal must produce an Aborted message"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_writes_assistant_before_tool_results() {
+        // Scripted stream: text + tool_call + usage. The persist callback
+        // must observe the assembled Assistant (with its tool_call block and
+        // THIS step's usage) BEFORE any ToolResult - crash-safe ordering.
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo args".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
+            }),
+        };
+        let mut config = test_config(vec![
+            StreamChunk::TextDelta("checking".into()),
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Usage {
+                input: 5,
+                output: 3,
+            },
+            StreamChunk::Done,
+        ]);
+        let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            sink.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.len() >= 2,
+            "expected at least Assistant + ToolResult"
+        );
+        match &recorded[0] {
+            SessionEvent::Assistant { message, usage } => {
+                assert!(
+                    matches!(message, AgentMessage::Assistant(a)
+                        if a.content.iter().any(|b| matches!(b, ContentBlock::ToolCall { .. }))),
+                    "persisted Assistant must carry the tool_call block"
+                );
+                assert_eq!(
+                    usage,
+                    &Some(crate::types::message::Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                    }),
+                    "persisted Assistant must carry this step's usage"
+                );
+            }
+            other => panic!("expected Assistant first, got {other:?}"),
+        }
+        assert!(
+            matches!(&recorded[1], SessionEvent::ToolResult(AgentMessage::ToolResult(tr))
+                if tr.tool_name == "echo"),
+            "ToolResult must be persisted after the Assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_error_aborts_run() {
+        // The persist callback fails on its very first call: the run must
+        // abort with that Err instead of silently continuing.
+        let mut config = test_config(vec![StreamChunk::TextDelta("hi".into()), StreamChunk::Done]);
+        config.persist = Some(Arc::new(|_ev: &SessionEvent| {
+            Err(AgentError::Io(std::io::Error::other("disk full")))
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        let result = run_agent_loop(vec![], context, config, |_| {}).await;
+        assert!(result.is_err(), "persist error must abort the run");
+    }
+
+    #[tokio::test]
+    async fn blocked_tool_call_still_persists_result() {
+        // A before_tool_call Block still produces an is_error ToolResult,
+        // and that refusal is persisted like any other fact.
+        let mut api = crate::extension::ExtensionApiImpl::new();
+        api.register_before_tool_call(Box::new(BlockBash));
+        let bash = crate::ToolDefinition {
+            name: "bash".into(),
+            label: "Bash".into(),
+            description: "shell".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::ToolResult::text("ran")) })
+            }),
+        };
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("bash".into()),
+                args_delta: "{\"command\":\"rm -rf /\"}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        config.hooks = Some(std::sync::Arc::new(api));
+        let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            sink.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![bash],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.len() >= 2,
+            "expected Assistant + blocked ToolResult on disk"
+        );
+        assert!(
+            matches!(&recorded[1], SessionEvent::ToolResult(AgentMessage::ToolResult(tr))
+                if tr.tool_name == "bash" && tr.is_error
+                && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "blocked by policy"))),
+            "a blocked call must still persist its is_error ToolResult"
         );
     }
 }

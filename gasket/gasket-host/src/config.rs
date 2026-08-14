@@ -73,6 +73,7 @@ impl HostConfig {
             stream_fn,
             hooks,
             retry: self.tunables.retry.clone(),
+            persist: None,
         }
     }
 
