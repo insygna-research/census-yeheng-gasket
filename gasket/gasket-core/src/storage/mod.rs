@@ -177,9 +177,11 @@ async fn append_line<T: serde::Serialize>(
 /// Parse a message transcript, applying the torn-tail recovery policy.
 ///
 /// Thin wrapper over the generic [`scan_jsonl`] scanner; see that function
-/// (and the module docs) for the exact semantics.
+/// (and the module docs) for the exact semantics. The legacy `messages.jsonl`
+/// behavior is frozen: `fail_closed_on_data` is off, so any unparseable last
+/// line — whatever the error class — heals as a torn tail.
 async fn parse_transcript(path: &Path) -> Result<Vec<AgentMessage>, AgentError> {
-    scan_jsonl::<AgentMessage>(path, true).await
+    scan_jsonl::<AgentMessage>(path, true, false).await
 }
 
 /// Scan a JSONL file into `T` rows, applying the torn-tail recovery policy.
@@ -190,9 +192,18 @@ async fn parse_transcript(path: &Path) -> Result<Vec<AgentMessage>, AgentError> 
 /// interrupted by crash/power loss): the line is dropped and — when
 /// `repair_tail` is set — the file is truncated at that line's start, so
 /// loading succeeds with the preceding records and later appends stay clean.
+///
+/// When `fail_closed_on_data` is set, a deserialization **data** error
+/// (`serde_json::error::Category::Data` — e.g. a complete row whose `"type"`
+/// tag matches no known variant) fails the load regardless of position and
+/// never truncates. A byte-truncated write can only produce a `Syntax`/`Eof`
+/// error, so a `Data` error on the last line is version skew (a newer gasket
+/// wrote a row this reader does not know — by definition the most recent
+/// line), and healing it away would silently destroy data.
 async fn scan_jsonl<T: serde::de::DeserializeOwned>(
     path: &Path,
     repair_tail: bool,
+    fail_closed_on_data: bool,
 ) -> Result<Vec<T>, AgentError> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -218,6 +229,12 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         match serde_json::from_slice::<T>(line) {
             Ok(m) => items.push(m),
             Err(e) => {
+                if fail_closed_on_data && e.classify() == serde_json::error::Category::Data {
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {line_no} in {}: {e}",
+                        path.display()
+                    )));
+                }
                 if is_last {
                     tracing::warn!(
                         path = %path.display(),
@@ -244,6 +261,12 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         match serde_json::from_slice::<T>(tail) {
             Ok(m) => items.push(m),
             Err(e) => {
+                if fail_closed_on_data && e.classify() == serde_json::error::Category::Data {
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {line_no} in {}: {e}",
+                        path.display()
+                    )));
+                }
                 tracing::warn!(
                     path = %path.display(),
                     line = line_no,
@@ -351,18 +374,22 @@ impl EventStorage {
     }
 
     /// Load all events for a session, in append order. Returns empty vec for
-    /// a session that has never been written. Same recovery policy as
-    /// [`JsonlStorage::load_messages`].
+    /// a session that has never been written. Same torn-tail policy as
+    /// [`JsonlStorage::load_messages`], plus fail-closed version-skew
+    /// handling: a complete row this reader does not understand fails the
+    /// load instead of being healed away as a torn tail.
     pub async fn load_events(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
         validate_session_id(session_id)?;
-        scan_jsonl::<SessionEvent>(&self.events_path(session_id), true).await
+        scan_jsonl::<SessionEvent>(&self.events_path(session_id), true, true).await
     }
 
     /// Load the legacy `messages.jsonl` for a session — the migration source.
-    /// Returns empty vec when there is nothing to migrate.
+    /// Returns empty vec when there is nothing to migrate. Legacy semantics
+    /// are frozen: identical recovery policy to
+    /// [`JsonlStorage::load_messages`].
     pub async fn load_messages(&self, session_id: &str) -> Result<Vec<AgentMessage>, AgentError> {
         validate_session_id(session_id)?;
-        scan_jsonl::<AgentMessage>(&self.messages_path(session_id), true).await
+        scan_jsonl::<AgentMessage>(&self.messages_path(session_id), true, false).await
     }
 
     /// Remove the session's legacy `messages.jsonl` after a successful
@@ -680,11 +707,33 @@ mod tests {
         );
     }
 
+    /// Fail closed on version skew: a syntactically complete row whose
+    /// "type" tag matches no known variant — even as the LAST line — must
+    /// fail the load and leave the file untouched, never be healed away as
+    /// a torn tail. A newer gasket wrote that row (it is by definition the
+    /// most recent line); truncating it would silently destroy data.
     #[tokio::test]
     async fn events_unknown_variant_fails_load() {
-        // Fail closed: a row the reader does not know must fail the load, not
-        // be silently skipped. Placed mid-file so it is treated as real
-        // damage rather than a torn tail.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        write_raw_events(&store, "s1", "{\"type\":\"from_the_future\"}\n");
+
+        let err = store.load_events("s1").await.unwrap_err();
+        assert!(matches!(err, AgentError::Transcript(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line 1"),
+            "error must name the file line, got: {msg}"
+        );
+        // No destructive repair: the unknown row is still on disk.
+        let raw = std::fs::read_to_string(store.events_path("s1")).unwrap();
+        assert_eq!(raw, "{\"type\":\"from_the_future\"}\n");
+    }
+
+    /// The same unknown variant mid-file is real damage: fail loudly,
+    /// file untouched.
+    #[tokio::test]
+    async fn events_unknown_variant_mid_file_fails_load() {
         let tmp = tempfile::tempdir().unwrap();
         let store = EventStorage::new(tmp.path());
         let good = serde_json::to_string(&SessionEvent::TurnStart).unwrap();
@@ -696,5 +745,7 @@ mod tests {
 
         let err = store.load_events("s1").await.unwrap_err();
         assert!(matches!(err, AgentError::Transcript(_)));
+        let raw = std::fs::read_to_string(store.events_path("s1")).unwrap();
+        assert_eq!(raw, format!("{{\"type\":\"from_the_future\"}}\n{good}\n"));
     }
 }
