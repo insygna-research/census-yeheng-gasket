@@ -27,10 +27,17 @@ pub fn event_to_ws(
             }
         },
         AgentEvent::ToolExecutionStart {
-            tool_name, args, ..
+            tool_call_id,
+            tool_name,
+            args,
+            ..
         } => {
             let args_str = serde_json::to_string(args).unwrap_or_default();
-            Some(OutgoingEvent::tool_start(tool_name.clone(), args_str))
+            Some(OutgoingEvent::tool_start(
+                tool_name.clone(),
+                args_str,
+                tool_call_id.clone(),
+            ))
         }
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
@@ -49,7 +56,7 @@ pub fn event_to_ws(
                     _ => None,
                 })
                 .unwrap_or_default();
-            Some(OutgoingEvent::tool_end(name, summary))
+            Some(OutgoingEvent::tool_end(name, summary, tool_call_id.clone()))
         }
         AgentEvent::Error { message } => Some(OutgoingEvent::error(message.clone())),
         _ => None,
@@ -172,6 +179,7 @@ mod tests {
         assert_eq!(v["type"], "tool_end");
         assert_eq!(v["name"], "bash");
         assert_eq!(v["output"], "ok");
+        assert_eq!(v["tool_call_id"], "tc1");
     }
 
     #[test]
@@ -186,6 +194,21 @@ mod tests {
         assert_eq!(v["type"], "tool_end");
         assert_eq!(v["name"], "bash");
         assert_eq!(v["output"], "approval denied by user");
+        assert_eq!(v["tool_call_id"], "tc1");
+    }
+
+    #[test]
+    fn tool_start_serializes_tool_call_id() {
+        let mut tool_names = HashMap::new();
+        let event = AgentEvent::ToolExecutionStart {
+            tool_call_id: "tc9".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"cmd": "ls"}),
+        };
+        let v = ws_json(&event, &mut tool_names);
+        assert_eq!(v["type"], "tool_start");
+        assert_eq!(v["tool_call_id"], "tc9");
+        assert_eq!(v["name"], "bash");
     }
 
     #[test]

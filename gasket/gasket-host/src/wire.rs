@@ -16,6 +16,9 @@ pub struct OutgoingEvent {
     event_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    /// Stable id pairing a `tool_start` with its `tool_end` (only on those).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +49,7 @@ impl OutgoingEvent {
         Self {
             event_type,
             id: None,
+            tool_call_id: None,
             tool_name: None,
             description: None,
             content: None,
@@ -69,16 +73,18 @@ impl OutgoingEvent {
         ev.content = Some(s);
         ev
     }
-    pub fn tool_start(name: String, args: String) -> Self {
+    pub fn tool_start(name: String, args: String, tool_call_id: String) -> Self {
         let mut ev = Self::base("tool_start");
         ev.name = Some(name);
         ev.arguments = Some(args);
+        ev.tool_call_id = Some(tool_call_id);
         ev
     }
-    pub fn tool_end(name: String, output: String) -> Self {
+    pub fn tool_end(name: String, output: String, tool_call_id: String) -> Self {
         let mut ev = Self::base("tool_end");
         ev.name = Some(name);
         ev.output = Some(output);
+        ev.tool_call_id = Some(tool_call_id);
         ev
     }
     pub fn error(msg: String) -> Self {
