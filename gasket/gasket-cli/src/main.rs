@@ -4,10 +4,10 @@ use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use gasket_core::{AgentMessage, ContentBlock, ToolDefinition, UserMessage};
+use gasket_core::ToolDefinition;
 use gasket_host::{
     commands_from_env, install_ctrl_c, load_all_mcp, load_external_tools, ConfigLoader,
-    ContextBudget, EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
+    EventPrinter, HookStack, Host, Mode, PermissionPolicy, SessionManager,
 };
 use reedline::{DefaultPrompt, Reedline, Signal};
 
@@ -55,7 +55,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resume_arg = std::env::args().find_map(|a| a.strip_prefix("--resume=").map(String::from));
 
     let mut session = SessionManager::new();
-    let mut history: Vec<AgentMessage> = Vec::new();
     if let Some(r) = resume_arg {
         let res = if r == "last" {
             session.resume_last().await
@@ -63,15 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session.resume(&r).await
         };
         match res {
-            Ok(m) => {
-                println!("(resumed {} with {} msgs)", session.current_id(), m.len());
-                history = m;
-            }
+            Ok(m) => println!("(resumed {} with {} msgs)", session.current_id(), m.len()),
             Err(e) => println!("(resume: {e})"),
         }
     }
 
-    let mut budget = ContextBudget::from_env();
     let (ext_tools, ext_hooks) = load_inprocess_ext();
     if !ext_tools.is_empty() {
         eprintln!("(in-process ext tools: {})", ext_tools.len());
@@ -111,30 +106,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('/') {
-            handle_slash(cmd, &mut host, &mut history, &ext_tools).await;
+            handle_slash(cmd, &mut host, &ext_tools).await;
             continue;
         }
-        let user_msg = AgentMessage::User(UserMessage {
-            content: vec![ContentBlock::text(line.to_string())],
-            timestamp: gasket_core::now(),
-        });
-        // Shrink working memory only; JSONL on disk stays append-only full log.
-        if budget.needs_compaction() {
-            history = budget.compact(&history);
-        }
+        // Working history (and its compaction) is log-derived inside
+        // run_turn; JSONL on disk stays the append-only full log.
         let mut printer = EventPrinter::new(io::stdout());
         match host
-            .run_turn(user_msg, &history, |ev| {
-                if let gasket_core::AgentEvent::AfterProviderResponse { response, .. } = &ev {
-                    if let Some(u) = &response.usage {
-                        budget.record_input_tokens(u.input_tokens);
-                    }
-                }
+            .run_turn(line, |ev| {
                 printer.on_event(&ev);
             })
             .await
         {
-            Ok(new_msgs) => history.extend(new_msgs),
+            Ok(_summary) => {}
             Err(e) => eprintln!("\n(run error: {e})"),
         }
         let _ = io::stdout().flush();
@@ -182,18 +166,12 @@ async fn load_external_from_env() -> Vec<ToolDefinition> {
     }
 }
 
-async fn handle_slash(
-    cmd: &str,
-    host: &mut Host,
-    history: &mut Vec<AgentMessage>,
-    ext_tools: &[ToolDefinition],
-) {
+async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("exit") | Some("quit") => std::process::exit(0),
         Some("clear") => {
             host.session_mut().clear();
-            history.clear();
             println!("(new session)");
         }
         Some("mode") => match parts.next().and_then(Mode::parse) {
@@ -212,12 +190,8 @@ async fn handle_slash(
             };
             match r {
                 Ok(m) => {
-                    *history = m;
-                    println!(
-                        "(resumed {} with {} msgs)",
-                        host.session().current_id(),
-                        history.len()
-                    );
+                    // History is re-derived from the event log each turn.
+                    println!("(resumed {} with {} msgs)", host.session().current_id(), m.len());
                 }
                 Err(e) => println!("(resume: {e})"),
             }

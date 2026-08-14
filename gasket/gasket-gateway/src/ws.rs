@@ -12,12 +12,11 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use gasket_core::{built_in_tools, AgentEvent, AgentMessage, ContentBlock, UserMessage};
+use gasket_core::{built_in_tools, AgentEvent};
 
 use gasket_host::permission::Approver;
 use gasket_host::{
-    load_all_mcp, ConfigLoader, ContextBudget, Host, HostSubagentSpawner, Mode, PermissionPolicy,
-    SessionManager,
+    load_all_mcp, ConfigLoader, Host, HostSubagentSpawner, Mode, PermissionPolicy, SessionManager,
 };
 
 use crate::api::load_external_tools;
@@ -90,10 +89,24 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     };
 
     // ── Resume prior transcript (reconnect keeps context) ──
-    // Host's SessionManager owns the on-disk JSONL; the in-memory
-    // WsSession.history is the working copy (compaction + REST context API).
+    // Host's SessionManager owns the on-disk event log; the in-memory
+    // WsSession.history is the working copy (REST context API).
     let mut session_mgr = SessionManager::new();
-    let resumed = session_mgr.resume_or_adopt(&session_id).await;
+    // resume() routes through open_or_migrate (migrating a legacy
+    // messages.jsonl once). Corruption fails closed: error the connection —
+    // never adopt-and-start-fresh over a damaged transcript.
+    let resumed = match session_mgr.resume(&session_id).await {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            error!("session {session_id}: transcript error: {e}");
+            let err = OutgoingEvent::error(format!("Session error: {e}"));
+            let mut s = session.lock().await;
+            send_json(&mut s.sender, &err).await;
+            let _ = s.sender.send(Message::Close(None)).await;
+            state.sessions.remove(&session_id);
+            return;
+        }
+    };
     if !resumed.is_empty() {
         info!("session {session_id}: resumed {} msgs", resumed.len());
         session.lock().await.history = resumed;
@@ -297,10 +310,6 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     }
     // Cancel sets the Host's shared abort flag; run_turn reads it at safe points.
     let signal = host.signal().clone();
-    // Per-connection token-aware compaction budget. Fed from `last_input_tokens`
-    // (read off the session) before each turn; compaction runs on the history
-    // snapshot so the budget never crosses the turn boundary.
-    let mut budget = ContextBudget::from_env();
 
     // ── Main event loop ─────────────────────────────────────
     loop {
@@ -364,37 +373,24 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     continue;
                 }
 
-                let user_msg = AgentMessage::User(UserMessage {
-                    content: vec![ContentBlock::text(user_text)],
-                    timestamp: gasket_core::now(),
-                });
-
-                // Snapshot current history and feed the per-turn compaction
-                // budget from the most recent provider report, then compact if
-                // over threshold. One lock grabs both history and token count.
-                let history = {
-                    let s = session.lock().await;
-                    budget.record_input_tokens(s.last_input_tokens);
-                    s.history.clone()
-                };
-                let history = if budget.needs_compaction() {
-                    budget.compact(&history)
-                } else {
-                    history
-                };
+                // The event log is the source of truth: run_turn derives
+                // (and compacts) history from it internally.
 
                 // ── Run the turn inline, multiplexing cancel/approval ──
                 // run_turn drives the agent loop inline; the sync on_event
                 // closure forwards events to the connection-wide wire channel
                 // (whose single writer task owns the socket and ordering).
                 // This is the same run_turn the CLI uses. On close/error we
-                // break immediately: dropping `turn` is cancel-safe (run_turn
-                // persists only on success), and it stops us re-polling an
-                // exhausted ws_rx (a Stream contract violation).
+                // break immediately: dropping `turn` is cancel-safe (the
+                // event log already holds every fact the turn produced), and
+                // it stops us re-polling an exhausted ws_rx (a Stream
+                // contract violation).
                 let turn_wire = wire_tx.clone();
                 let mut closing = false;
-                let turn_outcome: Option<Result<Vec<AgentMessage>, gasket_host::HostError>> = {
-                    let turn = host.run_turn(user_msg, &history, {
+                let turn_outcome: Option<
+                    Result<gasket_host::TurnSummary, gasket_core::AgentError>,
+                > = {
+                    let turn = host.run_turn(&user_text, {
                         let wire = turn_wire.clone();
                         move |ev| {
                             let _ = wire.send(WireEvent::Agent(ev));
@@ -482,8 +478,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     // turn-boundary markers.
                     let _ = wire_tx.send(WireEvent::Done);
                     match turn_outcome {
-                        Some(Ok(new_msgs)) => {
-                            session.lock().await.history.extend(new_msgs);
+                        Some(Ok(summary)) => {
+                            session.lock().await.history.extend(summary.new_messages);
                         }
                         Some(Err(e)) => {
                             let _ = wire_tx.send(WireEvent::Error(format!("{e}")));

@@ -1,8 +1,17 @@
-//! SessionManager: 包 JsonlStorage，加"当前 session/列举/最近"语义。
+//! SessionManager: wraps [`EventStorage`], adding "current session/list/
+//! latest" semantics plus the one-shot legacy `messages.jsonl` migration.
+//!
+//! The event log (`events.jsonl`) is the single source of truth. Legacy
+//! `messages.jsonl` transcripts migrate once — wrapped row-by-row into the
+//! event log, deleted only after the full write succeeded (D1: not kept) —
+//! and any corruption fails closed with `Err` instead of being adopted.
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use gasket_core::{AgentMessage, JsonlStorage};
+use gasket_core::{
+    derive_messages, AgentError, AgentMessage, EventStorage, JsonlStorage, SessionEvent,
+};
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -12,11 +21,12 @@ pub struct SessionInfo {
 }
 
 /// Cursor semantics: `new()` generates the initial `current_id`; only
-/// `new` / `resume` / `clear` change it; `append` always writes to the
+/// `new` / `resume` / `clear` change it; events always append to the
 /// current id. A fresh manager that was never resumed writes a brand-new
 /// session — callers that want an existing session MUST `resume` first.
 pub struct SessionManager {
-    storage: JsonlStorage,
+    root: PathBuf,
+    storage: EventStorage,
     current_id: String,
 }
 
@@ -33,11 +43,10 @@ impl SessionManager {
 
     /// 测试用：指定 root。
     pub fn with_root(root: PathBuf) -> Self {
-        let storage = JsonlStorage::new(root);
-        let current_id = uuid::Uuid::new_v4().to_string();
         Self {
-            storage,
-            current_id,
+            root: root.clone(),
+            storage: EventStorage::new(root),
+            current_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -45,37 +54,75 @@ impl SessionManager {
         &self.current_id
     }
 
+    /// 打开或迁移：events.jsonl 存在 → load；否则 messages.jsonl 存在 →
+    /// 旧消息逐条 `SessionEvent::from_message` 包裹写入 events.jsonl,
+    /// 迁移成功后删除旧 messages.jsonl(D1:不保留);两者皆无 → 新会话。
+    /// 中间行损坏 → `Err`(fail closed,绝不 adopt)。
+    ///
+    /// Does not change the current-session cursor; [`resume`](Self::resume)
+    /// adopts the id on top of this.
+    pub async fn open_or_migrate(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+        if self.storage.has_events(session_id) {
+            return self.storage.load_events(session_id).await;
+        }
+        let legacy = self.storage.load_messages(session_id).await?;
+        if legacy.is_empty() {
+            // Neither an event log nor legacy content: fresh session.
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::with_capacity(legacy.len());
+        for msg in &legacy {
+            let ev = SessionEvent::from_message(msg, None).ok_or_else(|| {
+                AgentError::Transcript(format!(
+                    "session {session_id}: legacy row cannot be represented as a session event"
+                ))
+            })?;
+            events.push(ev);
+        }
+        // Full batch on one open handle; only after every row landed is the
+        // legacy file removed — a mid-migration failure leaves it untouched.
+        self.storage.append_events(session_id, &events).await?;
+        self.storage.delete_legacy(session_id).await?;
+        Ok(events)
+    }
+
+    /// Append one event to the current session's log.
+    pub async fn append_event(&self, ev: &SessionEvent) -> Result<(), AgentError> {
+        self.storage.append_event(&self.current_id, ev).await
+    }
+
+    /// Bridge the agent loop's sync `persist` callback onto the async store.
+    ///
+    /// `Handle::block_on` may not run on a runtime worker thread (tokio's
+    /// nested block-on guard), so each event hops to a short-lived scoped
+    /// thread. Events per turn are few (assistant + tool results), so the
+    /// spawn cost is noise next to an LLM round-trip.
+    #[allow(clippy::type_complexity)]
+    pub fn persist_fn(&self) -> Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync> {
+        let storage = self.storage.clone();
+        let sid = self.current_id.clone();
+        let handle = tokio::runtime::Handle::current();
+        Arc::new(move |ev| {
+            let storage = storage.clone();
+            let sid = sid.clone();
+            let handle = handle.clone();
+            std::thread::scope(|s| {
+                s.spawn(move || handle.block_on(storage.append_event(&sid, ev)))
+                    .join()
+                    .expect("persist bridge thread panicked")
+            })
+        })
+    }
+
+    /// Load (migrating if needed) a session and adopt it as the current one.
+    /// Returns the derived model-visible history. Corruption fails closed.
     pub async fn resume(&mut self, id: &str) -> Result<Vec<AgentMessage>, crate::HostError> {
-        let msgs = self
-            .storage
-            .load_messages(id)
+        let events = self
+            .open_or_migrate(id)
             .await
             .map_err(|e| crate::HostError::Session(e.to_string()))?;
         self.current_id = id.to_string();
-        Ok(msgs)
-    }
-
-    /// Like [`resume`](Self::resume), but on a load error (e.g. a corrupt
-    /// transcript) still adopts `id` as the current session and starts fresh,
-    /// so future appends land in the right file. Returns the loaded history
-    /// (empty for a missing or unrecoverable session).
-    ///
-    /// Used by the gateway, which must keep the connection's `session_id`
-    /// authoritative even when the on-disk transcript cannot be read back.
-    pub async fn resume_or_adopt(&mut self, id: &str) -> Vec<AgentMessage> {
-        match self.storage.load_messages(id).await {
-            Ok(msgs) => {
-                self.current_id = id.to_string();
-                msgs
-            }
-            // Corrupt middle line (rare, real disk damage): adopt the id and
-            // start fresh so future appends land in the right file. Recovery is
-            // silent — the damaged transcript is unrecoverable anyway.
-            Err(_) => {
-                self.current_id = id.to_string();
-                Vec::new()
-            }
-        }
+        Ok(derive_messages(&events))
     }
 
     pub async fn resume_last(&mut self) -> Result<Vec<AgentMessage>, crate::HostError> {
@@ -90,9 +137,9 @@ impl SessionManager {
     }
 
     pub async fn list(&self) -> Result<Vec<SessionInfo>, crate::HostError> {
-        let root = self.storage.base_dir_clone();
+        let root = self.root.clone();
         let mut out = Vec::new();
-        // Fresh install: ~/.gasket/sessions doesn't exist yet -> no sessions.
+        // Fresh install: sessions dir doesn't exist yet -> no sessions.
         let mut rd = match tokio::fs::read_dir(&root).await {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -107,10 +154,16 @@ impl SessionManager {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            // mtime comes from messages.jsonl, NOT the session dir: appending to
-            // an existing file updates the file's mtime but leaves the dir's
-            // untouched, so dir mtime would freeze at first write.
-            let path = self.storage.messages_path(&id);
+            // mtime comes from the transcript file, NOT the session dir:
+            // appending updates the file's mtime but leaves the dir's
+            // untouched, so dir mtime would freeze at first write. Prefer
+            // events.jsonl; an unmigrated legacy session falls back to
+            // messages.jsonl.
+            let path = if self.storage.has_events(&id) {
+                self.storage.events_path(&id)
+            } else {
+                self.storage.messages_path(&id)
+            };
             let mtime = tokio::fs::metadata(&path)
                 .await
                 .ok()
@@ -130,13 +183,6 @@ impl SessionManager {
         Ok(out)
     }
 
-    pub async fn append(&self, msgs: &[AgentMessage]) -> Result<(), crate::HostError> {
-        self.storage
-            .append_messages(&self.current_id, msgs)
-            .await
-            .map_err(|e| crate::HostError::Session(e.to_string()))
-    }
-
     pub fn clear(&mut self) {
         self.current_id = uuid::Uuid::new_v4().to_string();
     }
@@ -154,13 +200,18 @@ mod tests {
         })
     }
 
+    fn user_event(t: &str) -> SessionEvent {
+        SessionEvent::User(user_msg(t))
+    }
+
     #[tokio::test]
     async fn resume_loads_and_sets_current() {
         let tmp = tempfile::tempdir().unwrap();
         let mut sm = SessionManager::with_root(tmp.path().to_path_buf());
         let id = "fixed-id".to_string();
         sm.current_id = id.clone();
-        sm.append(&[user_msg("a"), user_msg("b")]).await.unwrap();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&user_event("b")).await.unwrap();
 
         let mut sm2 = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = sm2.resume(&id).await.unwrap();
@@ -173,12 +224,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut a = SessionManager::with_root(tmp.path().to_path_buf());
         a.current_id = "old".into();
-        a.append(&[user_msg("old")]).await.unwrap();
+        a.append_event(&user_event("old")).await.unwrap();
         // 让 new 的 mtime 晚于 old
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut b = SessionManager::with_root(tmp.path().to_path_buf());
         b.current_id = "new".into();
-        b.append(&[user_msg("new")]).await.unwrap();
+        b.append_event(&user_event("new")).await.unwrap();
 
         let mut pick = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = pick.resume_last().await.unwrap();
@@ -193,16 +244,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut a = SessionManager::with_root(tmp.path().to_path_buf());
         a.current_id = "a".into();
-        a.append(&[user_msg("a1")]).await.unwrap();
+        a.append_event(&user_event("a1")).await.unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut b = SessionManager::with_root(tmp.path().to_path_buf());
         b.current_id = "b".into();
-        b.append(&[user_msg("b1")]).await.unwrap();
+        b.append_event(&user_event("b1")).await.unwrap();
 
-        // a receives a later message -> a is the most recently active session.
+        // a receives a later event -> a is the most recently active session.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        a.append(&[user_msg("a2")]).await.unwrap();
+        a.append_event(&user_event("a2")).await.unwrap();
 
         let mut pick = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = pick.resume_last().await.unwrap();
@@ -225,5 +276,19 @@ mod tests {
         let id1 = sm.current_id().to_string();
         sm.clear();
         assert_ne!(sm.current_id(), id1);
+    }
+
+    #[tokio::test]
+    async fn persist_fn_writes_events_outside_async_ctx() {
+        // The loop's sync persist callback must land events in the log —
+        // including when called from a plain (non-async) caller.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sm = SessionManager::with_root(tmp.path().to_path_buf());
+        sm.current_id = "persisted".into();
+        let persist = sm.persist_fn();
+        persist(&user_event("via-callback")).unwrap();
+
+        let events = sm.open_or_migrate("persisted").await.unwrap();
+        assert_eq!(events, vec![user_event("via-callback")]);
     }
 }

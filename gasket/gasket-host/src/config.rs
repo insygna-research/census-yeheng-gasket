@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gasket_core::{
-    AgentContext, AgentLoopConfig, AgentMessage, AgentTunables, HookChain, ProviderConfig,
-    StreamFn, ToolDefinition,
+    AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, HookChain,
+    ProviderConfig, SessionEvent, StreamFn, ToolDefinition,
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,9 @@ impl ConfigLoader {
         Ok(HostConfig { provider, tunables })
     }
 }
+/// The agent loop's persist callback — same shape as
+/// `AgentLoopConfig::persist`, named so host signatures stay readable.
+pub type PersistFn = Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync>;
 
 impl HostConfig {
     /// The provider's native `stream_fn`. `Host::new` fills its stream_fn slot
@@ -102,10 +105,14 @@ impl HostConfig {
 
     /// The single canonical "build one turn" step, shared by every host
     /// (`Host::run_turn` for the CLI, the gateway's per-connection driver).
-    /// Resets the abort signal, then builds the context + loop config from the
-    /// provider/tunables. Returns owned values so the caller can run the loop
-    /// however it likes - inline (CLI) or in a spawned task with event-channel
-    /// forwarding (gateway). Persistence is deliberately left to the caller.
+    /// Resets the abort signal, then builds the context + loop config from
+    /// the provider/tunables. `inputs.history` is the log-derived working
+    /// copy (already compacted) — the event log on disk remains the single
+    /// source of truth. Returns owned values so the caller can run the loop
+    /// however it likes - inline (CLI) or in a spawned task with
+    /// event-channel forwarding (gateway). `persist`, when set, is handed to
+    /// the loop so every Assistant/ToolResult lands on disk as it happens;
+    /// the host frames the turn with its own TurnStart/User/TurnEnd writes.
     pub fn prepare_turn(
         &self,
         inputs: TurnInputs<'_>,
@@ -113,6 +120,7 @@ impl HostConfig {
         hooks: Arc<dyn HookChain>,
         stream_fn: Arc<dyn StreamFn>,
         max_turns: usize,
+        persist: Option<PersistFn>,
     ) -> (AgentContext, AgentLoopConfig) {
         // A Ctrl-C from a previous turn must not leak into this one.
         signal.store(false, Ordering::Relaxed);
@@ -124,14 +132,18 @@ impl HostConfig {
             std::env::vars().collect(),
             inputs.session_id,
         );
-        let config =
+        let mut config =
             self.build_loop_config(max_turns, Some(signal.clone()), Some(hooks), stream_fn);
+        config.persist = persist;
         (context, config)
     }
 }
 
-/// Borrowed inputs for one agent turn. Grouped so [`HostConfig::prepare_turn`]
-/// stays readable instead of taking six positional args.
+/// Borrowed inputs for one agent turn. Grouped so
+/// [`HostConfig::prepare_turn`] stays readable instead of taking six
+/// positional args. `history` is the projection of the session event log
+/// (optionally compacted in memory) — callers no longer own a growing
+/// transcript themselves.
 pub struct TurnInputs<'a> {
     pub system_prompt: &'a str,
     pub history: &'a [AgentMessage],

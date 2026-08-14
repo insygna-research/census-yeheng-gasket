@@ -82,6 +82,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+    // Persist every Assistant/ToolResult as it happens (assistant hits the
+    // log before any tool in it executes), then frame the turn.
+    let session_id = context.session_id.clone();
+    let store =
+        gasket_core::EventStorage::new(gasket_core::JsonlStorage::default_root().base_dir_clone());
+    let persist_store = store.clone();
+    let persist_sid = session_id.clone();
     let config = gasket_core::AgentLoopConfig {
         model,
         thinking_level: tunables.thinking_level,
@@ -91,10 +98,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_fn,
         hooks: None,
         retry: tunables.retry,
-        persist: None,
+        persist: Some(Arc::new(move |ev: &gasket_core::SessionEvent| {
+            let store = persist_store.clone();
+            let sid = persist_sid.clone();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::scope(|s| {
+                s.spawn(move || handle.block_on(store.append_event(&sid, ev)))
+                    .join()
+                    .expect("persist bridge thread panicked")
+            })
+        })),
     };
+    store
+        .append_event(&session_id, &gasket_core::SessionEvent::TurnStart)
+        .await?;
+    store
+        .append_event(
+            &session_id,
+            &gasket_core::SessionEvent::User(user_msg.clone()),
+        )
+        .await?;
 
-    let session_id = context.session_id.clone();
     let msgs = agent_loop(vec![user_msg], context, config).await?;
 
     // Print the final assistant text (streaming already printed deltas in a
@@ -109,17 +133,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!();
-
-    // Persist the transcript (append-only JSONL under ~/.gasket/sessions/).
-    let store = gasket_core::JsonlStorage::default_root();
-    match store.append_messages(&session_id, &msgs).await {
-        Ok(()) => eprintln!(
-            "(session {} saved: {})",
-            session_id,
-            store.messages_path(&session_id).display()
-        ),
-        Err(e) => eprintln!("(warn: failed to persist session: {e})"),
-    }
+    store
+        .append_event(
+            &session_id,
+            &gasket_core::SessionEvent::TurnEnd {
+                reason: gasket_core::TurnEndReason::Completed,
+            },
+        )
+        .await?;
+    eprintln!(
+        "(session {} saved: {})",
+        session_id,
+        store.events_path(&session_id).display()
+    );
     Ok(())
 }
 

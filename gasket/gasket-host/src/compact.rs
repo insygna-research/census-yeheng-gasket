@@ -118,6 +118,7 @@ fn env_parse<T: std::str::FromStr>(
 ///
 /// When no usage has been recorded (`last_input_tokens == 0`), compaction
 /// falls back to a fixed message-count cap (`fallback_max_messages`).
+#[derive(Clone)]
 pub struct ContextBudget {
     /// Model context window (`GASKET_CONTEXT_WINDOW`, default 128_000).
     window: u64,

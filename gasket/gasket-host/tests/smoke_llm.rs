@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use gasket_core::{AgentMessage, ContentBlock, UserMessage};
+use gasket_core::AgentMessage;
 use gasket_host::{ConfigLoader, EventPrinter, Host, Mode, PermissionPolicy, SessionManager};
 
 /// 构造一次完整的 `Host::run_turn`，验证 ConfigLoader + Host + EventPrinter
@@ -25,7 +25,7 @@ async fn end_to_end_basic_chat() {
     let tmp = tempfile::tempdir().unwrap();
 
     // FullAuto 模式，避免 approver 阻塞（无 stdin）。
-    let mut host = Host::new(
+    let host = Host::new(
         cfg,
         SessionManager::with_root(tmp.path().to_path_buf()),
         Arc::new(PermissionPolicy::new(
@@ -37,26 +37,21 @@ async fn end_to_end_basic_chat() {
     )
     .with_max_turns(3);
 
-    let user_msg = AgentMessage::User(UserMessage {
-        content: vec![ContentBlock::text("Reply with exactly: pong")],
-        timestamp: gasket_core::now(),
-    });
-    let history: Vec<AgentMessage> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
-    let new_msgs = host
-        .run_turn(user_msg, &history, |ev| {
+    let summary = host
+        .run_turn("Reply with exactly: pong", |ev| {
             EventPrinter::new(&mut buf).on_event(&ev);
         })
         .await
         .expect("agent loop should complete");
+    let new_msgs = &summary.new_messages;
 
     // 至少有一条 assistant 消息。
     assert!(
         new_msgs
             .iter()
             .any(|m| matches!(m, AgentMessage::Assistant(_))),
-        "expected at least one assistant message, got: {:?}",
-        new_msgs
+        "expected at least one assistant message, got: {new_msgs:?}"
     );
 
     // EventPrinter 应该输出了点什么（至少 usage 或文本）。
@@ -72,7 +67,7 @@ async fn end_to_end_tool_call() {
     let cfg = ConfigLoader::load().expect("GASKET_LLM_* must be set");
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut host = Host::new(
+    let host = Host::new(
         cfg,
         SessionManager::with_root(tmp.path().to_path_buf()),
         Arc::new(PermissionPolicy::new(
@@ -84,17 +79,14 @@ async fn end_to_end_tool_call() {
     )
     .with_max_turns(3);
 
-    let user_msg = AgentMessage::User(UserMessage {
-        content: vec![ContentBlock::text(
+    let summary = host
+        .run_turn(
             "Use the `list` tool to list the current directory, then reply with the count of entries in one sentence.",
-        )],
-        timestamp: gasket_core::now(),
-    });
-    let history: Vec<AgentMessage> = Vec::new();
-    let new_msgs = host
-        .run_turn(user_msg, &history, |_| {})
+            |_| {},
+        )
         .await
         .expect("agent loop should complete");
+    let new_msgs = &summary.new_messages;
 
     assert!(
         new_msgs
