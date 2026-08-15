@@ -1,22 +1,5 @@
 import { onUnmounted, ref, watch, type Ref } from 'vue';
 
-export interface WebSocketStatus {
-  isConnected: boolean;
-  isReconnecting: boolean;
-  showReconnectButton: boolean;
-  reconnectAttempts: number;
-}
-
-export interface WebSocketMessage {
-  type: string;
-  content?: string;
-  name?: string;
-  arguments?: string;
-  output?: string;
-  error?: string;
-  message?: string;
-  tool_call_id?: string;
-}
 
 export function useIMWebSocket(
   chatId: Ref<string>,

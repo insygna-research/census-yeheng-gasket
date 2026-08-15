@@ -61,9 +61,6 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
 
-    // Initialize default session storage directory.
-    let _ = gasket_core::JsonlStorage::default_root();
-
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         store_root: gasket_core::JsonlStorage::default_root().base_dir_clone(),

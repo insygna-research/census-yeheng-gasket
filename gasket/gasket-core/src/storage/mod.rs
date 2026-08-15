@@ -227,6 +227,10 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
     let mut items = Vec::new();
     let mut line_start = 0usize;
     let mut line_no = 0usize;
+    // A parse failure is only a torn tail if no further line follows it
+    // (i.e. it is the last non-blank line). Defer the verdict instead of
+    // rescanning the remainder per line — one pass, O(n).
+    let mut pending: Option<(usize, usize, serde_json::Error)> = None; // (line_no, byte offset, error)
     for (idx, b) in bytes.iter().enumerate() {
         if *b != b'\n' {
             continue;
@@ -234,14 +238,22 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         line_no += 1;
         let this_line_start = line_start;
         let line = bytes[this_line_start..idx].trim_ascii();
-        // Nothing but whitespace after this line means it is the last one.
-        let is_last = bytes[idx + 1..].iter().all(|b| b.is_ascii_whitespace());
         line_start = idx + 1;
         if line.is_empty() {
             continue;
         }
         match serde_json::from_slice::<T>(line) {
-            Ok(m) => items.push(m),
+            Ok(m) => {
+                if let Some((bad_no, _, err)) = pending.take() {
+                    // A good line after the bad one proves the bad line was
+                    // mid-file damage, not a torn tail.
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {bad_no} in {}: {err}",
+                        path.display()
+                    )));
+                }
+                items.push(m);
+            }
             Err(e) => {
                 if fail_closed_on_data && e.classify() == serde_json::error::Category::Data {
                     return Err(AgentError::Transcript(format!(
@@ -249,22 +261,14 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
                         path.display()
                     )));
                 }
-                if is_last {
-                    tracing::warn!(
-                        path = %path.display(),
-                        line = line_no,
-                        error = %e,
-                        "dropping torn transcript tail"
-                    );
-                    if repair_tail {
-                        repair_torn_tail(path, this_line_start).await?;
-                    }
-                    return Ok(items);
+                if let Some((bad_no, _, err)) = pending.take() {
+                    // A second bad line proves the first was mid-file too.
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {bad_no} in {}: {err}",
+                        path.display()
+                    )));
                 }
-                return Err(AgentError::Transcript(format!(
-                    "invalid line {line_no} in {}: {e}",
-                    path.display()
-                )));
+                pending = Some((line_no, this_line_start, e));
             }
         }
     }
@@ -273,8 +277,24 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
     if !tail.is_empty() {
         line_no += 1;
         match serde_json::from_slice::<T>(tail) {
-            Ok(m) => items.push(m),
+            Ok(m) => {
+                if let Some((bad_no, _, err)) = pending.take() {
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {bad_no} in {}: {err}",
+                        path.display()
+                    )));
+                }
+                items.push(m);
+            }
             Err(e) => {
+                // A torn fragment after a bad complete line proves the bad
+                // line was mid-file (old semantics: error, not double-heal).
+                if let Some((bad_no, _, err)) = pending.take() {
+                    return Err(AgentError::Transcript(format!(
+                        "invalid line {bad_no} in {}: {err}",
+                        path.display()
+                    )));
+                }
                 if fail_closed_on_data && e.classify() == serde_json::error::Category::Data {
                     return Err(AgentError::Transcript(format!(
                         "invalid line {line_no} in {}: {e}",
@@ -291,6 +311,20 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
                     repair_torn_tail(path, line_start).await?;
                 }
             }
+        }
+    }
+    // A bad complete line with nothing but (optional) blank lines after it is
+    // the torn tail: drop it, and truncate the file at its start so later
+    // appends land after valid data.
+    if let Some((bad_no, bad_start, err)) = pending.take() {
+        tracing::warn!(
+            path = %path.display(),
+            line = bad_no,
+            error = %err,
+            "dropping torn transcript tail"
+        );
+        if repair_tail {
+            repair_torn_tail(path, bad_start).await?;
         }
     }
     Ok(items)

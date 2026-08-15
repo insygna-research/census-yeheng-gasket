@@ -125,20 +125,25 @@ fn build_client(
     builder.build().map_err(ConfigError::ClientBuild)
 }
 
+use crate::types::message::ContentBlock;
+
+/// Concatenate a message's `Text` content blocks into one plain string
+/// (assistant content / tool results). Shared by both provider wire formats.
+pub(crate) fn collect_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    /// A fake env for tests - maps var name -> value.
-    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
-    }
+    use crate::test_util::fake_env;
 
     #[test]
     fn parses_required_vars() {
@@ -216,12 +221,5 @@ mod tests {
             ("GASKET_LLM_PROXY", "not a url %"),
         ]));
         assert!(matches!(r, Err(ConfigError::BadProxy { .. })));
-    }
-
-    // Silence unused-import warning for the OnceLock/Mutex shim if not needed.
-    #[allow(dead_code)]
-    fn _unused() {
-        let _ = OnceLock::<()>::new();
-        let _ = Mutex::new(());
     }
 }

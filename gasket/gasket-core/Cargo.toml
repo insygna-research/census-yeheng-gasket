@@ -27,6 +27,7 @@ tracing = { workspace = true }
 
 # HTTP client (providers)
 reqwest = { workspace = true }
+url = { workspace = true }
 
 # Async utilities
 futures-util = { workspace = true }

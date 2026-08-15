@@ -27,6 +27,25 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Shared cap for tool textual output (bash stdout/stderr, fetch body).
+pub(crate) const MAX_OUTPUT_BYTES: usize = 200_000;
+
+/// Char-safe truncation to [`MAX_OUTPUT_BYTES`] with an indicator. Never
+/// slices through a multi-byte UTF-8 char (a plain `String::truncate` panics
+/// when the byte limit lands mid-char).
+pub(crate) fn truncate_output(s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s.to_string();
+    }
+    let mut cut = MAX_OUTPUT_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_string();
+    out.push_str("\n...(truncated)");
+    out
+}
+
 /// Resolve `requested` against `cwd`, rejecting any `..` or absolute component
 /// that would escape `cwd`, and re-checking the symlink-resolved target so a
 /// symlink inside `cwd` can't point outside it (lexical `..`-checking alone
@@ -122,6 +141,24 @@ mod tests {
             resolved,
             tmp.path().canonicalize().unwrap().join("sub/new.txt")
         );
+    }
+    #[test]
+    fn truncate_output_is_char_safe_at_multibyte_boundary() {
+        // 3-byte chars: make the byte limit land inside the final char.
+        let n = MAX_OUTPUT_BYTES / 3 + 10;
+        let s = "你".repeat(n);
+        assert!(s.len() > MAX_OUTPUT_BYTES);
+        let out = truncate_output(&s);
+        assert!(out.ends_with("...(truncated)"));
+        assert!(out.len() < s.len());
+        // The retained prefix is valid UTF-8 by construction; re-encode check.
+        let trimmed = out.trim_end_matches("\n...(truncated)");
+        assert_eq!(trimmed.chars().count() * 3, trimmed.len());
+    }
+
+    #[test]
+    fn truncate_output_noop_under_limit() {
+        assert_eq!(truncate_output("small"), "small");
     }
 
     #[cfg(unix)]

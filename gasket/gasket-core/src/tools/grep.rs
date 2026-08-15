@@ -83,12 +83,26 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
             Err(e) => return Ok(ToolResult::error(format!("rg failed: {e}"))),
         }
     } else {
-        let (m, aborted) =
-            grep_builtin(&re, &ctx.ctx.cwd, path, glob_pat.as_ref(), max, &ctx.signal);
-        if aborted {
-            return Ok(ToolResult::error("aborted".to_string()));
+        // The builtin walker is synchronous filesystem+CPU work; keep it off
+        // the async workers so a large tree can't stall the runtime.
+        let re = re.clone();
+        let cwd = ctx.ctx.cwd.clone();
+        let path = path.to_string();
+        let glob_pat = glob_pat.clone();
+        let signal = ctx.signal.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            grep_builtin(&re, &cwd, &path, glob_pat.as_ref(), max, &signal)
+        })
+        .await;
+        match joined {
+            Ok((m, aborted)) => {
+                if aborted {
+                    return Ok(ToolResult::error("aborted".to_string()));
+                }
+                (m, false, "builtin")
+            }
+            Err(e) => return Ok(ToolResult::error(format!("builtin grep failed: {e}"))),
         }
-        (m, false, "builtin")
     };
 
     let count = matches.len();

@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
+/// Default command timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const MAX_OUTPUT_BYTES: usize = 200_000;
 
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
@@ -55,8 +55,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
             .iter()
             .filter(|(k, _)| !k.starts_with("GASKET_")),
     );
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    // A timeout drops the `output()` future mid-wait; without kill_on_drop the
+    // spawned shell (and its children) would survive as orphans burning CPU.
+    cmd.kill_on_drop(true);
 
     let output = match tokio::time::timeout(Duration::from_secs(timeout), cmd.output()).await {
         Ok(Ok(o)) => o,
@@ -68,8 +69,8 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         }
     };
 
-    let stdout = truncate(String::from_utf8_lossy(&output.stdout).into_owned());
-    let stderr = truncate(String::from_utf8_lossy(&output.stderr).into_owned());
+    let stdout = super::truncate_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = super::truncate_output(&String::from_utf8_lossy(&output.stderr));
     let code = output.status.code().unwrap_or(-1);
 
     let mut text = String::new();
@@ -90,14 +91,6 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         details: serde_json::json!({"exit_code": code}),
         is_error,
     })
-}
-
-fn truncate(mut s: String) -> String {
-    if s.len() > MAX_OUTPUT_BYTES {
-        s.truncate(MAX_OUTPUT_BYTES);
-        s.push_str("\n... (truncated)");
-    }
-    s
 }
 
 #[cfg(test)]
@@ -185,5 +178,50 @@ mod tests {
         };
         assert!(!text.contains("sk-secret"), "leaked secret, got: {text}");
         assert!(text.contains("visible"), "non-secret env dropped: {text}");
+    }
+
+    /// Timeout must not just fail fast — it must kill the child. The command
+    /// records its shell PID, then sleeps well past the 1s timeout; after the
+    /// tool returns, that PID must be gone (kill_on_drop fired when the
+    /// `output()` future was dropped at the deadline).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_child_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        let start = std::time::Instant::now();
+        let r = run(
+            serde_json::json!({
+                "command": format!("echo $$ > {}; sleep 30", pidfile.display()),
+                "timeout": 1
+            }),
+            tmp.path(),
+        )
+        .await;
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "must return at the 1s deadline, not after sleep 30"
+        );
+        assert!(r.is_error);
+        match &r.content[0] {
+            ContentBlock::Text { text } => assert!(text.contains("timed out"), "got: {text}"),
+            _ => panic!("expected text content"),
+        }
+        // Give the runtime a moment to reap the killed child before probing.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(&pid)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !alive,
+            "child {pid} survived the timeout — kill_on_drop not effective"
+        );
     }
 }

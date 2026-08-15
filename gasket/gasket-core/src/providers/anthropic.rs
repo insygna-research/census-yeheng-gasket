@@ -9,12 +9,16 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde_json::json;
 
+use super::collect_text;
 use crate::types::context::{ModelSpec, StreamChunk, StreamFn};
 use crate::types::message::{AgentMessage, ContentBlock};
 use crate::types::tool::ToolDefinition;
+
+/// Abort-poll cadence while a provider body download is in flight.
+const ABORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Anthropic native messages provider.
 #[derive(Clone)]
@@ -73,7 +77,7 @@ impl StreamFn for AnthropicProvider {
         messages: &[AgentMessage],
         system_prompt: &str,
         tools: &[ToolDefinition],
-        _signal: Option<Arc<AtomicBool>>,
+        signal: Option<Arc<AtomicBool>>,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let body = build_request_body(model, messages, system_prompt, tools);
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
@@ -111,24 +115,59 @@ impl StreamFn for AnthropicProvider {
                 return;
             }
 
-            let body_text = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    yield StreamChunk::Error(e.to_string());
-                    return;
+            // True streaming: parse SSE frames incrementally off the wire as
+            // bytes arrive (first token reaches the user at first-token time,
+            // not whole-response time) and race the download against the
+            // abort signal so Ctrl-C stops it mid-flight.
+            let mut byte_stream = resp.bytes_stream();
+            let mut splitter = crate::providers::sse::SseFrameSplitter::new();
+            let mut frames: Vec<String> = Vec::new();
+            let mut finished = false;
+            while !finished {
+                // Emit eagerly: every frame parsed so far goes out before the
+                // next network read, keeping the pipeline live.
+                for frame in frames.drain(..) {
+                    for payload in crate::providers::sse::parse_sse_frame(&frame) {
+                        match payload {
+                            None => {
+                                yield StreamChunk::Done;
+                                return;
+                            }
+                            Some(json_str) => {
+                                for chunk in parse_anthropic_chunk(&json_str) {
+                                    yield chunk;
+                                }
+                            }
+                        }
+                    }
                 }
-            };
-
-            for payload in crate::providers::sse::parse_sse_body(&body_text) {
-                match payload {
-                    None => {
-                        yield StreamChunk::Done;
+                let chunk = match signal.as_ref() {
+                    Some(flag) => {
+                        // AtomicBool has no async notification; poll at a
+                        // short cadence so a set flag unwinds within ~50ms.
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep(ABORT_POLL_INTERVAL) => {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    tracing::debug!("anthropic stream aborted mid-download");
+                                    return;
+                                }
+                                continue;
+                            }
+                            c = byte_stream.next() => c,
+                        }
+                    }
+                    None => byte_stream.next().await,
+                };
+                match chunk {
+                    Some(Ok(bytes)) => frames.extend(splitter.push(&bytes)),
+                    Some(Err(e)) => {
+                        yield StreamChunk::Error(e.to_string());
                         return;
                     }
-                    Some(json_str) => {
-                        for chunk in parse_anthropic_chunk(&json_str) {
-                            yield chunk;
-                        }
+                    None => {
+                        frames.extend(splitter.finish());
+                        finished = true;
                     }
                 }
             }
@@ -224,17 +263,6 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
         })),
         AgentMessage::Custom(_) => None,
     }
-}
-
-fn collect_text(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn tool_to_anthropic(t: &ToolDefinition) -> serde_json::Value {

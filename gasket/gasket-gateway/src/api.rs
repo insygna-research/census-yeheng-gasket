@@ -191,7 +191,11 @@ pub(crate) async fn rename_session(
         )
             .into_response();
     }
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if name.is_empty() || name.chars().count() > 200 {
         return (
             StatusCode::BAD_REQUEST,

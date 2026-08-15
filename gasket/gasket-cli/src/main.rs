@@ -85,11 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::new(
         host_cfg,
         session,
-        policy,
+        policy.clone(),
         "You are a helpful, concise assistant.".to_string(),
         assemble_tools(&ext_tools, &extra_tools, &mcp_tools),
     )
     .with_hooks(Arc::new(hook_stack));
+    // The policy's approver waits on stdin; give it the Host's abort signal
+    // so Ctrl-C during a pending approval unwinds the wait.
+    policy.set_signal(host.signal().clone());
 
     // Cooperative-abort signal: a Ctrl-C during LLM streaming (cooked tty mode)
     // sets this and the agent loop exits at the next safe point, returning the

@@ -243,15 +243,7 @@ pub trait StreamFn: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
-    }
+    use crate::test_util::fake_env;
 
     #[test]
     fn tunables_default_when_unset() {

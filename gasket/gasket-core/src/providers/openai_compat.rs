@@ -8,12 +8,16 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde_json::json;
 
+use super::collect_text;
 use crate::types::context::{ModelSpec, StreamChunk, StreamFn};
 use crate::types::message::{AgentMessage, ContentBlock};
 use crate::types::tool::ToolDefinition;
+
+/// Abort-poll cadence while a provider body download is in flight.
+const ABORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// OpenAI-compatible chat completions provider.
 #[derive(Clone)]
@@ -67,7 +71,7 @@ impl StreamFn for OpenAiCompat {
         messages: &[AgentMessage],
         system_prompt: &str,
         tools: &[ToolDefinition],
-        _signal: Option<Arc<AtomicBool>>,
+        signal: Option<Arc<AtomicBool>>,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let body = build_request_body(model, messages, system_prompt, tools);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -104,24 +108,59 @@ impl StreamFn for OpenAiCompat {
                 return;
             }
 
-            let body_text = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    yield StreamChunk::Error(e.to_string());
-                    return;
+            // True streaming: parse SSE frames incrementally off the wire as
+            // bytes arrive (first token reaches the user at first-token time,
+            // not whole-response time) and race the download against the
+            // abort signal so Ctrl-C stops it mid-flight.
+            let mut byte_stream = resp.bytes_stream();
+            let mut splitter = crate::providers::sse::SseFrameSplitter::new();
+            let mut frames: Vec<String> = Vec::new();
+            let mut finished = false;
+            while !finished {
+                // Emit eagerly: every frame parsed so far goes out before the
+                // next network read, keeping the pipeline live.
+                for frame in frames.drain(..) {
+                    for payload in crate::providers::sse::parse_sse_frame(&frame) {
+                        match payload {
+                            None => {
+                                yield StreamChunk::Done;
+                                return;
+                            }
+                            Some(json_str) => {
+                                for chunk in parse_openai_chunk(&json_str) {
+                                    yield chunk;
+                                }
+                            }
+                        }
+                    }
                 }
-            };
-
-            for payload in crate::providers::sse::parse_sse_body(&body_text) {
-                match payload {
-                    None => {
-                        yield StreamChunk::Done;
+                let chunk = match signal.as_ref() {
+                    Some(flag) => {
+                        // AtomicBool has no async notification; poll at a
+                        // short cadence so a set flag unwinds within ~50ms.
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep(ABORT_POLL_INTERVAL) => {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    tracing::debug!("openai-compat stream aborted mid-download");
+                                    return;
+                                }
+                                continue;
+                            }
+                            c = byte_stream.next() => c,
+                        }
+                    }
+                    None => byte_stream.next().await,
+                };
+                match chunk {
+                    Some(Ok(bytes)) => frames.extend(splitter.push(&bytes)),
+                    Some(Err(e)) => {
+                        yield StreamChunk::Error(e.to_string());
                         return;
                     }
-                    Some(json_str) => {
-                        for chunk in parse_openai_chunk(&json_str) {
-                            yield chunk;
-                        }
+                    None => {
+                        frames.extend(splitter.finish());
+                        finished = true;
                     }
                 }
             }
@@ -228,17 +267,6 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
     }
 }
 
-fn collect_text(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn tool_to_openai(t: &ToolDefinition) -> serde_json::Value {
     json!({
         "type": "function",
@@ -321,97 +349,176 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod stream_tests {
+        use super::*;
+        use crate::types::context::{ModelSpec, ProviderApi};
+        use crate::StreamFn;
+        use futures_util::StreamExt;
+        use std::sync::Arc;
 
-    #[test]
-    fn parses_text_delta() {
-        let json = r#"{"choices":[{"delta":{"content":"Hi"}}]}"#;
-        let chunks = parse_openai_chunk(json);
-        assert_eq!(chunks, vec![StreamChunk::TextDelta("Hi".into())]);
-    }
+        /// End-to-end proof of true streaming: a local server writes the SSE body
+        /// in separate flushes with a pause between them, and the provider must
+        /// yield the first frame's chunk BEFORE the second flush arrives (whole-
+        /// body-buffering would only produce it after the connection closes).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn streams_frames_incrementally_across_tcp_writes() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn parses_tool_call_delta() {
-        let json = r#"{"choices":[{"delta":{"tool_calls":[{"id":"t1","function":{"name":"echo","arguments":"{\"x\":"}}]}}]}"#;
-        let chunks = parse_openai_chunk(json);
-        assert_eq!(chunks.len(), 1);
-        match &chunks[0] {
-            StreamChunk::ToolCallDelta {
-                id,
-                name,
-                args_delta,
-            } => {
-                assert_eq!(id, "t1");
-                assert_eq!(name.as_deref(), Some("echo"));
-                assert_eq!(args_delta, "{\"x\":");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let first_flush_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = Arc::clone(&first_flush_seen);
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut head = String::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if head.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let sse_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                sock.write_all(sse_head.as_bytes()).await.unwrap();
+                // Flush 1: one complete frame.
+                sock.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n")
+                    .await
+                    .unwrap();
+                sock.flush().await.unwrap();
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Hold the connection open with the rest unsent.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                // Flush 2: two frames at once, then the DONE sentinel.
+                sock.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n")
+                .await
+                .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+
+            let provider = OpenAiCompat::new(format!("http://{addr}"), "k");
+            let model = ModelSpec {
+                id: "test".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 16,
+                supports_thinking: false,
+            };
+            let mut stream = provider.stream(&model, &[], "", &[], None);
+
+            let first = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
+                .await
+                .expect("first chunk must arrive before the second flush")
+                .unwrap();
+            assert!(first_flush_seen.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(first, StreamChunk::TextDelta("Hel".into()));
+
+            // Drain the rest: the remaining frame, then Done.
+            let mut texts = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    StreamChunk::TextDelta(t) => texts.push(t),
+                    StreamChunk::Done => break,
+                    other => panic!("unexpected chunk: {other:?}"),
+                }
             }
-            _ => panic!("wrong variant"),
+            assert_eq!(texts, vec!["lo".to_string()]);
+            server.await.unwrap();
         }
-    }
 
-    #[test]
-    fn parses_usage_chunk() {
-        let json = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let chunks = parse_openai_chunk(json);
-        assert_eq!(
-            chunks,
-            vec![StreamChunk::Usage {
-                input: 10,
-                output: 5
-            }]
-        );
-    }
+        #[test]
+        fn parses_text_delta() {
+            let json = r#"{"choices":[{"delta":{"content":"Hi"}}]}"#;
+            let chunks = parse_openai_chunk(json);
+            assert_eq!(chunks, vec![StreamChunk::TextDelta("Hi".into())]);
+        }
 
-    #[test]
-    fn ignores_malformed_json() {
-        assert!(parse_openai_chunk("not json").is_empty());
-    }
+        #[test]
+        fn parses_tool_call_delta() {
+            let json = r#"{"choices":[{"delta":{"tool_calls":[{"id":"t1","function":{"name":"echo","arguments":"{\"x\":"}}]}}]}"#;
+            let chunks = parse_openai_chunk(json);
+            assert_eq!(chunks.len(), 1);
+            match &chunks[0] {
+                StreamChunk::ToolCallDelta {
+                    id,
+                    name,
+                    args_delta,
+                } => {
+                    assert_eq!(id, "t1");
+                    assert_eq!(name.as_deref(), Some("echo"));
+                    assert_eq!(args_delta, "{\"x\":");
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
 
-    #[test]
-    fn convert_message_drops_custom() {
-        let custom = AgentMessage::Custom(crate::types::message::CustomMessage {
-            custom_type: "x".into(),
-            content: json!({}),
-            timestamp: 0,
-        });
-        assert!(convert_message(&custom).is_none());
-    }
+        #[test]
+        fn parses_usage_chunk() {
+            let json = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+            let chunks = parse_openai_chunk(json);
+            assert_eq!(
+                chunks,
+                vec![StreamChunk::Usage {
+                    input: 10,
+                    output: 5
+                }]
+            );
+        }
 
-    #[test]
-    fn convert_message_drops_empty_assistant() {
-        // Stream-error / aborted turns persist an assistant message with no
-        // content at all.
-        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
-        a.stop_reason = crate::types::message::StopReason::Error("boom".into());
-        assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
-    }
+        #[test]
+        fn ignores_malformed_json() {
+            assert!(parse_openai_chunk("not json").is_empty());
+        }
 
-    #[test]
-    fn convert_message_drops_thinking_only_assistant() {
-        // Reasoning models can end a turn inside thinking: text and tool
-        // calls stay empty while thinking is not.
-        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
-        a.append_thinking("reasoning only");
-        assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
-    }
+        #[test]
+        fn convert_message_drops_custom() {
+            let custom = AgentMessage::Custom(crate::types::message::CustomMessage {
+                custom_type: "x".into(),
+                content: json!({}),
+                timestamp: 0,
+            });
+            assert!(convert_message(&custom).is_none());
+        }
 
-    #[test]
-    fn convert_message_keeps_assistant_with_text_and_thinking() {
-        let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
-        a.append_thinking("reasoning");
-        a.append_text("answer");
-        let entry = convert_message(&AgentMessage::Assistant(a)).expect("kept");
-        assert_eq!(entry["content"], json!("answer"));
-        assert_eq!(entry["reasoning_content"], json!("reasoning"));
-        assert!(entry.get("tool_calls").is_none());
-    }
+        #[test]
+        fn convert_message_drops_empty_assistant() {
+            // Stream-error / aborted turns persist an assistant message with no
+            // content at all.
+            let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+            a.stop_reason = crate::types::message::StopReason::Error("boom".into());
+            assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
+        }
 
-    #[test]
-    fn parses_reasoning_content() {
-        let json = r#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
-        let chunks = parse_openai_chunk(json);
-        assert_eq!(
-            chunks,
-            vec![StreamChunk::ThinkingDelta("thinking...".into())]
-        );
+        #[test]
+        fn convert_message_drops_thinking_only_assistant() {
+            // Reasoning models can end a turn inside thinking: text and tool
+            // calls stay empty while thinking is not.
+            let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+            a.append_thinking("reasoning only");
+            assert!(convert_message(&AgentMessage::Assistant(a)).is_none());
+        }
+
+        #[test]
+        fn convert_message_keeps_assistant_with_text_and_thinking() {
+            let mut a = crate::types::message::AssistantMessage::new(&"glm".into());
+            a.append_thinking("reasoning");
+            a.append_text("answer");
+            let entry = convert_message(&AgentMessage::Assistant(a)).expect("kept");
+            assert_eq!(entry["content"], json!("answer"));
+            assert_eq!(entry["reasoning_content"], json!("reasoning"));
+            assert!(entry.get("tool_calls").is_none());
+        }
+
+        #[test]
+        fn parses_reasoning_content() {
+            let json = r#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
+            let chunks = parse_openai_chunk(json);
+            assert_eq!(
+                chunks,
+                vec![StreamChunk::ThinkingDelta("thinking...".into())]
+            );
+        }
     }
 }

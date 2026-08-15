@@ -16,7 +16,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["name"]
         }),
-        risk: RiskLevel::High,
+        risk: RiskLevel::Low,
         execute: Arc::new(|ctx| {
             Box::pin(async move {
                 let name = ctx.args["name"].as_str().unwrap_or("world");

@@ -46,9 +46,53 @@ export interface SubagentState {
 }
 
 /**
- * WebSocket message types for subagent events (gateway → frontend).
- * 网关经单一有序通道发送；`tool_id` 已从协议删除——前端自行生成工具
- * id 并按 name 匹配（子 agent 串行执行工具，name 无歧义）。
+ * The gateway→frontend wire protocol, field-for-field.
+ * Source of truth: `gasket-host/src/wire.rs` (OutgoingEvent) and
+ * `gasket-host/src/event_map.rs::subagent_event_to_ws`. Add fields, never
+ * rename — this union IS the contract.
+ */
+export type WsMessage =
+  // ── main agent stream ──
+  | { type: 'thinking'; content: string }
+  | { type: 'content'; content: string }
+  | { type: 'text'; content: string } // legacy alias still accepted
+  | { type: 'tool_start'; name: string; arguments?: string; tool_call_id?: string }
+  | { type: 'tool_end'; name: string; output?: string; error?: string; tool_call_id?: string }
+  | { type: 'error'; content?: string; message?: string }
+  | { type: 'done'; usage_in?: number; usage_out?: number; elapsed_ms?: number }
+  | { type: 'busy'; content?: string; message?: string }
+  | { type: 'approval_request'; id: string; tool_name: string; description: string; arguments: string }
+  // ── subagent_* (all 9 wire variants; Usage never leaves the server) ──
+  | SubagentWsMessage;
+
+/**
+ * Runtime guard: a parsed WS/Tauri payload with a known `type` discriminant.
+ * Unknown types (future protocol) fall through as `null`.
+ */
+const WS_MESSAGE_TYPES = new Set([
+  'thinking', 'content', 'text', 'tool_start', 'tool_end', 'error', 'done',
+  'busy', 'approval_request',
+  'subagent_all_started', 'subagent_synthesizing', 'subagent_started',
+  'subagent_thinking', 'subagent_content', 'subagent_tool_start',
+  'subagent_tool_end', 'subagent_completed', 'subagent_error',
+]);
+
+export function parseWsMessage(raw: unknown): WsMessage | null {
+  if (typeof raw !== 'object' || raw === null || !('type' in raw)) {
+    return null;
+  }
+  const t = raw.type; // narrowed to unknown by the `in` check above
+  if (typeof t === 'string' && WS_MESSAGE_TYPES.has(t)) {
+    // Known discriminant: this is a WsMessage by construction of the
+    // server-side serializer (wire.rs / event_map.rs).
+    const msg: WsMessage = raw as WsMessage;
+    return msg;
+  }
+  return null;
+}
+
+/**
+ * Subagent message types for real-time UI updates
  */
 export type SubagentWsMessage =
   | { type: 'subagent_all_started'; count: number }

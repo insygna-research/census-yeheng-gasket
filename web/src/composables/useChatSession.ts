@@ -1,10 +1,11 @@
 import { computed, reactive, ref, watch } from 'vue';
-import { useChatStore, uid } from '@/stores/chatStore';
+import { useChatStore, makeId } from '@/stores/chatStore';
 import { useIMWebSocket } from '@/hooks/useIMWebSocket';
 import { useTauriChat } from '@/hooks/useTauriChat';
 import { isTauri } from '@/lib/platform';
 import { backendBaseUrl, fetchSessionMessages, sessionKey } from '@/lib/backend';
-import type { ApprovalRequest, ContextStats, Message, SubagentState } from '@/types';
+import { parseWsMessage } from '@/types';
+import type { ApprovalRequest, ContextStats, Message, SubagentState, WsMessage } from '@/types';
 import { notifyTurnComplete } from '@/lib/notifications';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -21,6 +22,12 @@ export function useChatSession(chatId: { value: string }) {
   const SUBAGENT_TIMEOUT_MS = 300_000; // 5 minutes client-side timeout as a safety net
 
   const pendingApprovals = ref<Map<string, ApprovalRequest>>(new Map());
+
+  // Explicit identity of the current turn's bot message. Guessing "last
+  // message is the bot's" breaks on retry (the retried turn's events would
+  // append to a stale bot bubble); track it instead. Null between turns —
+  // the first bot-ish WS event of a turn creates and records the message.
+  const currentBotMessageId = ref<string | null>(null);
 
   const errorBanner = ref<string | null>(null);
   let errorBannerTimer: ReturnType<typeof setTimeout> | null = null;
@@ -53,7 +60,7 @@ export function useChatSession(chatId: { value: string }) {
   const getBotSubagent = (botMsg: Message, id: string): SubagentState | undefined =>
     botMsg.subagents?.find(sa => sa.id === id);
 
-  const handleSubagentStarted = (msg: { id: string; task: string; index: number }, botMsg: Message) => {
+  const handleSubagentStarted = (msg: Extract<WsMessage, { type: 'subagent_started' }>, botMsg: Message) => {
     chatStore.pushSubagent(chatId.value, botMsg.id, {
       id: msg.id,
       index: msg.index,
@@ -83,25 +90,25 @@ export function useChatSession(chatId: { value: string }) {
     }, SUBAGENT_TIMEOUT_MS);
   };
 
-  const handleSubagentThinking = (msg: { id: string; content: string }, botMsg: Message) => {
+  const handleSubagentThinking = (msg: Extract<WsMessage, { type: 'subagent_thinking' }>, botMsg: Message) => {
     const s = getBotSubagent(botMsg, msg.id);
     if (s) {
       chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { thinking: (s.thinking || '') + msg.content });
     }
   };
 
-  const handleSubagentContent = (msg: { id: string; content: string }, botMsg: Message) => {
+  const handleSubagentContent = (msg: Extract<WsMessage, { type: 'subagent_content' }>, botMsg: Message) => {
     const s = getBotSubagent(botMsg, msg.id);
     if (s) {
       chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { content: (s.content || '') + msg.content });
     }
   };
 
-  const handleSubagentToolStart = (msg: { id: string; name: string; arguments?: string }, botMsg: Message) => {
+  const handleSubagentToolStart = (msg: Extract<WsMessage, { type: 'subagent_tool_start' }>, botMsg: Message) => {
     const s = getBotSubagent(botMsg, msg.id);
     if (s) {
       const toolCall = {
-        id: uid(),
+        id: makeId(),
         name: msg.name,
         arguments: msg.arguments,
         status: 'running' as const,
@@ -115,7 +122,7 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
-  const handleSubagentToolEnd = (msg: { id: string; name: string; output?: string }, botMsg: Message) => {
+  const handleSubagentToolEnd = (msg: Extract<WsMessage, { type: 'subagent_tool_end' }>, botMsg: Message) => {
     const s = getBotSubagent(botMsg, msg.id);
     if (s && s.toolCalls.length > 0) {
       // Sub-agents execute tools serially, so the newest running call with
@@ -140,7 +147,7 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
-  const handleSubagentCompleted = (msg: { id: string; index: number; summary: string; tool_count: number }, botMsg: Message) => {
+  const handleSubagentCompleted = (msg: Extract<WsMessage, { type: 'subagent_completed' }>, botMsg: Message) => {
     if (subagentTimers.value[msg.id]) {
       clearTimeout(subagentTimers.value[msg.id]);
       delete subagentTimers.value[msg.id];
@@ -154,7 +161,7 @@ export function useChatSession(chatId: { value: string }) {
     checkAndFinalizeSubagents(botMsg);
   };
 
-  const handleSubagentError = (msg: { id: string; index: number; error: string }, botMsg: Message) => {
+  const handleSubagentError = (msg: Extract<WsMessage, { type: 'subagent_error' }>, botMsg: Message) => {
     if (subagentTimers.value[msg.id]) {
       clearTimeout(subagentTimers.value[msg.id]);
       delete subagentTimers.value[msg.id];
@@ -169,7 +176,7 @@ export function useChatSession(chatId: { value: string }) {
 
   // ── WebSocket message processing ────────────────────────────
 
-  const processWebSocketMessageInner = (msg: any, botMsg: Message) => {
+  const processWebSocketMessageInner = (msg: WsMessage, botMsg: Message) => {
     switch (msg.type) {
       case 'thinking':
         isThinking.value = true;
@@ -178,7 +185,7 @@ export function useChatSession(chatId: { value: string }) {
       case 'tool_start':
         isThinking.value = true;
         chatStore.ensureToolCalls(chatId.value, botMsg.id);
-        const toolId = msg.tool_call_id || uid();
+        const toolId = msg.tool_call_id || makeId();
         chatStore.pushToolCall(chatId.value, botMsg.id, {
           id: toolId,
           name: msg.name,
@@ -201,7 +208,7 @@ export function useChatSession(chatId: { value: string }) {
               : [...toolCalls].reverse().find(t => t.name === msg.name && t.status === 'running'))
           : undefined;
         if (runningTool) {
-          const updates: { status: 'error' | 'complete'; result: string; duration?: string } = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output };
+          const updates: { status: 'error' | 'complete'; result: string; duration?: string } = { status: msg.error ? 'error' : 'complete', result: msg.error || msg.output || '' };
           if (runningTool.startTime) {
             updates.duration = ((Date.now() - runningTool.startTime) / 1000).toFixed(1);
           }
@@ -209,7 +216,7 @@ export function useChatSession(chatId: { value: string }) {
         } else {
           chatStore.ensureToolCalls(chatId.value, botMsg.id);
           chatStore.pushToolCall(chatId.value, botMsg.id, {
-            id: msg.tool_call_id || uid(),
+            id: msg.tool_call_id || makeId(),
             name: msg.name || 'unknown',
             arguments: '',
             status: 'error',
@@ -233,6 +240,8 @@ export function useChatSession(chatId: { value: string }) {
         showError(msg.content || msg.message || 'An error occurred');
         break;
       case 'done':
+        // Turn complete: release the tracked bot message.
+        currentBotMessageId.value = null;
         isThinking.value = false;
         // 回合结束（含审批超时/连接关闭后的 done）：清理残留审批弹窗。
         // 网关保证 done 排在全部 subagent 事件之后（单一有序通道），
@@ -264,8 +273,9 @@ export function useChatSession(chatId: { value: string }) {
         isReceiving.value = false;
         showError(msg.message || 'The agent is busy processing a request');
         break;
-      // subagent_* 协议是 M2（core 子 agent 编排）的预留契约：网关当前
-      // 从不发送，这些分支保持无害惰性。M2 落地后由网关协议激活。
+      // subagent_*: live events forwarded by the gateway's single ordered
+      // wire channel (event_map::subagent_event_to_ws) while a
+      // spawn_subagents fan-out runs.
       case 'subagent_all_started':
         subagentPhase.value = 'running';
         break;
@@ -305,13 +315,24 @@ export function useChatSession(chatId: { value: string }) {
     }
   };
 
-  const processWebSocketMessage = (msg: any) => {
+  const processWebSocketMessage = (raw: unknown) => {
+    const parsed = parseWsMessage(raw);
+    if (!parsed) return; // unknown/absent discriminant — drop, nothing sane to do
+
     isSending.value = false;
     isReceiving.value = true;
 
-    const botMsg = chatStore.getOrCreateBotMessage(chatId.value);
+    let botMsg: Message | null = null;
+    if (currentBotMessageId.value) {
+      const tracked = chatStore.activeMessages.find(m => m.id === currentBotMessageId.value);
+      if (tracked) botMsg = tracked;
+    }
+    if (!botMsg) {
+      botMsg = chatStore.getOrCreateBotMessage(chatId.value);
+      if (botMsg) currentBotMessageId.value = botMsg.id;
+    }
     if (!botMsg) return;
-    processWebSocketMessageInner(msg, botMsg);
+    processWebSocketMessageInner(parsed, botMsg);
   };
 
   const handleMessage = (data: string) => {
@@ -455,9 +476,6 @@ export function useChatSession(chatId: { value: string }) {
     pendingApprovals.value.delete(requestId);
   };
 
-  const generateTraceId = () => {
-    return Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 11);
-  };
 
   const sendMessage = (text: string) => {
     // 接收期间一律禁发（含子 agent 运行中）：后端在回合内不会接受新
@@ -465,7 +483,7 @@ export function useChatSession(chatId: { value: string }) {
     // 契约错觉。
     if (!text.trim() || !isConnected.value || isSending.value || isReceiving.value) return false;
 
-    const msgId = uid();
+    const msgId = makeId();
     chatStore.appendMessage(chatId.value, {
       id: msgId,
       role: 'user',
@@ -473,13 +491,16 @@ export function useChatSession(chatId: { value: string }) {
       timestamp: Date.now(),
       status: 'sending'
     });
+    // New turn: the next bot events belong to a fresh bot message, not
+    // whatever bot bubble happens to be last.
+    currentBotMessageId.value = null;
 
     isSending.value = true;
     try {
       const payload = JSON.stringify({
         type: 'message',
         content: text,
-        trace_id: generateTraceId(),
+        trace_id: makeId('trace'),
       });
       send(payload);
       chatStore.updateMessageStatus(chatId.value, msgId, 'sent');
@@ -495,11 +516,13 @@ export function useChatSession(chatId: { value: string }) {
   const retryMessage = (msgId: string, content: string) => {
     if (!isConnected.value) return;
     chatStore.updateMessageStatus(chatId.value, msgId, 'sending');
+    // Retried turn gets its own bot message; do not append to a stale one.
+    currentBotMessageId.value = null;
     try {
       const payload = JSON.stringify({
         type: 'message',
         content,
-        trace_id: generateTraceId(),
+        trace_id: makeId('trace'),
       });
       send(payload);
       chatStore.updateMessageStatus(chatId.value, msgId, 'sent');

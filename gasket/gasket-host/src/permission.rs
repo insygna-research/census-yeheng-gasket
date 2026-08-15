@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use gasket_core::{HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
-
+use parking_lot::RwLock as PlRwLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Suggest,
@@ -39,6 +39,10 @@ pub type Approver = Arc<
 pub struct PermissionPolicy {
     mode: AtomicU8,
     approver: Approver,
+    /// Shared abort flag (the Host's signal). When set while waiting on the
+    /// approver, the wait is abandoned — cancellation is centralized here
+    /// instead of trusting every approver to be cancel-aware.
+    signal: PlRwLock<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl PermissionPolicy {
@@ -46,7 +50,15 @@ impl PermissionPolicy {
         Self {
             mode: AtomicU8::new(mode as u8),
             approver,
+            signal: PlRwLock::new(None),
         }
+    }
+
+    /// Attach the shared abort signal (the Host's). Call once after the Host
+    /// owning the signal is built; the policy is typically Arc-shared into
+    /// the Host's hook chain before that point.
+    pub fn set_signal(&self, signal: Arc<std::sync::atomic::AtomicBool>) {
+        *self.signal.write() = Some(signal);
     }
 
     pub fn set_mode(&self, mode: Mode) {
@@ -59,6 +71,32 @@ impl PermissionPolicy {
             1 => Mode::AutoEdit,
             2 => Mode::FullAuto,
             _ => Mode::AutoEdit,
+        }
+    }
+
+    /// Poll the shared abort signal while the approver decides. The HookChain
+    /// contract requires human-blocking implementors to return promptly on
+    /// cancel; an approver parked on stdin or a dead WS client cannot.
+    async fn await_approver(&self, name: &str, args: &serde_json::Value) -> ToolCallVerdict {
+        let signal = self.signal.read().clone();
+        let mut approver = std::pin::pin!((self.approver)(name, args));
+        loop {
+            if let Some(sig) = &signal {
+                if sig.load(Ordering::Relaxed) {
+                    return ToolCallVerdict::Block(format!("{name} aborted"));
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
+                allowed = &mut *approver => {
+                    return if allowed {
+                        ToolCallVerdict::Allow
+                    } else {
+                        ToolCallVerdict::Block(format!("{name} denied by user"))
+                    };
+                }
+            }
         }
     }
 }
@@ -77,13 +115,7 @@ impl HookChain for PermissionPolicy {
                 (Mode::AutoEdit, RiskLevel::Low) | (Mode::AutoEdit, RiskLevel::Medium) => {
                     ToolCallVerdict::Allow
                 }
-                (Mode::AutoEdit, RiskLevel::High) => {
-                    if (self.approver)(name, args).await {
-                        ToolCallVerdict::Allow
-                    } else {
-                        ToolCallVerdict::Block(format!("{name} denied by user"))
-                    }
-                }
+                (Mode::AutoEdit, RiskLevel::High) => self.await_approver(name, args).await,
                 (Mode::Suggest, RiskLevel::Low) => ToolCallVerdict::Allow,
                 (Mode::Suggest, RiskLevel::Medium) | (Mode::Suggest, RiskLevel::High) => {
                     ToolCallVerdict::Block("read-only mode".into())
@@ -200,5 +232,28 @@ mod tests {
             verdict(&p, "bash", RiskLevel::High).await,
             ToolCallVerdict::Allow
         ));
+    }
+
+    /// P1-5 regression: an approver that never resolves must not out-wait the
+    /// abort signal — the verdict must return promptly with a Block("…aborted").
+    #[tokio::test]
+    async fn approver_wait_is_cancel_aware() {
+        let policy = PermissionPolicy::new(
+            Mode::AutoEdit,
+            Arc::new(|_n, _a| Box::pin(async { std::future::pending::<bool>().await })),
+        );
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        policy.set_signal(signal.clone());
+
+        signal.store(true, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let verdict = policy
+            .before_tool_call("2", "bash", &serde_json::json!({}), RiskLevel::High)
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        match verdict {
+            ToolCallVerdict::Block(msg) => assert!(msg.contains("aborted"), "{msg}"),
+            v => panic!("expected Block, got {v:?}"),
+        }
     }
 }

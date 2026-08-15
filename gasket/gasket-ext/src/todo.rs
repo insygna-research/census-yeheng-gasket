@@ -50,7 +50,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["action"]
         }),
-        risk: RiskLevel::High,
+        risk: RiskLevel::Medium,
         execute: Arc::new(|ctx: ToolCallCtx| Box::pin(async move { execute(&ctx).await })),
     });
 }

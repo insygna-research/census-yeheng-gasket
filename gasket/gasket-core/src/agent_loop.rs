@@ -1,6 +1,5 @@
 //! The agent loop — single outer loop: LLM call → tool calls → repeat.
 
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 
@@ -35,16 +34,14 @@ where
 {
     let mut new_messages: Vec<AgentMessage> = Vec::new();
 
-    // Seed context with the initial prompts.
+    // Seed context with the initial prompts. These are inputs, not assistant
+    // output: no MessageStart/MessageEnd is emitted for them (an empty
+    // AssistantMessage per user prompt would be a lie both frontends would
+    // have to filter out).
     for msg in &initial_prompts {
         context.messages.push(msg.clone());
         new_messages.push(msg.clone());
-        emit(AgentEvent::MessageStart);
-        emit(AgentEvent::MessageEnd {
-            message: AssistantMessage::new(&config.model.id),
-        });
     }
-
     emit(AgentEvent::AgentStart);
     tracing::info!(model = %config.model.id, session = %context.session_id, "agent loop start");
 
@@ -565,10 +562,14 @@ where
         }
     }
 
-    // If the model emitted tool calls, the turn continues; otherwise it ended.
-    // Preserve an explicit Abort set during streaming so the outer loop stops.
+    // The provider may end its stream without a Done chunk when the abort
+    // signal stopped the download mid-flight; preserve the Aborted marker so
+    // the persisted partial transcript stays honest. If the model emitted
+    // tool calls the turn would otherwise continue; otherwise it ended.
     if accumulated.stop_reason != StopReason::Aborted {
-        accumulated.stop_reason = if accumulated
+        accumulated.stop_reason = if is_aborted(config) {
+            StopReason::Aborted
+        } else if accumulated
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
@@ -593,10 +594,6 @@ fn backoff_ms(attempt: usize, policy: &crate::types::context::RetryPolicy) -> u6
     let base = policy.initial_delay_ms.saturating_mul(1u64 << shift);
     base.min(policy.max_delay_ms)
 }
-
-// Keep the boxed-future type name available for clarity in signatures above.
-#[allow(dead_code)]
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 #[cfg(test)]
 mod tests {

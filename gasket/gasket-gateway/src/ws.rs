@@ -213,15 +213,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     // without a preceding turn (shouldn't happen, but
                     // degrade to a plain done instead of crashing).
                     let s = wire_session.lock().await;
-                    let elapsed_ms = s.turn_start
+                    let elapsed_ms = s
+                        .turn_start
                         .map(|t| t.elapsed().as_millis() as u64)
                         .unwrap_or(0);
                     let ev = if elapsed_ms > 0 {
-                        OutgoingEvent::done_with_summary(
-                            s.usage_in,
-                            s.usage_out,
-                            elapsed_ms,
-                        )
+                        OutgoingEvent::done_with_summary(s.usage_in, s.usage_out, elapsed_ms)
                     } else {
                         OutgoingEvent::done()
                     };
@@ -306,7 +303,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     // (event-by-event, including on later failure).
     let spawner_cfg = host_cfg.clone();
     let spawner_policy = Arc::clone(&policy);
-    let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
+    let mut host = Host::new(host_cfg, session_mgr, policy.clone(), system_prompt, tools);
+    // The policy's approver waits on a WS round-trip that may never come
+    // (client gone); give it the Host's abort signal so cancel unwinds it.
+    policy.set_signal(host.signal().clone());
     // Subagent spawner: events forwarded to WS via the wire channel.
     {
         let spawner_signal = host.signal().clone();

@@ -41,9 +41,6 @@ importers:
       marked:
         specifier: ^17.0.4
         version: 17.0.6
-      marked-highlight:
-        specifier: ^2.2.1
-        version: 2.2.4(marked@17.0.6)
       mermaid:
         specifier: ^11.6.0
         version: 11.15.0
@@ -1241,11 +1238,6 @@ packages:
   make-dir@2.1.0:
     resolution: {integrity: sha512-LS9X+dc8KLxXCb8dni79fLIIUA5VyZoyjSMCwTluaXA0o27cCK0bhXkpgw+sTXVpPy/lSO57ilRixqk0vDmtRA==}
     engines: {node: '>=6'}
-
-  marked-highlight@2.2.4:
-    resolution: {integrity: sha512-PZxisNMJDduSjc0q6uvjsnqqHCXc9s0eyzxDO9sB1eNGJnd/H1/Fu+z6g/liC1dfJdFW4SftMwMlLvsBhUPrqQ==}
-    peerDependencies:
-      marked: '>=4 <19'
 
   marked@16.3.0:
     resolution: {integrity: sha512-K3UxuKu6l6bmA5FUwYho8CfJBlsUWAooKtdGgMcERSpF7gcBUrCGsLH7wDaaNOzwq18JzSUDyoEb/YsrqMac3w==}
@@ -2692,10 +2684,6 @@ snapshots:
       pify: 4.0.1
       semver: 5.6.0
     optional: true
-
-  marked-highlight@2.2.4(marked@17.0.6):
-    dependencies:
-      marked: 17.0.6
 
   marked@16.3.0: {}
 

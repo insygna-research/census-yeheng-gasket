@@ -1,8 +1,8 @@
 //! Web search tool with multiple providers.
 //!
 //! Environment variables:
-//! - GASKET_SEARCH_PROVIDER: "serper" (default), "serpapi", "duckduckgo", "brave",
-//!   "tavily", "exa", or "firecrawl"
+//! - GASKET_SEARCH_PROVIDER: "duckduckgo" (default, no key required), "serper",
+//!   "serpapi", "brave", "tavily", "exa", or "firecrawl"
 //! - GASKET_SERPER_API_KEY: Serper.dev API key
 //! - GASKET_SERPAPI_API_KEY: SerpAPI API key
 //! - GASKET_BRAVE_API_KEY: Brave Search API key
@@ -382,10 +382,13 @@ async fn send_get<T: serde::de::DeserializeOwned>(
         req = req.header(key, value);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| ToolError::Message(format!("{} API request failed: {}", provider_name, e)))?;
+    let response = req.send().await.map_err(|e| {
+        ToolError::Message(format!(
+            "{} API request failed: {}",
+            provider_name,
+            e.without_url()
+        ))
+    })?;
 
     check_status(&response, provider_name).await?;
 
@@ -413,10 +416,13 @@ async fn send_post_json<T: serde::de::DeserializeOwned>(
         req = req.header(key, value);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| ToolError::Message(format!("{} API request failed: {}", provider_name, e)))?;
+    let response = req.send().await.map_err(|e| {
+        ToolError::Message(format!(
+            "{} API request failed: {}",
+            provider_name,
+            e.without_url()
+        ))
+    })?;
 
     check_status(&response, provider_name).await?;
 
@@ -513,11 +519,10 @@ where
 // ── Tool implementation ──────────────────────────────────────────────────
 
 pub fn register(api: &mut dyn ExtensionApi) {
-
     api.register_tool(ToolDefinition {
         name: "web_search".into(),
         label: "Web Search".into(),
-        description: "Search the web for current information. Supported providers: serper (default), serpapi, duckduckgo, brave, tavily, exa, firecrawl. Configure via GASKET_SEARCH_PROVIDER and the corresponding GASKET_<PROVIDER>_API_KEY environment variable.".into(),
+        description: "Search the web for current information. Supported providers: duckduckgo (default), serper, serpapi, brave, tavily, exa, firecrawl. Configure via GASKET_SEARCH_PROVIDER and the corresponding GASKET_<PROVIDER>_API_KEY environment variable.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -836,10 +841,7 @@ mod tests {
         match &result.content[0] {
             gasket_core::ContentBlock::Text { text } => {
                 assert!(text.contains("Search failed"), "got: {text}");
-                assert!(
-                    text.contains("https://html.duckduckgo.com/"),
-                    "got: {text}"
-                );
+                assert!(text.contains("https://html.duckduckgo.com/"), "got: {text}");
             }
             _ => panic!("expected text content"),
         }

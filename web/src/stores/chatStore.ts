@@ -3,8 +3,12 @@ import { ref, computed } from 'vue';
 import { deleteSession, fetchSessionList, renameSession } from '@/lib/backend';
 import type { Chat, Message, MessageStatus, SubagentState, TurnSummary } from '@/types';
 
-/** Collision-resistant id for locally-created messages and tool calls. */
-export const uid = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 11);
+/** Collision-resistant local id: `prefix_timestamp_random`. One generator
+ * for every locally-created entity (messages, tool calls, chats, traces). */
+export const makeId = (prefix?: string) => {
+  const core = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 11);
+  return prefix ? `${prefix}_${core}` : core;
+};
 
 export const useChatStore = defineStore('chat', () => {
   // The backend's session store (~/.gasket/sessions via list_sessions) is
@@ -22,10 +26,10 @@ export const useChatStore = defineStore('chat', () => {
 
   const createChat = () => {
     const newChat: Chat = {
-      id: 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
+      id: makeId('chat'),
       name: 'New Chat',
       messages: [
-        { id: uid(), role: 'system', content: 'Connected to gasket Gateway', timestamp: Date.now() }
+        { id: makeId(), role: 'system', content: 'Connected to gasket Gateway', timestamp: Date.now() }
       ],
       updatedAt: Date.now()
     };
@@ -77,7 +81,7 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     const newBotMsg: Message = {
-      id: uid(),
+      id: makeId(),
       role: 'bot',
       content: '',
       timestamp: Date.now()
@@ -208,9 +212,12 @@ export const useChatStore = defineStore('chat', () => {
   const abortToolCalls = (chatId: string) => {
     const chat = getChat(chatId);
     if (!chat) return;
-    const lastMsg = chat.messages[chat.messages.length - 1];
-    if (lastMsg && lastMsg.role === 'bot' && lastMsg.toolCalls) {
-      lastMsg.toolCalls.forEach(tc => {
+    // Same lookup as abortSubagents: the LAST BOT message, not the literal
+    // last message — after a retry the literal last message may be a user
+    // message and running tool calls would silently survive.
+    const lastBot = [...chat.messages].reverse().find(m => m.role === 'bot');
+    if (lastBot?.toolCalls) {
+      lastBot.toolCalls.forEach(tc => {
         if (tc.status === 'running') tc.status = 'error';
       });
     }

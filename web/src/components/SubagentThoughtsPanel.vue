@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onUnmounted, ref, watch } from 'vue';
 import {
   Sparkles,
   ChevronRight,
@@ -23,6 +23,27 @@ const props = withDefaults(
 );
 
 const toolExpandedMap = ref<Record<string, boolean>>({});
+
+
+// Reactive clock for running durations: formatDuration re-evaluates every
+// second while any subagent is running, so the timer visibly ticks.
+const now = ref(Date.now());
+let tickTimer: ReturnType<typeof setInterval> | null = null;
+const anyRunning = computed(() => props.subagents.some(s => s.status === 'running'));
+watch(anyRunning, running => {
+  if (running && tickTimer === null) {
+    tickTimer = setInterval(() => { now.value = Date.now(); }, 1000);
+  } else if (!running && tickTimer !== null) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}, { immediate: true });
+onUnmounted(() => {
+  if (tickTimer !== null) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+});
 
 const sortedSubagents = computed(() =>
   [...props.subagents].sort((a, b) => a.index - b.index)
@@ -90,13 +111,12 @@ function toolIconForStatus(status: SubagentToolCall['status']) {
 }
 
 function formatDuration(start: number, end?: number) {
-  const ms = (end || Date.now()) - start;
+  const ms = (end ?? now.value) - start; // reads `now` → reactive while running
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
 }
 </script>
-
 <template>
   <div v-if="hasAnySubagents" class="w-full my-1 relative">
     <!-- Tree of subagent nodes -->

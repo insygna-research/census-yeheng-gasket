@@ -727,7 +727,7 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
     let configs = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("(mcp config load failed: {e})");
+            tracing::warn!("mcp config load failed: {e}");
             return Vec::new();
         }
     };
@@ -739,7 +739,7 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
             match McpHttpClient::connect(&name, url, &cfg.headers, timeout).await {
                 Ok((_, defs)) => defs,
                 Err(e) => {
-                    eprintln!("(mcp {name} load failed: {e})");
+                    tracing::warn!("mcp {name} load failed: {e}");
                     continue;
                 }
             }
@@ -748,13 +748,13 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
             match McpBridge::spawn(&name, command, &cfg.args, &cfg.env, timeout).await {
                 Ok((_, defs)) => defs,
                 Err(e) => {
-                    eprintln!("(mcp {name} load failed: {e})");
+                    tracing::warn!("mcp {name} load failed: {e}");
                     continue;
                 }
             }
         };
         if !defs.is_empty() {
-            eprintln!("(mcp {name}: {} tools)", defs.len());
+            tracing::info!("mcp {name}: {} tools", defs.len());
         }
         tools.extend(defs);
     }

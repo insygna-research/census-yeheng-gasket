@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use crate::ContentBlock;
 
+/// Request timeout.
 const TIMEOUT_SECS: u64 = 30;
-const MAX_OUTPUT_BYTES: usize = 200_000;
 
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
@@ -21,7 +21,7 @@ pub fn tool() -> ToolDefinition {
             },
             "required": ["url"]
         }),
-        risk: RiskLevel::Low,
+        risk: RiskLevel::Medium,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     }
 }
@@ -40,6 +40,13 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         return Ok(ToolResult::error(format!(
             "unsupported URL scheme '{scheme}': only http/https allowed"
         )));
+    }
+
+    // SSRF guard: the model must not reach private/loopback/link-local
+    // targets (cloud metadata endpoints, internal services) through us.
+    // Opt out with GASKET_FETCH_ALLOW_PRIVATE_NET=1 (self-hosted LAN use).
+    if let Err(msg) = ssrf_guard(url).await {
+        return Ok(ToolResult::error(msg));
     }
 
     let client = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
@@ -78,12 +85,85 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         body
     };
 
-    let text = truncate(&text);
+    let text = super::truncate_output(&text);
     Ok(ToolResult {
         content: vec![ContentBlock::text(text)],
         details: serde_json::json!({"url": url, "content_type": content_type}),
         is_error: false,
     })
+}
+
+/// Reject URLs whose host resolves (or literals point) into non-public
+/// address space. Skipped entirely when a tool proxy is configured — the
+/// proxy decides where traffic may go — or when the operator opted out.
+async fn ssrf_guard(url: &str) -> Result<(), String> {
+    if crate::proxy::tool_proxy().is_some() {
+        return Ok(());
+    }
+    if let Ok(v) = std::env::var("GASKET_FETCH_ALLOW_PRIVATE_NET") {
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return Ok(());
+        }
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
+    // Fast path: IP literal — check directly, no DNS.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return if is_non_public_ip(ip) {
+            Err(format!(
+                "refusing to fetch non-public address {host} (SSRF guard; \
+                 set GASKET_FETCH_ALLOW_PRIVATE_NET=1 to allow)"
+            ))
+        } else {
+            Ok(())
+        };
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addr = format!("{host}:{port}");
+
+    // Hostname: resolve and reject if ANY answer is non-public (a public
+    // name that rebinds to an internal IP must not slip through). Resolution
+    // failure stays fail-open — the request itself will surface the DNS error.
+    if let Ok(Ok(addrs)) =
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr)).await
+    {
+        for a in addrs {
+            if is_non_public_ip(a.ip()) {
+                return Err(format!(
+                    "host {host} resolves to non-public address {} (SSRF guard; \
+                     set GASKET_FETCH_ALLOW_PRIVATE_NET=1 to allow)",
+                    a.ip()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ip` is anything other than a globally routable unicast address.
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 0 // "this" network
+                || o[0] == 10 // private
+                || o[0] == 127 // loopback
+                || (o[0] == 100 && o[1] & 0xC0 == 64) // CGNAT 100.64/10
+                || (o[0] == 172 && o[1] & 0xF0 == 16) // private 172.16/12
+                || (o[0] == 192 && o[1] == 168) // private
+                || (o[0] == 169 && o[1] == 254) // link-local incl. cloud metadata
+                || o[0] >= 224 // multicast + reserved + broadcast
+        }
+        std::net::IpAddr::V6(v6) => {
+            // ::/128 (unspecified), ::1/128 (loopback), and every special
+            // prefix; only global unicast 2000::/3 is public.
+            v6.segments()[0] & 0xE000 != 0x2000
+        }
+    }
 }
 
 /// Convert HTML to readable plain text: strip non-content elements, extract
@@ -122,20 +202,7 @@ fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
-/// Truncate to MAX_OUTPUT_BYTES (char-safe), appending an indicator.
-fn truncate(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
-        return s.to_string();
-    }
-    let cut = s[..MAX_OUTPUT_BYTES]
-        .char_indices()
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(MAX_OUTPUT_BYTES);
-    let mut out = s[..cut].to_string();
-    out.push_str("\n...(truncated)");
-    out
-}
+// Char-safe truncation lives in `super::truncate_output` (shared with bash).
 
 #[cfg(test)]
 mod tests {
@@ -174,18 +241,102 @@ mod tests {
 
     #[test]
     fn truncate_adds_indicator() {
-        let big = "x".repeat(MAX_OUTPUT_BYTES + 1000);
-        let out = truncate(&big);
-        assert!(out.ends_with("...(truncated)"));
+        let big = "x".repeat(crate::tools::MAX_OUTPUT_BYTES + 1000);
+        let out = crate::tools::truncate_output(&big);
         assert!(out.len() < big.len());
     }
 
     #[test]
     fn truncate_noop_under_limit() {
-        let s = "small text";
-        assert_eq!(truncate(s), s);
+        assert_eq!(crate::tools::truncate_output("small text"), "small text");
     }
 
+    #[test]
+    fn non_public_ip_classification() {
+        let bad = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+        ];
+        for s in bad {
+            let ip: std::net::IpAddr = s.parse().unwrap();
+            assert!(is_non_public_ip(ip), "{s} must be non-public");
+        }
+        let ok = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2001:db8::1",
+        ];
+        for s in ok {
+            let ip: std::net::IpAddr = s.parse().unwrap();
+            assert!(!is_non_public_ip(ip), "{s} must be public");
+        }
+    }
+
+    // The guard consults the global tool-proxy override; the std mutex below
+    // deliberately spans the await to serialize global-state tests (same
+    // pattern as fetch_goes_through_tool_proxy).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn fetch_rejects_cloud_metadata_endpoint() {
+        // The guard consults the global tool-proxy override; hold the same
+        // lock as the proxy test so a concurrent override can't skip it.
+        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+        let ctx = ToolCallCtx {
+            tool_call_id: "t3".into(),
+            args: serde_json::json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+            signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: crate::ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+                spawner: None,
+            },
+        };
+        let result = execute(ctx).await.unwrap();
+        assert!(result.is_error);
+        match &result.content[0] {
+            ContentBlock::Text { text } => assert!(text.contains("SSRF guard"), "got: {text}"),
+            _ => panic!("expected text content"),
+        }
+    }
+    // Deliberate cross-await lock: see fetch_rejects_cloud_metadata_endpoint.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn fetch_rejects_localhost_by_resolution() {
+        // No proxy configured and no opt-out: `localhost` resolves to a
+        // loopback IP and must be refused before any request is made.
+        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+        let ctx = ToolCallCtx {
+            tool_call_id: "t4".into(),
+            args: serde_json::json!({"url": "http://localhost:9/"}),
+            signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: crate::ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+                spawner: None,
+            },
+        };
+        let result = execute(ctx).await.unwrap();
+        assert!(result.is_error, "localhost must be blocked: {result:?}");
+    }
     #[tokio::test]
     async fn fetch_rejects_non_http_scheme() {
         let ctx = ToolCallCtx {
@@ -269,6 +420,9 @@ mod tests {
         // A proxied http request carries the absolute target URI on the
         // request line — proof the connection went through the proxy.
         let head = server.await.unwrap();
-        assert!(head.starts_with("GET http://example.test/"), "proxy saw: {head}");
+        assert!(
+            head.starts_with("GET http://example.test/"),
+            "proxy saw: {head}"
+        );
     }
 }
