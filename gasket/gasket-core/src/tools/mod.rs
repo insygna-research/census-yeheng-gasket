@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod grep;
 pub mod list;
 pub mod read;
+pub mod sandbox;
 pub mod subagent;
 pub mod write;
 
