@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "gasket 系统架构",
+    "output": "docs/diagrams/gasket-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/YeHeng/gasket",
+      "revision": "0a97189bf80b9b37b702c796a5c6de4eabbef708"
+    },
+    "viewBox": [2000, 800],
+    "views": [
+      { "id": "main-path", "label": "主请求路径", "focus": ["web", "gateway", "host", "core", "llm"], "note": "浏览器消息流经网关、宿主、内核,以 SSE 调用 LLM。" },
+      { "id": "frontends", "label": "三种前端形态", "focus": ["web", "cli", "gateway", "host"], "note": "REPL、浏览器 WS、Tauri IPC 桌面,共用同一个 Host::run_turn。" },
+      { "id": "event-log", "label": "事件日志真相源", "focus": ["host", "core", "events"], "note": "append-only 事件日志逐事件落盘,历史每轮现派生。" },
+      { "id": "extensions", "label": "扩展与外部工具", "focus": ["ext", "mcp", "core", "host"], "note": "进程内扩展注册工具与 Hook,MCP 服务器经宿主接入。" }
+    ]
+  },
+  "components": [
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "web/ 前端",
+      "sublabel": "Vue 3 · 浏览器 + Tauri 桌面",
+      "tag": "isTauri 双传输",
+      "pos": [60, 140],
+      "size": [240, 92],
+      "sources": [{ "path": "web/src-tauri/src/chat.rs", "label": "桌面 IPC · 进程内 Host" }]
+    },
+    {
+      "id": "gateway",
+      "type": "backend",
+      "label": "gasket-gateway",
+      "sublabel": "WS 网关 + REST · :3000",
+      "tag": "每连接一会话",
+      "pos": [450, 140],
+      "size": [260, 92],
+      "sources": [{ "path": "gasket/gasket-gateway/src/ws.rs", "label": "WS 连接处理" }]
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "gasket-host",
+      "sublabel": "会话 · 权限 · 压缩 · MCP",
+      "tag": "Host::run_turn",
+      "pos": [810, 140],
+      "size": [300, 140],
+      "sources": [{ "path": "gasket/gasket-host/src/lib.rs", "line": 51, "label": "Host 编排器" }]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "gasket-core",
+      "sublabel": "agent_loop · tools · providers · storage",
+      "tag": "无状态内核",
+      "pos": [1300, 140],
+      "size": [300, 140],
+      "sources": [{ "path": "gasket/gasket-core/src/agent_loop.rs", "label": "推理循环" }]
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "LLM Provider",
+      "sublabel": "OpenAI 兼容 / Anthropic",
+      "tag": "SSE 流式",
+      "pos": [1720, 140],
+      "size": [220, 140],
+      "sources": [{ "path": "gasket/gasket-core/src/providers/mod.rs", "label": "StreamFn 实现" }]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "gasket-cli",
+      "sublabel": "终端 REPL(bin gasket)",
+      "tag": "斜杠命令",
+      "pos": [60, 420],
+      "size": [240, 88],
+      "sources": [{ "path": "gasket/gasket-cli/src/main.rs", "label": "REPL 主循环" }]
+    },
+    {
+      "id": "mcp",
+      "type": "external",
+      "label": "MCP 服务器",
+      "sublabel": "stdio · Streamable HTTP",
+      "tag": "mcp.json",
+      "pos": [810, 420],
+      "size": [240, 88],
+      "sources": [{ "path": "gasket/gasket-host/src/mcp.rs", "label": "McpBridge" }]
+    },
+    {
+      "id": "events",
+      "type": "database",
+      "label": "events.jsonl",
+      "sublabel": "append-only 事件日志",
+      "tag": "~/.gasket/sessions",
+      "pos": [1190, 420],
+      "size": [240, 88],
+      "sources": [{ "path": "gasket/gasket-core/src/storage/mod.rs", "line": 323, "label": "EventStorage" }]
+    },
+    {
+      "id": "ext",
+      "type": "backend",
+      "label": "gasket-ext",
+      "sublabel": "hello · todo · search · gate",
+      "tag": "进程内扩展 · 可选",
+      "pos": [1350, 640],
+      "size": [240, 88],
+      "sources": [{ "path": "gasket/gasket-ext/src/lib.rs", "label": "register_all" }]
+    }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "本地会话状态 ~/.gasket", "wraps": ["events"] }
+  ],
+  "connections": [
+    { "id": "fe-gw", "from": "web", "to": "gateway", "label": "WS /ws · REST /api", "variant": "emphasis" },
+    { "id": "gw-host", "from": "gateway", "to": "host", "label": "内联 run_turn" },
+    { "id": "fe-host-ipc", "from": "web", "to": "host", "label": "Tauri IPC · 桌面进程内", "variant": "dashed", "fromSide": "top", "toSide": "top" },
+    { "id": "cli-host", "from": "cli", "to": "host", "label": "run_turn + on_event" },
+    { "id": "host-core", "from": "host", "to": "core", "label": "prepare_turn · 注入", "variant": "emphasis" },
+    { "id": "core-llm", "from": "core", "to": "llm", "label": "SSE 流式" },
+    { "id": "host-mcp", "from": "host", "to": "mcp", "label": "tools/list · tools/call", "fromSide": "bottom", "toSide": "top" },
+    { "id": "host-events", "from": "host", "to": "events", "label": "open · derive_messages" },
+    { "id": "core-events", "from": "core", "to": "events", "label": "persist 逐事件追加", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ext-core", "from": "ext", "to": "core", "label": "注册工具 + Hook", "fromSide": "top", "toSide": "bottom" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "严格分层",
+      "items": [
+        "core 是无状态纯内核:agent loop 只认注入的 StreamFn 接缝",
+        "host 持有全部状态,同一 run_turn 驱动 CLI 与网关",
+        "gateway 与 cli 是两种前端壳,gateway 另托管 web/dist 静态资源"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "事件溯源日志",
+      "items": [
+        "events.jsonl 是唯一真相源:Assistant 与 ToolResult 逐事件追加",
+        "历史每轮 derive_messages 现派生,压缩只缩内存不改盘",
+        "usage 随 Assistant 事件持久化,token 预算跨重启恢复"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "安全与扩展",
+      "items": [
+        "三档权限模式 × 工具风险分级,before/after 双 Hook 拦截",
+        "gasket-ext 进程内注册工具与 Hook,无需改内核",
+        "MCP 服务器与 spawn_subagents 子 agent 编排扩展能力边界"
+      ]
+    }
+  ]
+}

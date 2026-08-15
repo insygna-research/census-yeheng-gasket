@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "gasket 生产部署拓扑",
+    "output": "docs/diagrams/deployment.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/YeHeng/gasket",
+      "revision": "0a97189bf80b9b37b702c796a5c6de4eabbef708"
+    },
+    "viewBox": [1240, 640],
+    "views": [
+      { "id": "ingress", "label": "入口链路", "focus": ["user", "gw", "dist"], "note": "浏览器经 :3000 访问网关与静态前端。" },
+      { "id": "state", "label": "会话状态", "focus": ["gw", "gdir"], "note": "会话真相源在容器内 ~/.gasket。" },
+      { "id": "egress", "label": "出站链路", "focus": ["gw", "llm", "proxy"], "note": "LLM API 必配,出站代理可选。" }
+    ]
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户浏览器",
+      "sublabel": "http://<host>:3000",
+      "pos": [60, 260],
+      "size": [200, 80]
+    },
+    {
+      "id": "dist",
+      "type": "frontend",
+      "label": "web/dist 静态资源",
+      "sublabel": "SPA 回退 index.html",
+      "tag": "GASKET_GATEWAY_STATIC_DIR",
+      "pos": [470, 100],
+      "size": [260, 80],
+      "sources": [{ "path": "Dockerfile", "line": 105, "label": "构建产物 COPY" }]
+    },
+    {
+      "id": "gw",
+      "type": "backend",
+      "label": "gasket-gateway",
+      "sublabel": "WS + REST · EXPOSE 3000",
+      "tag": "单二进制 ENTRYPOINT",
+      "pos": [470, 250],
+      "size": [260, 96],
+      "sources": [{ "path": "Dockerfile", "line": 102, "label": "release 二进制" }]
+    },
+    {
+      "id": "gdir",
+      "type": "database",
+      "label": "~/.gasket",
+      "sublabel": "sessions/ · mcp.json",
+      "tag": "容器内 /root/.gasket",
+      "pos": [470, 430],
+      "size": [260, 80],
+      "sources": [{ "path": "Dockerfile", "line": 108, "label": "配置目录" }]
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "LLM API",
+      "sublabel": "GASKET_LLM_BASE_URL / KEY / MODEL / API",
+      "pos": [950, 160],
+      "size": [230, 96],
+      "sources": [{ "path": "gasket/.env.example", "label": "必填连接配置" }]
+    },
+    {
+      "id": "proxy",
+      "type": "external",
+      "label": "出站代理(可选)",
+      "sublabel": "GASKET_TOOL_PROXY / GASKET_LLM_PROXY",
+      "pos": [950, 400],
+      "size": [230, 80]
+    }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Docker 容器 gasket(debian:bookworm-slim)", "wraps": ["dist", "gw", "gdir"] }
+  ],
+  "connections": [
+    { "id": "user-gw", "from": "user", "to": "gw", "label": "HTTP :3000 · WS /ws", "variant": "emphasis" },
+    { "id": "gw-dist", "from": "gw", "to": "dist", "label": "托管 · SPA 回退", "fromSide": "top", "toSide": "bottom" },
+    { "id": "gw-gdir", "from": "gw", "to": "gdir", "label": "events.jsonl 读写", "fromSide": "bottom", "toSide": "top", "labelDy": 26 },
+    { "id": "gw-llm", "from": "gw", "to": "llm", "label": "SSE · 443 出站" },
+    { "id": "gw-proxy", "from": "gw", "to": "proxy", "label": "可选出站代理", "variant": "dashed", "fromSide": "right", "toSide": "left" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "单容器交付",
+      "items": [
+        "多阶段构建:Vue 前端与 Rust 网关打进同一镜像",
+        "一个进程既是 WS/REST 后端,又托管前端静态资源",
+        "docker run -p 3000:3000 即完成部署"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "配置面",
+      "items": [
+        "LLM 连接四项必填:BASE_URL / KEY / MODEL / API",
+        "网关旋钮:端口、模式、静态目录均为环境变量",
+        "无数据库依赖:全部状态是文件"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "数据与出站",
+      "items": [
+        "会话真相源在容器内 ~/.gasket,重建容器需挂载卷保留",
+        "LLM 流量直连或走 GASKET_LLM_PROXY",
+        "工具出站流量独立走 GASKET_TOOL_PROXY,两条代理互不影响"
+      ]
+    }
+  ]
+}

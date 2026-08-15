@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "gasket Agent Loop 完整时序",
+    "output": "docs/diagrams/agent-loop.sequence.html",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1500, 1070],
+    "views": [
+      { "id": "full-turn", "label": "完整一轮", "focus": ["fe", "host", "loop", "store", "llm", "hooks", "tool"], "note": "从用户消息到 done 的完整时间线。" },
+      { "id": "llm-phase", "label": "LLM 推理", "focus": ["loop", "llm", "fe"], "note": "流式调用与增量渲染,含工具结果回喂。" },
+      { "id": "tool-phase", "label": "工具与审批", "focus": ["loop", "hooks", "tool", "fe"], "note": "verdict 裁决、人工审批与结果改写。" },
+      { "id": "log-phase", "label": "事件落盘", "focus": ["host", "loop", "store"], "note": "append-only 日志是唯一真相源。" }
+    ]
+  },
+  "participants": [
+    { "id": "fe", "type": "external", "label": "前端", "sublabel": "Web / CLI / Tauri" },
+    { "id": "host", "type": "backend", "label": "gasket-host", "sublabel": "Host::run_turn" },
+    { "id": "loop", "type": "backend", "label": "agent_loop", "sublabel": "gasket-core · 无状态" },
+    { "id": "store", "type": "database", "label": "EventStorage", "sublabel": "events.jsonl" },
+    { "id": "llm", "type": "external", "label": "LLM Provider", "sublabel": "StreamFn · SSE" },
+    { "id": "hooks", "type": "security", "label": "Hook + 权限", "sublabel": "before / after" },
+    { "id": "tool", "type": "backend", "label": "工具", "sublabel": "read / bash / grep …" }
+  ],
+  "segments": [
+    { "from": 150, "to": 285, "label": "轮次开启" },
+    { "from": 310, "to": 475, "label": "第 1 轮 LLM 推理" },
+    { "from": 480, "to": 805, "label": "工具调用 · 审批" },
+    { "from": 815, "to": 1015, "label": "第 2 轮 · 收尾" }
+  ],
+  "messages": [
+    { "id": "m01-send", "from": "fe", "to": "host", "y": 170, "label": "用户消息(WS / REPL)", "variant": "emphasis" },
+    { "id": "m02-open", "from": "host", "to": "store", "y": 204, "label": "append TurnStart + User", "note": "日志是唯一真相源,用户消息先于循环落盘" },
+    { "id": "m03-derive", "from": "host", "to": "store", "y": 238, "label": "读日志 · derive_messages" },
+    { "id": "m04-history", "from": "store", "to": "host", "y": 270, "label": "history + 尾部 usage", "variant": "return" },
+    { "id": "m05-run", "from": "host", "to": "loop", "y": 304, "label": "run_agent_loop(turn inputs)", "variant": "emphasis", "note": "prepare_turn 注入 stream_fn 与 persist 回调" },
+    { "id": "m06-call1", "from": "loop", "to": "llm", "y": 348, "label": "stream(model, messages, tools)", "variant": "emphasis" },
+    { "id": "m07-delta", "from": "llm", "to": "loop", "y": 382, "label": "SSE 增量:Text / ToolCall / Thinking", "variant": "return" },
+    { "id": "m08-render", "from": "loop", "to": "fe", "y": 414, "label": "on_event 流式渲染", "variant": "dashed", "note": "经 host 的 on_event 回调转发 → WS / 终端" },
+    { "id": "m09-persist-a", "from": "loop", "to": "store", "y": 446, "label": "persist Assistant{message, usage}", "note": "崩溃安全:先于本消息内任何工具执行落盘" },
+    { "id": "m10-before", "from": "loop", "to": "hooks", "y": 490, "label": "before_tool_call(name, args, risk)", "variant": "security", "note": "stop_reason = ToolUse → 进入工具阶段" },
+    { "id": "m11-approve", "from": "hooks", "to": "fe", "y": 522, "label": "approval_request(高风险)", "variant": "dashed", "note": "权限模式要求审批时才触发,oneshot 挂起等待" },
+    { "id": "m12-resp", "from": "fe", "to": "hooks", "y": 554, "label": "approval_response", "variant": "dashed" },
+    { "id": "m13-verdict", "from": "hooks", "to": "loop", "y": 586, "label": "Allow / Block / Modify", "variant": "return", "note": "首个 Block 获胜;否则末个 Modify;默认 Allow" },
+    { "id": "m14-exec", "from": "loop", "to": "tool", "y": 624, "label": "execute(tool_call)", "variant": "emphasis" },
+    { "id": "m15-tres", "from": "tool", "to": "loop", "y": 656, "label": "ToolResult", "variant": "return" },
+    { "id": "m16-after", "from": "loop", "to": "hooks", "y": 688, "label": "after_tool_call(脱敏 / 改写)", "note": "同步纯变换,可替换结果" },
+    { "id": "m17-ares", "from": "hooks", "to": "loop", "y": 720, "label": "最终 ToolResult", "variant": "return" },
+    { "id": "m18-persist-t", "from": "loop", "to": "store", "y": 752, "label": "persist ToolResult", "note": "定稿即落盘,写序 == 执行序;Block 则跳过执行直接落盘" },
+    { "id": "m19-tev", "from": "loop", "to": "fe", "y": 784, "label": "tool_start / tool_end 事件", "variant": "dashed" },
+    { "id": "m20-call2", "from": "loop", "to": "llm", "y": 820, "label": "stream(messages + ToolResult)", "note": "工具结果回喂,再问 LLM" },
+    { "id": "m21-final", "from": "llm", "to": "loop", "y": 852, "label": "文本增量 · stop_reason=EndTurn", "variant": "return" },
+    { "id": "m22-persist-f", "from": "loop", "to": "store", "y": 884, "label": "persist Assistant(最终回答)" },
+    { "id": "m23-ret", "from": "loop", "to": "host", "y": 916, "label": "AgentEnd · 新增消息", "variant": "return" },
+    { "id": "m24-te", "from": "host", "to": "store", "y": 948, "label": "append TurnEnd{reason}", "note": "成功 / 失败 / 中止皆落盘" },
+    { "id": "m25-done", "from": "host", "to": "fe", "y": 980, "label": "done{usage_in, usage_out, elapsed}", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "host", "from": 165, "to": 988, "type": "backend" },
+    { "participant": "loop", "from": 299, "to": 921, "type": "backend" },
+    { "participant": "store", "from": 199, "to": 274, "type": "database" },
+    { "participant": "store", "from": 441, "to": 451, "type": "database" },
+    { "participant": "store", "from": 747, "to": 757, "type": "database" },
+    { "participant": "store", "from": 879, "to": 953, "type": "database" },
+    { "participant": "llm", "from": 343, "to": 386, "type": "external" },
+    { "participant": "llm", "from": 815, "to": 856, "type": "external" },
+    { "participant": "hooks", "from": 485, "to": 590, "type": "security" },
+    { "participant": "hooks", "from": 683, "to": 724, "type": "security" },
+    { "participant": "tool", "from": 619, "to": 660, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "无状态循环",
+      "items": [
+        "agent_loop 是纯函数:状态全部由 host 持有",
+        "内核只认注入的 StreamFn,不绑定具体厂商",
+        "max_turns 上限 + signal 协作式中止,返回已累积的部分转录"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "事件溯源落盘",
+      "items": [
+        "Assistant(含 usage)先于工具执行落盘,崩溃不丢已发生事实",
+        "每个 ToolResult 定稿即 persist,写序 == 执行序",
+        "TurnEnd{reason} 永远落盘,不存在静默的半截对话"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "审批与 Hook",
+      "items": [
+        "before_tool_call 异步裁决:Allow / Block / Modify",
+        "高风险工具经前端人工审批,oneshot + cancel + 超时三路等待",
+        "after_tool_call 同步改写结果,如脱敏与截断"
+      ]
+    }
+  ]
+}

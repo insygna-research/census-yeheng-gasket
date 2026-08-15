@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "gasket 上下文压缩流程",
+    "output": "docs/diagrams/context-compaction.workflow.html",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "token-path", "label": "Token 感知主路径", "focus": ["log", "derive", "check", "keep"], "note": "每轮从日志派生、判定、按原子组压缩后喂入。" },
+      { "id": "bypass", "label": "未超阈值", "focus": ["check", "keep"], "note": "绝大多数轮次原样喂入,零损耗。" },
+      { "id": "fallback", "label": "条数兜底", "focus": ["check", "bycount", "keep"], "note": "无 usage 数据时的第二触发器,同一算法。" }
+    ]
+  },
+  "lanes": [
+    { "id": "host", "label": "run_turn · 每轮" },
+    { "id": "fallback", "label": "兜底触发" }
+  ],
+  "phases": [
+    { "id": "ph-source", "label": "日志派生", "fromCol": 0, "toCol": 1 },
+    { "id": "ph-decide", "label": "阈值判定", "fromCol": 3, "toCol": 3, "variant": "emphasis" },
+    { "id": "ph-compact", "label": "原子组压缩", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["log", "derive", "check", "keep"],
+  "nodes": [
+    { "id": "log", "lane": "host", "col": 0, "type": "database", "label": "events.jsonl", "sublabel": "append-only" },
+    { "id": "derive", "lane": "host", "col": 1, "type": "backend", "label": "纯投影", "sublabel": "derive_messages" },
+    { "id": "check", "lane": "host", "col": 3, "type": "backend", "label": "预算判定", "sublabel": "ContextBudget" },
+    { "id": "keep", "lane": "host", "col": 5, "type": "backend", "label": "压缩后喂 LLM", "sublabel": "贪心保留 · 前置提示", "tag": "留至 50%" },
+    { "id": "bycount", "lane": "fallback", "col": 4, "type": "backend", "label": "条数兜底", "sublabel": "compact_by_count" }
+  ],
+  "edges": [
+    { "id": "e-load", "from": "log", "to": "derive", "label": "load_events", "role": "main", "labelDy": 44 },
+    { "id": "e-history", "from": "derive", "to": "check", "label": "全量 history", "role": "main", "labelDy": 44 },
+    { "id": "e-over", "from": "check", "to": "keep", "label": "超 80% · 原子组取舍", "role": "main", "variant": "emphasis", "labelDy": 44 },
+    { "id": "e-under", "from": "check", "to": "keep", "label": "未超阈值原样喂入", "role": "branch", "variant": "dashed", "route": "up-channel", "channelY": 30, "labelDy": 18 },
+    { "id": "e-nousage", "from": "check", "to": "bycount", "label": "无 usage 数据", "role": "branch", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelDy": 30 },
+    { "id": "e-share", "from": "bycount", "to": "keep", "label": "同一贪心算法", "role": "main", "fromSide": "right", "toSide": "bottom", "labelDy": 26 }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "只缩内存,不改盘",
+      "items": [
+        "events.jsonl 永远 append-only,压缩只作用于本轮喂给 LLM 的 history",
+        "无 LLM 摘要:丢弃最旧整组 + 一条前置提示,不调模型",
+        "usage 随 Assistant 事件持久化,预算跨重启存活"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "一套算法,两个触发器",
+      "items": [
+        "token 感知为主:超 window 的 80% 触发,压到 50%",
+        "80% → 50% 的滞后带避免阈值附近反复压缩",
+        "无 usage 时按条数兜底,复用同一 compact_by_count"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "协议安全",
+      "items": [
+        "原子组保证 Assistant(tool_call) 永不与 ToolResult 分离",
+        "孤儿 tool_result 会触发 provider 协议错误,原子组从结构上杜绝",
+        "无 tokenizer:不假装建模 per-message token 成本"
+      ]
+    }
+  ]
+}

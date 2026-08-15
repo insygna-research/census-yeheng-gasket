@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "gasket WebSocket 连接时序",
+    "output": "docs/diagrams/ws-connection.sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [1500, 1120],
+    "views": [
+      { "id": "conn", "label": "连接与会话", "focus": ["fe", "gw"], "note": "每条 WS 连接即一个会话。" },
+      { "id": "turn", "label": "一轮对话", "focus": ["fe", "gw", "host"], "note": "内联 run_turn 与事件推流,busy 回执。" },
+      { "id": "approval", "label": "审批往返", "focus": ["host", "reg", "gw", "fe"], "note": "oneshot 三路等待的人工决策回路。" },
+      { "id": "cancel", "label": "取消与收尾", "focus": ["fe", "gw", "host"], "note": "双通道取消与 done 推送。" }
+    ]
+  },
+  "participants": [
+    { "id": "fe", "type": "external", "label": "前端", "sublabel": "浏览器 / Tauri" },
+    { "id": "gw", "type": "backend", "label": "网关", "sublabel": "每连接一会话" },
+    { "id": "host", "type": "backend", "label": "Host", "sublabel": "run_turn 内联" },
+    { "id": "reg", "type": "security", "label": "审批登记", "sublabel": "ApprovalRegistry" }
+  ],
+  "segments": [
+    { "from": 150, "to": 260, "label": "连接建立" },
+    { "from": 285, "to": 505, "label": "一轮对话" },
+    { "from": 530, "to": 760, "label": "审批往返" },
+    { "from": 785, "to": 1010, "label": "取消与收尾" }
+  ],
+  "messages": [
+    { "id": "w01-upgrade", "from": "fe", "to": "gw", "y": 180, "label": "WS 升级 /ws?user_id=<chatId>", "variant": "emphasis", "note": "open_or_migrate:日志损坏则拒绝连接" },
+    { "id": "w02-ready", "from": "gw", "to": "fe", "y": 220, "label": "会话就绪 · 历史可派生", "variant": "return" },
+    { "id": "w03-msg", "from": "fe", "to": "gw", "y": 300, "label": "{\"type\":\"message\",\"content\":…}", "variant": "emphasis", "note": "trace_id 关联本轮" },
+    { "id": "w04-run", "from": "gw", "to": "host", "y": 338, "label": "run_turn(user_msg)" },
+    { "id": "w05-events", "from": "host", "to": "gw", "y": 376, "label": "on_event(AgentEvent) 流", "variant": "return", "note": "thinking / content / tool_start…" },
+    { "id": "w06-push", "from": "gw", "to": "fe", "y": 414, "label": "事件 JSON 推送", "variant": "dashed", "note": "单一 WireEvent 有序通道 + 单写者任务" },
+    { "id": "w07-second", "from": "fe", "to": "gw", "y": 460, "label": "{\"type\":\"message\"}(进行中再发)", "variant": "dashed" },
+    { "id": "w08-busy", "from": "gw", "to": "fe", "y": 494, "label": "busy 回执", "variant": "dashed", "note": "区别于 error:前端弹 toast,不清状态" },
+    { "id": "w09-wait", "from": "host", "to": "reg", "y": 560, "label": "wait_for_decision 挂起", "variant": "security", "note": "before_tool_call 需人工决策" },
+    { "id": "w10-req1", "from": "reg", "to": "gw", "y": 598, "label": "approval_request" },
+    { "id": "w11-req2", "from": "gw", "to": "fe", "y": 634, "label": "approval_request{id,tool,args}", "variant": "dashed" },
+    { "id": "w12-resp", "from": "fe", "to": "gw", "y": 672, "label": "approval_response{approved,remember}", "variant": "dashed" },
+    { "id": "w13-wake", "from": "gw", "to": "reg", "y": 708, "label": "oneshot 发送决策" },
+    { "id": "w14-verdict", "from": "reg", "to": "host", "y": 744, "label": "Allow / Block", "variant": "return" },
+    { "id": "w15-cancel", "from": "fe", "to": "gw", "y": 810, "label": "{\"type\":\"cancel\"}", "note": "select! 多路复用入站" },
+    { "id": "w16-signal", "from": "gw", "to": "host", "y": 848, "label": "signal 置位 · watch 解锁", "note": "双通道取消费,防闩锁毒化" },
+    { "id": "w17-partial", "from": "host", "to": "gw", "y": 888, "label": "部分转录 · TurnEnd{Aborted}", "variant": "return" },
+    { "id": "w18-done", "from": "gw", "to": "fe", "y": 928, "label": "done{usage_in,usage_out,elapsed_ms}", "variant": "return" },
+    { "id": "w19-close", "from": "fe", "to": "gw", "y": 968, "label": "连接关闭", "variant": "dashed", "note": "连接即会话:关闭即结束本轮生命周期" }
+  ],
+  "activations": [
+    { "participant": "gw", "from": 175, "to": 975, "type": "backend" },
+    { "participant": "host", "from": 333, "to": 893, "type": "backend" },
+    { "participant": "reg", "from": 555, "to": 748, "type": "security" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "连接模型",
+      "items": [
+        "每条 WS 连接 = 一个独立会话,chatId 即 user_id",
+        "打开会话即迁移旧日志,损坏日志拒绝连接而非静默重启",
+        "所有出站事件经单一有序通道,单写者保证跨流顺序"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "审批往返",
+      "items": [
+        "ApprovalRegistry 用 oneshot + cancel + 超时三路 select 等待",
+        "approval_request 不会越过它所属的 tool_start",
+        "remember 缓存让同类调用免于重复询问"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "取消与回执语义",
+      "items": [
+        "cancel 置 AtomicBool 中止循环,同时用 watch 解锁挂起审批",
+        "busy 是进行中再发的回执,与 error 的清状态语义不同",
+        "done 携带累计 token 用量与耗时,总是最后一条"
+      ]
+    }
+  ]
+}
