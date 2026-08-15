@@ -441,6 +441,19 @@ impl McpBridge {
 
 // ── Streamable HTTP transport ───────────────────────────────────
 
+/// Proxy for remote MCP traffic: the tool-proxy system first (runtime
+/// override > `GASKET_TOOL_PROXY`), then the legacy LLM-proxy env chain for
+/// backward compatibility. Direct connection when none is set.
+fn pick_mcp_proxy(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Option<String> {
+    if let Some(p) = gasket_core::tool_proxy() {
+        return Some(p);
+    }
+    ["GASKET_LLM_PROXY", "HTTPS_PROXY", "https_proxy"]
+        .iter()
+        .find_map(|k| lookup(k).ok().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+}
+
 /// One long-lived MCP HTTP client. Each tool's `execute` closure holds an
 /// `Arc<McpHttpClient>`; calls are stateless POSTs to the server URL.
 pub struct McpHttpClient {
@@ -463,11 +476,9 @@ impl McpHttpClient {
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(false);
-        // Proxy support: respect GASKET_LLM_PROXY / HTTPS_PROXY for remote MCP servers.
-        if let Ok(proxy_url) = std::env::var("GASKET_LLM_PROXY")
-            .or_else(|_| std::env::var("HTTPS_PROXY"))
-            .or_else(|_| std::env::var("https_proxy"))
-        {
+        // Proxy support: tool-proxy system (override > GASKET_TOOL_PROXY)
+        // first, then the legacy GASKET_LLM_PROXY / HTTPS_PROXY env chain.
+        if let Some(proxy_url) = pick_mcp_proxy(&|k| std::env::var(k)) {
             if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
                 builder = builder.proxy(proxy);
             }
@@ -1179,5 +1190,47 @@ for line in sys.stdin:
             result.content.len()
         );
         drop(bridge);
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    /// Serializes these tests: they touch the process-global tool-proxy
+    /// override (gasket-core's own test lock is pub(crate), unavailable here).
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
+    #[test]
+    fn tool_proxy_wins_over_legacy_env() {
+        let _g = LOCK.lock().unwrap();
+        gasket_core::set_tool_proxy(Some("socks5://tool:1080")).unwrap();
+        assert_eq!(
+            pick_mcp_proxy(&fake_env(&[
+                ("GASKET_TOOL_PROXY", "socks5://tool:1080"),
+                ("GASKET_LLM_PROXY", "http://llm:8080"),
+            ])),
+            Some("socks5://tool:1080".to_string())
+        );
+        gasket_core::set_tool_proxy(None).unwrap();
+    }
+
+    #[test]
+    fn legacy_llm_proxy_still_works() {
+        let _g = LOCK.lock().unwrap();
+        gasket_core::set_tool_proxy(None).unwrap();
+        assert_eq!(
+            pick_mcp_proxy(&fake_env(&[("GASKET_LLM_PROXY", "http://llm:8080")])),
+            Some("http://llm:8080".to_string())
+        );
+        assert_eq!(pick_mcp_proxy(&fake_env(&[])), None);
     }
 }
