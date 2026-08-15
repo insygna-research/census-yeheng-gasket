@@ -128,7 +128,6 @@ fn get_app_config() -> Result<Option<serde_json::Value>, String> {
 /// frontend, so a blocking std::fs write is noise.
 #[tauri::command]
 fn set_app_config(config: serde_json::Value) -> Result<(), String> {
-  let proxy = apply_proxy_from_config(&config);
   let path = app_config_path();
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -137,7 +136,21 @@ fn set_app_config(config: serde_json::Value) -> Result<(), String> {
   let tmp = path.with_extension("json.tmp");
   std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
   std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-  proxy
+  // Apply only after the write succeeded, so runtime state can never
+  // diverge from what is persisted.
+  apply_proxy_from_config(&config)
+}
+
+/// Check a proxy URL against the same validation `set_tool_proxy` uses,
+/// without installing it. The dialog calls this before saving so a bad
+/// URL fails in the UI, not in a console.warn.
+#[tauri::command]
+fn validate_proxy(url: String) -> Result<(), String> {
+  let url = url.trim();
+  if url.is_empty() {
+    return Ok(()); // clearing is always valid
+  }
+  gasket_core::validate_tool_proxy(url)
 }
 
 /// Delete the session's on-disk data wholesale (event log + meta sidecar).
@@ -179,6 +192,7 @@ pub fn run() {
       chat::get_context,
       get_app_config,
       set_app_config,
+      validate_proxy,
     ])
     .setup(|app| {
       if let Ok(Some(config)) = get_app_config() {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
 import { Ban, Check, Globe, X } from 'lucide-vue-next';
 import { Input } from '@/components/ui/input';
 import { readString, storageKeys, writeString } from '@/lib/storage';
@@ -25,11 +26,22 @@ watch(
 const PROXY_RE = /^(https?|socks5h?):\/\/\S+$/i;
 const trimmed = computed(() => url.value.trim());
 
-const save = () => {
+const save = async () => {
   const value = trimmed.value;
   if (value && !PROXY_RE.test(value)) {
     error.value = 'URL must start with http://, https://, socks5:// or socks5h://';
     return;
+  }
+  // Authoritative validation lives in the backend (it accepts/rejects the
+  // same URLs set_tool_proxy would); this regex is only the browser-mode
+  // fallback. A rejected URL must surface here, not in a console.warn.
+  if (isTauri && value) {
+    try {
+      await invoke('validate_proxy', { url: value });
+    } catch (e) {
+      error.value = String(e);
+      return;
+    }
   }
   writeString(storageKeys.proxy, value);
   emit('close');

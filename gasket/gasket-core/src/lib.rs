@@ -17,7 +17,7 @@ pub mod types;
 pub use agent_loop::{agent_loop, run_agent_loop};
 pub use error::{AgentError, ToolError};
 pub use extension::{ExtensionApi, ExtensionApiImpl};
-pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy};
+pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
 pub use storage::{is_valid_session_id, EventStorage, JsonlStorage, SessionMeta};
 pub use subagent::{

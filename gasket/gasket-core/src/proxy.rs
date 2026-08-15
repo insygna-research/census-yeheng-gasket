@@ -23,7 +23,7 @@ pub fn set_tool_proxy(url: Option<&str>) -> Result<(), String> {
       Ok(())
     }
     Some(url) => {
-      validate(url)?;
+      validate_tool_proxy(url)?;
       *OVERRIDE.write().unwrap() = Some(url.to_string());
       Ok(())
     }
@@ -47,7 +47,9 @@ fn resolve_with(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> 
     .filter(|s| !s.is_empty())
 }
 
-fn validate(url: &str) -> Result<(), String> {
+/// Validate a proxy URL without installing it. Single source of truth for
+/// what a valid tool proxy is — hosts (desktop UI) call this before saving.
+pub fn validate_tool_proxy(url: &str) -> Result<(), String> {
   let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
   if !ALLOWED_SCHEMES.contains(&scheme.as_str()) {
     return Err(format!(
@@ -121,14 +123,14 @@ mod tests {
       "SOCKS5://127.0.0.1:1080",
       "http://user:pass@proxy:8080",
     ] {
-      assert!(validate(url).is_ok(), "should accept {url}");
+      assert!(validate_tool_proxy(url).is_ok(), "should accept {url}");
     }
   }
 
   #[test]
   fn validation_rejects_bad_input() {
     for url in ["", "  ", "ftp://proxy:21", "127.0.0.1:8080", "http://"] {
-      assert!(validate(url).is_err(), "should reject '{url}'");
+      assert!(validate_tool_proxy(url).is_err(), "should reject '{url}'");
     }
   }
 

@@ -87,6 +87,8 @@ cd web && pnpm install && pnpm dev
 桌面版在顶栏 Globe 按钮中配置代理,优先级高于该环境变量;保存后下一次工具调用即生效,无需重启。该代理不影响 LLM API 请求(那部分继续用上面的 `GASKET_LLM_PROXY` 系列)。
 点击 Disable 时若设置了 GASKET_TOOL_PROXY 则回退到该环境变量，而非直连。
 
+注意 fail-open 语义:`GASKET_TOOL_PROXY` 里的无效 URL(拼错、不支持 scheme)不会报错中断,只会打一条 warn 日志然后**静默回退直连**。桌面版 UI 保存时会做完整校验,坏值进不了配置;环境变量没有这道关卡,若你在意"绝不经由直连暴露流量"(例如绕封锁场景),请自行确认该变量值有效。
+
 ---
 
 ## 4. 运行后端
