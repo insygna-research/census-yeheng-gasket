@@ -346,6 +346,25 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 设置 `GASKET_SANDBOX=1` 后,`bash` 工具的命令在操作系统级文件系统沙箱中执行:macOS 使用 `sandbox-exec`(Seatbelt,系统自带);Linux 使用 Landlock,要求以 `--features sandbox-landlock` 构建否则 `GASKET_SANDBOX=1` fail-closed 并附带 rebuild 提示。写操作仅允许在当前工作目录、`TMPDIR` 与 `/var/tmp` 内,其余路径只读。未设置时行为完全不变。沙箱是 fail-closed 的:如果隔离无法施加(如 Windows、或不支持 Landlock 的内核),命令会被直接拒绝并返回错误,而不是降级放行。
 
+### 9.7 Skills(可选)
+
+技能是磁盘上的 Markdown 指令文件。启动时 gasket 只把「名称 + 描述 + 文件路径」目录追加到系统提示;模型需要某个技能时,用 `read` 工具按目录给出的路径读取全文。全文不进入系统提示,不占用上下文预算。子代理(subagent)提示不参与技能目录。
+
+两个存放位置(同名时项目覆盖全局):
+
+- 全局:`~/.gasket/skills/*.md`(绝对路径,`read` 已允许读取 `~/.gasket` 内的绝对路径)
+- 项目:`<项目根>/.gasket/skills/*.md`
+
+文件必须以 YAML frontmatter 开头,`name` 与 `description` 缺一不可,否则该文件被跳过并在日志告警。文件需使用 LF(Unix)换行符——CRLF 文件无法通过严格的 `---\n` frontmatter 校验,同样会被跳过并在日志告警。示例 `~/.gasket/skills/commit-style.md`:
+
+```markdown
+---
+name: commit-style
+description: Enforce conventional commit messages with scope
+---
+Write commit titles as `type(scope): summary`, lowercase, imperative mood...
+```
+
 ---
 
 ## 10. 环境变量完整参考
