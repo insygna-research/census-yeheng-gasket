@@ -45,6 +45,11 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         c.arg("-c").arg(command);
         c
     };
+    if super::sandbox::sandbox_enabled(&ctx.ctx.env) {
+        if let Err(e) = super::sandbox::confine(&mut cmd, &ctx.ctx.cwd) {
+            return Ok(ToolResult::error(e));
+        }
+    }
     cmd.current_dir(&ctx.ctx.cwd);
     cmd.env_clear();
     // Don't leak gasket's own config/secrets (e.g. GASKET_LLM_KEY) into
@@ -223,5 +228,76 @@ mod tests {
             !alive,
             "child {pid} survived the timeout — kill_on_drop not effective"
         );
+    }
+
+    async fn run_with_env(
+        args: serde_json::Value,
+        cwd: &std::path::Path,
+        env: std::collections::HashMap<String, String>,
+    ) -> ToolResult {
+        let t = tool();
+        (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env,
+                session_id: "s".into(),
+                state_dir: cwd.to_path_buf(),
+                spawner: None,
+            },
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Sandbox lets us write inside cwd but not outside it. Only meaningful where
+    /// confinement is real (macOS seatbelt); Linux lands in Task 3, Windows refuses.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_blocks_writes_outside_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
+        env.insert("GASKET_SANDBOX".to_string(), "1".to_string());
+
+        // write inside cwd -> allowed
+        let r = run_with_env(
+            serde_json::json!({"command": "echo x > inside.txt"}),
+            cwd.path(),
+            env.clone(),
+        )
+        .await;
+        assert!(!r.is_error, "write in cwd must pass: {:?}", r.details);
+        assert!(cwd.path().join("inside.txt").exists());
+
+        // write outside cwd -> refused by the seatbelt profile
+        let target = outside.path().join("f.txt");
+        let r = run_with_env(
+            serde_json::json!({"command": format!("echo x > {}", target.display())}),
+            cwd.path(),
+            env,
+        )
+        .await;
+        assert!(r.is_error, "write outside cwd must fail");
+        assert!(!target.exists(), "sandbox did not contain the write");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn no_sandbox_flag_no_behavior_change() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("f.txt");
+        let env: std::collections::HashMap<_, _> = std::env::vars().collect(); // no GASKET_SANDBOX
+        let r = run_with_env(
+            serde_json::json!({"command": format!("echo x > {}", target.display())}),
+            cwd.path(),
+            env,
+        )
+        .await;
+        assert!(!r.is_error, "sandbox off -> old behavior");
+        assert!(target.exists());
     }
 }

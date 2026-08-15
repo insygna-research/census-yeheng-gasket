@@ -51,6 +51,14 @@ regex = "1"
 # HTML parsing for the fetch tool
 dom_query = "0.28"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Opt-in Landlock backend for the bash tool (GASKET_SANDBOX=1).
+landlock = { version = "0.4", optional = true }
+
+[features]
+# Opt-in Linux sandbox backend; macOS (sandbox-exec) needs no dependency.
+sandbox-landlock = ["dep:landlock"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
