@@ -252,13 +252,17 @@ mod tests {
         .unwrap()
     }
 
-    /// Sandbox lets us write inside cwd but not outside it. Only meaningful where
-    /// confinement is real (macOS seatbelt); Linux lands in Task 3, Windows refuses.
+    /// Sandbox lets us write inside cwd but not outside the whitelist (cwd /
+    /// TMPDIR / /var/tmp). The "outside" dir must dodge $TMPDIR too — plain
+    /// tempdir() lands inside it, and the tmp whitelist is supposed to allow
+    /// exactly that. Only meaningful where confinement is real (macOS
+    /// seatbelt); Linux lands in Task 3, Windows refuses.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_blocks_writes_outside_cwd() {
         let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        // /tmp (-> /private/tmp) is NOT whitelisted; only /var/tmp is.
+        let outside = tempfile::tempdir_in("/tmp").unwrap();
         let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
         env.insert("GASKET_SANDBOX".to_string(), "1".to_string());
 
@@ -284,13 +288,67 @@ mod tests {
         assert!(!target.exists(), "sandbox did not contain the write");
     }
 
+    /// With GASKET_SANDBOX=1 the $TMPDIR whitelist must actually work: on macOS
+    /// /var and /tmp are symlinks (/private/var, /private/tmp) and Seatbelt
+    /// matches by resolved real path, so a literal subpath rule never fires.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_allows_writes_under_tmpdir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let target = std::env::temp_dir().join("gasket_sandbox_tmpdir_probe.txt");
+        let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
+        env.insert("GASKET_SANDBOX".to_string(), "1".to_string());
+        let r = run_with_env(
+            serde_json::json!({"command": format!("echo x > {}", target.display())}),
+            cwd.path(),
+            env,
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "write under temp_dir() must pass under the sandbox: {:?}",
+            r.details
+        );
+        assert!(target.exists(), "sandbox blocked the TMPDIR write");
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// Sandbox ON + short timeout: sandbox-exec execs the command in place
+    /// after applying the profile, so the timeout still kills the child.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_timeout_kills_wrapped_command() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
+        env.insert("GASKET_SANDBOX".to_string(), "1".to_string());
+        let start = std::time::Instant::now();
+        let r = run_with_env(
+            serde_json::json!({"command": "sleep 30", "timeout": 1}),
+            cwd.path(),
+            env,
+        )
+        .await;
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "must return at the 1s deadline, not after sleep 30"
+        );
+        assert!(r.is_error);
+        match &r.content[0] {
+            ContentBlock::Text { text } => assert!(text.contains("timed out"), "got: {text}"),
+            _ => panic!("expected text content"),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn no_sandbox_flag_no_behavior_change() {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("f.txt");
-        let env: std::collections::HashMap<_, _> = std::env::vars().collect(); // no GASKET_SANDBOX
+        let mut env: std::collections::HashMap<_, _> = std::env::vars().collect();
+        // Seal against the outer runner: `GASKET_SANDBOX=1 cargo test` must
+        // not flip this into the sandboxed path and false-fail the write.
+        env.remove("GASKET_SANDBOX");
         let r = run_with_env(
             serde_json::json!({"command": format!("echo x > {}", target.display())}),
             cwd.path(),

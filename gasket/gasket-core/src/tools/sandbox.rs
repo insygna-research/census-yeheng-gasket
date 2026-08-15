@@ -2,16 +2,18 @@
 //! Fail-closed: if confinement cannot be applied, the command is refused.
 
 /// Generate a Seatbelt (sandbox-exec) SBPL profile: allow everything broadly,
-/// deny file writes everywhere except cwd / tmp / var/tmp. Pure function.
+/// deny file writes everywhere except cwd / tmp / var/tmp. Pure function; the
+/// CALLER canonicalizes paths (Seatbelt matches by resolved real path, so a
+/// symlinked root like /var/tmp would never match as a literal).
 #[cfg(target_os = "macos")]
-fn seatbelt_profile(cwd: &str, tmp: &str) -> String {
+fn seatbelt_profile(cwd: &str, tmp: &str, var_tmp: &str) -> String {
     format!(
         "(version 1)\n\
          (allow default)\n\
          (deny file-write*)\n\
          (allow file-write* (subpath \"{cwd}\"))\n\
          (allow file-write* (subpath \"{tmp}\"))\n\
-         (allow file-write* (subpath \"/var/tmp\"))\n"
+         (allow file-write* (subpath \"{var_tmp}\"))\n"
     )
 }
 
@@ -33,8 +35,25 @@ pub(crate) fn confine(
         let cwd_c = cwd
             .canonicalize()
             .map_err(|e| format!("sandbox: cwd not accessible: {e}"))?;
+        // Premise: this whitelist is read from the PROCESS env on the
+        // assumption that hosts populate ToolContext.env from the process
+        // env (the child sees the filtered ctx env); a host building its
+        // own env map could diverge whitelist and the child's $TMPDIR.
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-        let profile = seatbelt_profile(&cwd_c.display().to_string(), &tmp);
+        // /var -> /private/var etc: canonicalize or the subpath rules
+        // never match Seatbelt's resolved-path checks. Unresolvable path
+        // (e.g. dangling TMPDIR) falls back to the literal unchanged.
+        let canon = |p: String| {
+            std::path::Path::new(&p)
+                .canonicalize()
+                .map(|c| c.display().to_string())
+                .unwrap_or(p)
+        };
+        let profile = seatbelt_profile(
+            &cwd_c.display().to_string(),
+            &canon(tmp),
+            &canon("/var/tmp".to_string()),
+        );
         let std_cmd = cmd.as_std_mut();
         let program = std_cmd.get_program().to_os_string();
         let args: Vec<_> = std_cmd.get_args().map(std::ffi::OsString::from).collect();
@@ -137,7 +156,7 @@ mod tests {
 
     #[test]
     fn profile_allows_read_execute_and_denies_write_by_default() {
-        let p = seatbelt_profile("/tmp/cwd", "/tmp/dir");
+        let p = seatbelt_profile("/tmp/cwd", "/tmp/dir", "/private/var/tmp");
         assert!(p.contains("(version 1)"), "{p}");
         assert!(p.contains("(allow default)"), "read/exec broadly: {p}");
         assert!(p.contains("(deny file-write*)"), "deny writes: {p}");
@@ -152,10 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_includes_var_tmp_unconditionally() {
-        let p = seatbelt_profile("/x", "/y");
+    fn profile_includes_var_tmp_as_passed() {
+        let p = seatbelt_profile("/x", "/y", "/private/var/tmp");
         assert!(
-            p.contains("(allow file-write* (subpath \"/var/tmp\"))"),
+            p.contains("(allow file-write* (subpath \"/private/var/tmp\"))"),
             "{p}"
         );
     }
