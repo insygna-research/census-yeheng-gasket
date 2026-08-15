@@ -178,3 +178,31 @@ export async function fetchSessionMessages(chatId: string): Promise<Message[] | 
     return null;
   }
 }
+
+/** Cross-session full-text search hit — the gateway REST route and the
+ * desktop Tauri command return the same shape (single engine, single
+ * SessionHit definition in gasket-host). */
+export interface SessionHit {
+  session_id: string;
+  /** Display name from the session's meta sidecar; null when unnamed. */
+  name?: string | null;
+  snippet: string;
+}
+
+/** Cross-session full-text search. Empty list on failure or no hits —
+ * callers render an empty result, not an error toast. */
+export async function searchSessions(q: string): Promise<SessionHit[]> {
+  try {
+    if (isTauri) {
+      return await invoke<SessionHit[]>('search_sessions', { query: q });
+    }
+    const res = await fetch(
+      `${backendBaseUrl()}/api/sessions/search?q=${encodeURIComponent(q)}`,
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.hits || [];
+  } catch {
+    return [];
+  }
+}
