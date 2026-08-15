@@ -58,7 +58,9 @@ pub(crate) fn spill_or_truncate(ctx: &crate::types::tool::ToolCallCtx, s: &str) 
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
-    let name = format!("{:012x}.txt", h.finish());
+    // u64 hashes to 16 hex digits; keep a fixed 12-char name by taking the
+    // leading 12 (an ASCII slice of a hex string is always char-safe).
+    let name = format!("{}.txt", &format!("{:016x}", h.finish())[..12]);
     let dir = ctx.ctx.state_dir.join("spill");
     let path = dir.join(&name);
     match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, s)) {
@@ -121,6 +123,38 @@ pub(crate) fn resolve_within_cwd(cwd: &Path, requested: &str) -> Result<PathBuf,
     } else {
         Ok(existing_canon.join(tail))
     }
+}
+
+/// Read-path policy: relative paths resolve within cwd (see
+/// [`resolve_within_cwd`]); absolute paths are allowed only under gasket's
+/// own config dir (`~/.gasket` — spill files and tool state live there).
+/// Anything else absolute is rejected: the cwd sandbox stays intact.
+pub(crate) fn resolve_read_path(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
+    resolve_read_path_in(cwd, &crate::storage::config_dir(), requested)
+}
+
+/// Testable core: `allowed_root` is injected (production uses the config dir).
+pub(crate) fn resolve_read_path_in(
+    cwd: &Path,
+    allowed_root: &Path,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let p = Path::new(requested);
+    if p.is_absolute() {
+        let root_canon = allowed_root
+            .canonicalize()
+            .map_err(|e| format!("allowed root not accessible: {e}"))?;
+        let canon = p
+            .canonicalize()
+            .map_err(|e| format!("path not accessible: {e}"))?;
+        if canon.starts_with(&root_canon) {
+            return Ok(canon);
+        }
+        return Err(format!(
+            "absolute paths outside the gasket config directory are not allowed: {requested}"
+        ));
+    }
+    resolve_within_cwd(cwd, requested)
 }
 
 /// Walk `path` up to the nearest ancestor that exists on disk. Returns that
@@ -249,6 +283,41 @@ mod tests {
         let big = "y".repeat(MAX_OUTPUT_BYTES + 100);
         let out = spill_or_truncate(&ctx, &big);
         assert!(out.ends_with("...(truncated)"), "{out}");
+    }
+
+    #[test]
+    fn read_path_allows_absolute_inside_allowed_root() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("spilled.txt");
+        std::fs::write(&file, "spilled").unwrap();
+        let resolved =
+            resolve_read_path_in(cwd.path(), root.path(), file.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn read_path_rejects_absolute_outside_allowed_root() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.txt");
+        std::fs::write(&file, "s3cr3t").unwrap();
+        let err =
+            resolve_read_path_in(cwd.path(), root.path(), file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("outside the gasket config directory"), "{err}");
+    }
+
+    #[test]
+    fn read_path_relative_still_sandboxed_to_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // Relative escape is rejected regardless of the allowed root.
+        assert!(resolve_read_path_in(cwd.path(), root.path(), "../escape").is_err());
+        // A legitimate relative path still resolves inside cwd.
+        std::fs::write(cwd.path().join("f.txt"), "x").unwrap();
+        let resolved = resolve_read_path_in(cwd.path(), root.path(), "f.txt").unwrap();
+        assert_eq!(resolved, cwd.path().canonicalize().unwrap().join("f.txt"));
     }
 
     #[cfg(unix)]

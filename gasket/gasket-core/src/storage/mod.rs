@@ -585,7 +585,16 @@ impl EventStorage {
     pub async fn remove_session(&self, session_id: &str) -> Result<bool, AgentError> {
         validate_session_id(session_id)?;
         match tokio::fs::remove_dir_all(self.session_dir(session_id)).await {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Spill files and per-tool state live outside the session dir; a
+                // deleted session must not leave them accumulating on disk.
+                // Best-effort: their absence is not an error.
+                let tool_state = crate::storage::config_dir()
+                    .join("tool_state")
+                    .join(session_id);
+                let _ = tokio::fs::remove_dir_all(&tool_state).await;
+                Ok(true)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }

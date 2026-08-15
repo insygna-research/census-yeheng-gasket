@@ -1,5 +1,8 @@
 //! Loop-hygiene guard (borrowed from dsh `guard/`): advisory note when the
 //! model makes the exact same tool call three times in a row.
+//!
+//! Only calls which reach execution are observed — calls rejected earlier
+//! (hook Block, malformed args, unknown tool) do not count toward the streak.
 
 /// Tracks only the previous call's (tool, args) — any change resets the
 /// streak. No window, no map: the simplest structure that answers "is this

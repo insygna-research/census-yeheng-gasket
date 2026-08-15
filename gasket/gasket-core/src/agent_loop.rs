@@ -373,10 +373,18 @@ where
         if let Some(note) =
             crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key))
         {
-            if let Some(crate::ContentBlock::Text { text }) = result.content.first_mut() {
-                text.push_str("\n\n[");
-                text.push_str(&note);
-                text.push(']');
+            match result.content.iter_mut().find_map(|b| match b {
+                crate::ContentBlock::Text { text } => Some(text),
+                _ => None,
+            }) {
+                Some(text) => {
+                    text.push_str("\n\n[");
+                    text.push_str(&note);
+                    text.push(']');
+                }
+                None => result
+                    .content
+                    .push(crate::ContentBlock::text(format!("[{note}]"))),
             }
         }
 
