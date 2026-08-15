@@ -52,7 +52,7 @@ cd web && pnpm install && pnpm dev
 
 ## 3. 后端配置(`.env`)
 
-后端所有配置走**环境变量 + dotenvy**(`gasket/.env`)。模板见 `gasket/.env.example`(注:模板不完整,完整变量见 §9)。
+后端所有配置走**环境变量 + dotenvy**(`gasket/.env`)。模板见 `gasket/.env.example`(已覆盖常用变量,完整清单见 §10)。
 
 ### 3.1 必填:LLM 连接
 
@@ -76,7 +76,7 @@ cd web && pnpm install && pnpm dev
 | `GASKET_LLM_HTTP_PROXY` | 仅 http(覆盖上面的 http 部分) |
 | `GASKET_LLM_HTTPS_PROXY` | 仅 https(覆盖上面的 https 部分) |
 
-代理优先级:按 scheme 的专用代理(`HTTP_PROXY`/`HTTPS_PROXY`)最高;`GASKET_LLM_PROXY` 填补缺失的那个 scheme。
+代理优先级:按 scheme 的专用代理(`GASKET_LLM_HTTP_PROXY`/`GASKET_LLM_HTTPS_PROXY`)最高;`GASKET_LLM_PROXY` 填补缺失的那个 scheme。不读取标准的 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量。
 
 **工具代理(fetch / web_search)**:设置 `GASKET_TOOL_PROXY` 可让 `fetch` 与 `web_search` 工具的出站流量走代理,支持 `http` / `https` / `socks5` / `socks5h`(带认证的代理把 `user:pass` 写进 URL 即可):
 
@@ -210,18 +210,10 @@ pnpm tauri:build    # = tauri build
 
 ## 7. Docker 部署
 
-> ⚠️ **仓库根 `Dockerfile` 当前已过时,无法直接使用。** 它引用的是旧版目录结构(`gasket/types/`、`gasket/storage/`、`gasket/engine/` 等已不存在的路径),`EXPOSE 18790` 也对不上网关默认端口 **3000**,且默认 `ENTRYPOINT ["gasket"]` 跑的是 CLI 而非网关。使用容器部署前需要更新它。
-
-**当前可行的容器化思路**(待补一个修复版 Dockerfile):
-
-1. 基础镜像构建 Rust workspace,产出 `/usr/local/bin/gasket-gateway`。
-2. 把 `web/dist`(先在构建阶段 `pnpm build` 得到)放进镜像,gateway 用 `GASKET_GATEWAY_STATIC_DIR` 指向它。
-3. `EXPOSE 3000`,`ENTRYPOINT ["gasket-gateway"]`。
-4. 运行时注入 `GASKET_LLM_*` 等环境变量(`-e` 或 `--env-file`)。
-
-示例运行(假设已有修复版镜像):
+仓库根 `Dockerfile` 是可用的多阶段构建:构建阶段编译 Rust workspace 全部 5 个 crate 并 `pnpm build` 产出 `web/dist`,运行阶段 `GASKET_GATEWAY_STATIC_DIR=/app/web/dist`、`EXPOSE 3000`、`ENTRYPOINT ["gasket-gateway"]`。
 
 ```bash
+docker build -t gasket .
 docker run -d -p 3000:3000 \
   -e GASKET_LLM_BASE_URL=https://api.deepseek.com/v1 \
   -e GASKET_LLM_KEY=sk-... \
@@ -230,6 +222,8 @@ docker run -d -p 3000:3000 \
   --name gasket gasket:latest
 # 访问 http://localhost:3000/
 ```
+
+运行时通过 `-e` 或 `--env-file` 注入 `GASKET_LLM_*` 等环境变量(完整清单见 §10)。
 
 ---
 
@@ -244,7 +238,7 @@ docker run -d -p 3000:3000 \
 | `GASKET_COMPACT_TARGET_PCT` | `50` | 压缩后目标占窗口的百分比(带滞后,防抖) |
 | `GASKET_COMPACT_MAX_MESSAGES` | `80` | 无 provider usage 数据时,按消息条数兜底的阈值;`0` 表示不压缩 |
 
-Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/sessions/{key}/compact`)。
+Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/sessions/{key}/context/compact`,见 §4.1)。
 
 ---
 
@@ -252,7 +246,7 @@ Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/session
 
 ### 9.1 内置工具
 
-`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级,低风险(`read`/`grep`/`list`/`fetch`)通常自动放行,高风险(`write`/`edit`/`bash`)在非 full-auto 模式下会请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。
+`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级:`read`/`grep`/`list`/`fetch` 为低风险,`write`/`edit` 为中风险,`bash` 为高风险。默认 `auto-edit` 模式下低/中风险自动放行,仅高风险(`bash`)请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。
 
 ### 9.2 外部工具(白名单)
 
@@ -333,8 +327,8 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 | 模式 | 行为 |
 |---|---|
-| `suggest` | 谨慎,广泛请求审批 |
-| `auto-edit` | 低风险自动放行,其余请求审批(**CLI 默认**,gateway 默认 `auto-edit`) |
+| `suggest` | 只读:低风险放行,中/高风险直接拒绝 |
+| `auto-edit` | 低/中风险自动放行,高风险请求审批(**CLI 默认**,gateway 默认 `auto-edit`) |
 | `full-auto` | 全部自动放行(慎用) |
 
 入口设定:CLI 用 `--mode=` 或 `/mode`;gateway 用 `GASKET_GATEWAY_MODE`;审批超时用 `GASKET_APPROVAL_TIMEOUT_S`(默认 300 秒)。
@@ -343,7 +337,7 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 ## 10. 环境变量完整参考
 
-> `gasket/.env.example` 模板并不完整,以本表为准。
+> `gasket/.env.example` 模板已覆盖常用变量,本表为完整参考。
 
 ### LLM 连接(必填三项)
 
@@ -412,10 +406,9 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 | 端口 3000 被占用 | 用 `GASKET_GATEWAY_PORT=<其它端口>` 改网关端口,并把前端 `VITE_WS_URL`/`VITE_API_URL` 同步改掉。 |
 | 报 `orphan tool_call` / 工具结果错乱 | 通常与压缩有关;确认没有手动设异常小的 `GASKET_COMPACT_MAX_MESSAGES`。正常情况下原子组会保护 tool_call↔result。 |
 | 模型不支持 thinking | `GASKET_THINKING` 设了 `low/medium/high` 但模型不支持时自动无效化;`ModelSpec.supports_thinking` 控制是否发送 thinking 参数。 |
-| 桌面端打不开/不响应 | 确认 LLM API key 已配置(`~/.gasket/config.toml` 或环境变量);桌面端通过进程内 Host 做 IPC 推理,不需要独立 gateway。 |
+| 桌面端打不开/不响应 | 确认 LLM API key 已配置(环境变量或 `gasket/.env`);桌面端通过进程内 Host 做 IPC 推理,不需要独立 gateway。 |
 | 想用 Claude(Anthropic) | `GASKET_LLM_API=anthropic`,`GASKET_LLM_BASE_URL=https://api.anthropic.com/v1`,`GASKET_LLM_MODEL=claude-...`。 |
 | 想接本地 Ollama/vLLM | `GASKET_LLM_API=openai`(默认),`GASKET_LLM_BASE_URL=http://localhost:11434/v1`(Ollama 示例),key 随意填。 |
-| Docker 构建失败 | 根 `Dockerfile` 已过时(见 §7),需按当前 5-crate 结构重写。 |
 | MCP server 启动失败 / 工具不出现 | 确认 `command` 在 `PATH` 里(如 `npx`);检查 `~/.gasket/mcp.json` JSON 合法;server 自身的 `env`(API key)正确。单个 server 失败不影响其他 server 和内置工具。 |
 
 ---

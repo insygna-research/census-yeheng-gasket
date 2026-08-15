@@ -14,10 +14,10 @@ The **host binary** is the composition root: it calls each linked crate's
 loading, no ABI version, no hot-unload.
 
 Official examples: workspace crate **`gasket-ext`** (`hello`, `todo`,
-`permission_gate`). CLI: `cargo run -p gasket-cli --features ext`.
+`search`, `permission_gate`). CLI: `cargo run -p gasket-cli --features ext`.
 
-Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep`) live in
-`gasket-core` and are not extension crates.
+Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep` /
+`fetch`) live in `gasket-core` and are not extension crates.
 
 ---
 
@@ -45,15 +45,13 @@ That is the static-world substitute for a plugin marketplace.
 
 | Method | What it does | Example |
 |---|---|---|
-| `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello`, `todo_list` |
+| `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello`, `todo` |
 | `register_before_tool_call(handler)` | block / modify args before run | `permission_gate` |
 | `register_after_tool_call(handler)` | rewrite tool result | — |
-| `register_event_handler(handler)` | observe events | — |
-| `send_message(msg)` | queue a message for the host | — |
-| `current_messages()` | read session snapshot (host-filled) | — |
 
-**Events vs hooks are type-separated.** Event handlers only observe.
 `before_tool_call` returns `ToolCallVerdict` (`Allow` / `Block` / `Modify`).
+Extensions do **not** observe events or read session state through this
+trait — event observation is the host's job (`HookChain`, storage).
 
 ---
 
@@ -62,7 +60,7 @@ That is the static-world substitute for a plugin marketplace.
 Source: `gasket-ext/src/hello.rs`.
 
 ```rust
-pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
+pub fn register(api: &mut dyn ExtensionApi) {
     api.register_tool(ToolDefinition {
         name: "hello".into(),
         label: "Hello".into(),
@@ -72,6 +70,7 @@ pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
             "properties": { "name": { "type": "string" } },
             "required": ["name"]
         }),
+        risk: RiskLevel::High,
         execute: Arc::new(|ctx| Box::pin(async move {
             let name = ctx.args["name"].as_str().unwrap_or("world");
             Ok(ToolResult {
@@ -85,6 +84,8 @@ pub fn register(api: &mut (impl ExtensionApi + ?Sized)) {
 ```
 
 - `parameters` is JSON Schema.
+- `risk: RiskLevel` is **required** (no default) — set it honestly; the
+  host's permission matrix keys off it.
 - `details` is extension-private; the agent never reads it.
 
 ---
