@@ -46,6 +46,38 @@ pub(crate) fn truncate_output(s: &str) -> String {
     out
 }
 
+/// Spill threshold-sharing wrapper around [`truncate_output`]: content over
+/// [`MAX_OUTPUT_BYTES`] is written whole to `<state_dir>/spill/` and replaced
+/// in-context by a head preview + file path (the model can `read` it back
+/// with offsets). Falls back to plain truncation if the disk write fails —
+/// a spill problem must never fail the tool.
+pub(crate) fn spill_or_truncate(ctx: &crate::types::tool::ToolCallCtx, s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s.to_string();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    let name = format!("{:012x}.txt", h.finish());
+    let dir = ctx.ctx.state_dir.join("spill");
+    let path = dir.join(&name);
+    match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, s)) {
+        Ok(()) => {
+            let head: String = s.chars().take(4000).collect();
+            format!(
+                "[output too large for context ({} bytes); full output saved to {}; head preview follows]\n{}\n[...preview ends — use `read` with offset on that path for the rest]",
+                s.len(),
+                path.display(),
+                head
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "spill write failed; falling back to truncation");
+            truncate_output(s)
+        }
+    }
+}
+
 /// Resolve `requested` against `cwd`, rejecting any `..` or absolute component
 /// that would escape `cwd`, and re-checking the symlink-resolved target so a
 /// symlink inside `cwd` can't point outside it (lexical `..`-checking alone
@@ -159,6 +191,64 @@ mod tests {
     #[test]
     fn truncate_output_noop_under_limit() {
         assert_eq!(truncate_output("small"), "small");
+    }
+
+    fn spill_ctx(state_dir: &Path) -> crate::types::tool::ToolCallCtx {
+        crate::types::tool::ToolCallCtx {
+            tool_call_id: "t".into(),
+            args: serde_json::json!({}),
+            signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: crate::ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "s".into(),
+                state_dir: state_dir.to_path_buf(),
+                spawner: None,
+            },
+        }
+    }
+
+    #[test]
+    fn spill_writes_full_output_and_returns_stub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = spill_ctx(tmp.path());
+        let big = "x".repeat(MAX_OUTPUT_BYTES + 1000);
+        let out = spill_or_truncate(&ctx, &big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("full output saved to"), "{out}");
+        // The file the stub points at holds the complete original output.
+        let line = out.lines().find(|l| l.contains("saved to")).unwrap();
+        let path = line
+            .split("saved to ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim();
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert_eq!(on_disk.len(), big.len());
+    }
+
+    #[test]
+    fn spill_small_output_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = spill_ctx(tmp.path());
+        let out = spill_or_truncate(&ctx, "small");
+        assert_eq!(out, "small");
+    }
+
+    #[test]
+    fn spill_write_failure_falls_back_to_truncation() {
+        // state_dir is a regular file, so create_dir_all(<file>/spill) fails;
+        // the tool must still get usable (truncated) output, never an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("occupied");
+        std::fs::write(&file, "x").unwrap();
+        let ctx = spill_ctx(&file);
+        let big = "y".repeat(MAX_OUTPUT_BYTES + 100);
+        let out = spill_or_truncate(&ctx, &big);
+        assert!(out.ends_with("...(truncated)"), "{out}");
     }
 
     #[cfg(unix)]

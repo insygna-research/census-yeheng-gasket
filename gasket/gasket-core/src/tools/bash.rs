@@ -69,8 +69,8 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         }
     };
 
-    let stdout = super::truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = super::truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let stdout = super::spill_or_truncate(&ctx, &String::from_utf8_lossy(&output.stdout));
+    let stderr = super::spill_or_truncate(&ctx, &String::from_utf8_lossy(&output.stderr));
     let code = output.status.code().unwrap_or(-1);
 
     let mut text = String::new();

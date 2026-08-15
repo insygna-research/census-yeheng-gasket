@@ -254,7 +254,7 @@ Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/session
 
 ### 9.1 内置工具
 
-`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级:`read`/`grep`/`list`/`fetch` 为低风险,`write`/`edit` 为中风险,`bash` 为高风险。默认 `auto-edit` 模式下低/中风险自动放行,仅高风险(`bash`)请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。
+`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级:`read`/`grep`/`list`/`fetch` 为低风险,`write`/`edit` 为中风险,`bash` 为高风险。默认 `auto-edit` 模式下低/中风险自动放行,仅高风险(`bash`)请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。`bash`/`fetch` 超过 200KB 的输出会完整落盘到 `~/.gasket/tool_state/<会话>/<工具>/spill/`,上下文中只保留头部预览与文件路径(模型可用 `read` 按 offset 分段读回)。
 
 ### 9.2 外部工具(白名单)
 

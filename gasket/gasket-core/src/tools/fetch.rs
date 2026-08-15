@@ -85,7 +85,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         body
     };
 
-    let text = super::truncate_output(&text);
+    let text = super::spill_or_truncate(&ctx, &text);
     Ok(ToolResult {
         content: vec![ContentBlock::text(text)],
         details: serde_json::json!({"url": url, "content_type": content_type}),
