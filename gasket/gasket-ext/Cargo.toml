@@ -13,6 +13,11 @@ reqwest = { workspace = true, features = ["json"] }
 tracing = { workspace = true }
 urlencoding = "2.1"
 dom_query = "0.28"
+portable-pty = { version = "0.8", optional = true }
+
+[features]
+terminal = ["dep:portable-pty"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

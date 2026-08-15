@@ -7,6 +7,9 @@ pub mod permission_gate;
 pub mod search;
 pub mod todo;
 
+#[cfg(feature = "terminal")]
+pub mod terminal;
+
 use gasket_core::ExtensionApi;
 
 /// Production extensions only (no demo tools). Hosts whose users did not
