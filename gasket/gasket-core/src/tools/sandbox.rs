@@ -44,8 +44,7 @@ pub(crate) fn confine(
     }
     #[cfg(all(target_os = "linux", feature = "sandbox-landlock"))]
     {
-        let _ = (cmd, cwd);
-        Err("sandbox: landlock support not yet built".to_string())
+        confine_landlock(cmd, cwd)
     }
     #[cfg(all(target_os = "linux", not(feature = "sandbox-landlock")))]
     {
@@ -57,6 +56,79 @@ pub(crate) fn confine(
         let _ = (cmd, cwd);
         Err("sandbox unsupported on this platform".into())
     }
+}
+
+/// Landlock confinement for Linux: enforced in pre_exec so the ruleset
+/// applies to the exec'd child and its whole process tree.
+#[cfg(all(target_os = "linux", feature = "sandbox-landlock"))]
+fn confine_landlock(
+    cmd: &mut tokio::process::Command,
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("sandbox: cwd not accessible: {e}"))?;
+    let tmp = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()));
+    // pre_exec runs between fork and exec: Landlock is inherited by the
+    // exec'd child and its whole process tree. Owned paths (no borrows) so
+    // the closure is Send + 'static.
+    unsafe {
+        cmd.as_std_mut()
+            .pre_exec(move || landlock_ruleset(&cwd, &tmp).map_err(std::io::Error::other));
+    }
+    Ok(())
+}
+
+/// Read-only filesystem everywhere except cwd/TMPDIR (/var/tmp via a fourth
+/// rule). Errors (unsupported kernel, missing paths) reach pre_exec and fail
+/// the spawn -> fail-closed.
+#[cfg(all(target_os = "linux", feature = "sandbox-landlock"))]
+fn landlock_ruleset(cwd: &std::path::Path, tmp: &std::path::Path) -> Result<(), String> {
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, ABI,
+    };
+    let read = AccessFs::from_read(ABI::V5);
+    let read_write = AccessFs::from_all(ABI::V5);
+
+    Ruleset::default()
+        // Fail-closed: a kernel without Landlock (or missing the V1 core
+        // access set) must error out here, not silently skip confinement.
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(ABI::V1))
+        .map_err(|e| e.to_string())?
+        // Everything beyond V1 (Refer, Truncate, IoctlDev, ...) is enforced
+        // opportunistically where the running kernel supports it.
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(read_write)
+        .map_err(|e| e.to_string())?
+        .create()
+        .map_err(|e| e.to_string())?
+        .add_rule(PathBeneath::new(
+            PathFd::new("/").map_err(|e| e.to_string())?,
+            read,
+        ))
+        .map_err(|e| e.to_string())?
+        .add_rule(PathBeneath::new(
+            PathFd::new(cwd).map_err(|e| e.to_string())?,
+            read_write,
+        ))
+        .map_err(|e| e.to_string())?
+        .add_rule(PathBeneath::new(
+            PathFd::new(tmp).map_err(|e| e.to_string())?,
+            read_write,
+        ))
+        .map_err(|e| e.to_string())?
+        .add_rule(PathBeneath::new(
+            PathFd::new("/var/tmp").map_err(|e| e.to_string())?,
+            read_write,
+        ))
+        .map_err(|e| e.to_string())?
+        .no_new_privs(true)
+        .restrict_self()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -103,5 +175,33 @@ mod flag_tests {
         assert!(!sandbox_enabled(&env));
         env.insert("GASKET_SANDBOX".to_string(), "1".to_string());
         assert!(sandbox_enabled(&env));
+    }
+}
+
+// Landlock tests compile (and run) only on Linux with the feature on. On the
+// macOS dev box they are verified via cross-target `cargo check`.
+#[cfg(all(test, target_os = "linux", feature = "sandbox-landlock"))]
+mod landlock_tests {
+    use super::*;
+
+    #[test]
+    fn landlock_ruleset_builds_for_existing_paths() {
+        let cwd = tempfile::tempdir().unwrap();
+        // Enforcing here sandboxes only this test's thread (Landlock is
+        // per-thread and libtest spawns one thread per test), and the ruleset
+        // grants rw beneath the tempdir, so the test runner is unaffected.
+        assert!(landlock_ruleset(cwd.path(), std::path::Path::new("/tmp")).is_ok());
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(feature = "sandbox-landlock")))]
+mod no_landlock_tests {
+    use super::*;
+
+    #[test]
+    fn confine_without_feature_fails_closed_with_hint() {
+        let mut cmd = tokio::process::Command::new("true");
+        let err = confine(&mut cmd, std::path::Path::new("/tmp")).unwrap_err();
+        assert!(err.contains("--features sandbox-landlock"), "{err}");
     }
 }

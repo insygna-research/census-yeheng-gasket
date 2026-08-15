@@ -342,6 +342,10 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 入口设定:CLI 用 `--mode=` 或 `/mode`;gateway 用 `GASKET_GATEWAY_MODE`;审批超时用 `GASKET_APPROVAL_TIMEOUT_S`(默认 300 秒)。
 
+### 9.6 bash 沙箱(GASKET_SANDBOX)
+
+设置 `GASKET_SANDBOX=1` 后,`bash` 工具的命令在操作系统级文件系统沙箱中执行:macOS 使用 `sandbox-exec`(Seatbelt,系统自带);Linux 使用 Landlock,要求以 `--features sandbox-landlock` 构建否则 `GASKET_SANDBOX=1` fail-closed 并附带 rebuild 提示。写操作仅允许在当前工作目录、`TMPDIR` 与 `/var/tmp` 内,其余路径只读。未设置时行为完全不变。沙箱是 fail-closed 的:如果隔离无法施加(如 Windows、或不支持 Landlock 的内核),命令会被直接拒绝并返回错误,而不是降级放行。
+
 ---
 
 ## 10. 环境变量完整参考
@@ -396,6 +400,7 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 | `GASKET_MCP_CONFIG` | MCP 配置文件路径(默认 `~/.gasket/mcp.json`,见 §9.3) |
 | `GASKET_SEARCH_PROVIDER` | 搜索 provider 选择(需 `ext` feature) |
 | `GASKET_BRAVE_API_KEY` / `GASKET_TAVILY_API_KEY` / `GASKET_SERPER_API_KEY` / `GASKET_SERPAPI_API_KEY` / `GASKET_EXA_API_KEY` / `GASKET_FIRECRAWL_API_KEY` | 各搜索商 key |
+| `GASKET_SANDBOX` | 置 1 时 bash 工具启用文件系统沙箱(见 §9.6) |
 
 ### 前端(`web/.env`)
 
