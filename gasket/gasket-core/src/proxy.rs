@@ -96,9 +96,12 @@ fn apply_proxy_url(
 #[cfg(test)]
 pub(crate) mod test_util {
     /// Serializes tests that touch the global override. Shared across this
-    /// crate's test modules (proxy.rs, tools/fetch.rs) so parallel #[test]
-    /// threads cannot observe each other's override.
-    pub static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// crate's test modules (proxy.rs, tools/fetch.rs) so parallel test
+    /// threads/tasks cannot observe each other's override. A tokio mutex so
+    /// async tests can hold it across `.await` (sync tests use
+    /// `blocking_lock`).
+    pub static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 }
 
 #[cfg(test)]
@@ -130,7 +133,7 @@ mod tests {
 
     #[test]
     fn override_beats_env_and_blank_env_is_none() {
-        let _g = test_util::LOCK.lock().unwrap();
+        let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(Some("socks5://override:1080")).unwrap();
         assert_eq!(
             resolve_with(&fake_env(&[(ENV_VAR, "http://env:8080")])),
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn set_rejects_invalid_and_keeps_previous() {
-        let _g = test_util::LOCK.lock().unwrap();
+        let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(Some("http://good:8080")).unwrap();
         assert!(set_tool_proxy(Some("garbage")).is_err());
         assert_eq!(
@@ -164,7 +167,7 @@ mod tests {
 
     #[test]
     fn apply_builds_client_with_socks5_and_fails_open_on_invalid() {
-        let _g = test_util::LOCK.lock().unwrap();
+        let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(Some("socks5://127.0.0.1:1080")).unwrap();
         apply_tool_proxy(reqwest::Client::builder())
             .build()

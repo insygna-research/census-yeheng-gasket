@@ -287,15 +287,14 @@ mod tests {
         }
     }
 
-    // The guard consults the global tool-proxy override; the std mutex below
+    // The guard consults the global tool-proxy override; the mutex below
     // deliberately spans the await to serialize global-state tests (same
     // pattern as fetch_goes_through_tool_proxy).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fetch_rejects_cloud_metadata_endpoint() {
         // The guard consults the global tool-proxy override; hold the same
         // lock as the proxy test so a concurrent override can't skip it.
-        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+        let _g = crate::proxy::test_util::LOCK.lock().await;
         let ctx = ToolCallCtx {
             tool_call_id: "t3".into(),
             args: serde_json::json!({"url": "http://169.254.169.254/latest/meta-data/"}),
@@ -315,13 +314,11 @@ mod tests {
             _ => panic!("expected text content"),
         }
     }
-    // Deliberate cross-await lock: see fetch_rejects_cloud_metadata_endpoint.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fetch_rejects_localhost_by_resolution() {
         // No proxy configured and no opt-out: `localhost` resolves to a
         // loopback IP and must be refused before any request is made.
-        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+        let _g = crate::proxy::test_util::LOCK.lock().await;
         let ctx = ToolCallCtx {
             tool_call_id: "t4".into(),
             args: serde_json::json!({"url": "http://localhost:9/"}),
@@ -364,13 +361,11 @@ mod tests {
     /// End-to-end wiring proof: with the override set, fetch's request must
     /// hit the proxy, not the target host. A real HTTP proxy in ~25 lines:
     /// read the request head, reply with a canned page.
-    // Deliberate cross-await lock: see fetch_rejects_cloud_metadata_endpoint.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fetch_goes_through_tool_proxy() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let _g = crate::proxy::test_util::LOCK.lock().unwrap();
+        let _g = crate::proxy::test_util::LOCK.lock().await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
