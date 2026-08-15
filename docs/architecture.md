@@ -210,6 +210,18 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 内核导出见 `core/src/lib.rs`。
 
+### 准入标准:什么才进 core
+
+一个能力想进入 `gasket-core`,先过三问;任何一问答不上来,它就属于 `host`、`ext` 或某个 feature 之后:
+
+| # | 问题 | 判据 |
+|---|---|---|
+| 1 | **三个宿主都要吗?** | CLI、gateway、桌面端都用到的能力才是内核;只有一两个宿主需要的是宿主层服务(如 skills 目录注入、session 检索引擎 → `host`)或 agent 工具(→ `ext`) |
+| 2 | **依赖代价是什么?** | 零新增依赖直接进;重依赖必须 opt-in feature 且默认关闭(如 Linux Landlock → `sandbox-landlock`),默认构建零影响 |
+| 3 | **持有的是什么状态?** | 配置状态(可注入、无资源持有,如 `proxy.rs` 的 override、`guard.rs` 的重复计数)可以进 core;资源状态(进程句柄、连接池、会话注册表、可重建的派生数据)属于宿主或扩展层 |
+
+先例:PTY 会话注册表是进程状态 → 整个 `terminal` 工具住 `gasket-ext` feature 之后;FTS5 索引是可重建派生数据 → 引擎住 `gasket-host` feature 之后;Landlock 是重依赖 → core 内 feature 之后,且无 feature 时 fail-closed。
+
 ### 5.1 类型系统(`types/`)
 
 | 类型 | 作用 | 文件 |
