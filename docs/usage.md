@@ -255,7 +255,7 @@ Web 端可在头部点 **Compress** 按钮手动触发(调用 `POST /api/session
 
 ### 9.1 内置工具
 
-`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级:`read`/`grep`/`list`/`fetch` 为低风险,`write`/`edit` 为中风险,`bash` 为高风险。默认 `auto-edit` 模式下低/中风险自动放行,仅高风险(`bash`)请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。`bash`/`fetch` 超过 200KB 的输出会完整落盘到 `~/.gasket/tool_state/<会话>/<工具>/spill/`,上下文中只保留头部预览与文件路径(完整输出保留在磁盘上该路径,用户可自行查看或经 shell 取回)。落盘路径位于 `~/.gasket` 之下,模型也可通过 `read` 工具以该绝对路径直接读回完整输出。
+`read` / `write` / `edit` / `bash` / `grep` / `list` / `fetch`(详见 [架构设计 §5.2](./architecture.md))。每个工具自带风险等级:`read`/`grep`/`list`/`fetch` 为低风险,`write`/`edit` 为中风险,`bash` 为高风险。默认 `auto-edit` 模式下低/中风险自动放行,仅高风险(`bash`)请求审批。`fetch` 工具抓取 URL 并把 HTML 转成可读文本(markdown 风格),支持 http/https。`bash`/`fetch` 超过 200KB 的输出会完整落盘到 `~/.gasket/tool_state/<会话>/<工具>/spill/`,上下文中只保留头部预览与文件路径(完整输出保留在磁盘上该路径,用户可自行查看或经 shell 取回)。落盘路径位于 `~/.gasket` 之下,模型也可通过 `read` 工具以该绝对路径直接读回完整输出。`terminal` 工具位于 gasket-ext,默认关闭:主机在 gasket-ext 依赖上启用 `terminal` feature 后经其扩展注册入口生效(桌面端已启用;CLI 随 `--features ext` 一并启用)。它通过 PTY 运行命令:action=`run` 启动(同名 session 存活时旧进程被 kill)、`read` 排空新输出并报告退出状态、`send` 向运行中进程的 stdin 写入一行,适合驱动交互式程序;会话按 `session` 参数(默认 `default`)区分,输出经 64KiB 环形缓冲按需排空、超限丢弃最旧输出(与 `bash`/`fetch` 的 200KB 落盘 spill 不同,该工具不落盘)。
 
 ### 9.2 外部工具(白名单)
 

@@ -52,9 +52,8 @@ impl OutputRing {
 
 struct PtySession {
     child: Box<dyn portable_pty::Child + Send>,
-    /// Consumed by the `send` action (Task 3); must be taken at spawn time
-    /// because `take_writer` succeeds only once per master.
-    #[allow(dead_code)]
+    /// Consumed by the `send` action; must be taken at spawn time because
+    /// `take_writer` succeeds only once per master.
     writer: Box<dyn Write + Send>,
     ring: Arc<Mutex<OutputRing>>,
 }
@@ -96,7 +95,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, ToolError> {
     match action {
         "run" => run(&ctx, &key),
         "read" => read(&key).await,
-        "send" => send(&key),
+        "send" => send(&ctx, &key),
         other => Ok(ToolResult::error(format!("unknown action: {other}"))),
     }
 }
@@ -217,12 +216,25 @@ async fn read(key: &str) -> Result<ToolResult, ToolError> {
     })
 }
 
-fn send(key: &str) -> Result<ToolResult, ToolError> {
-    if REGISTRY.read().unwrap().get(key).is_none() {
+fn send(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
+    let input = ctx.args["command"]
+        .as_str()
+        .ok_or_else(|| ToolError::Message("command is required for send".into()))?;
+    let Some(sess) = REGISTRY.read().unwrap().get(key).cloned() else {
         return Ok(ToolResult::error(format!("no session `{key}`")));
-    }
-    // implemented fully in Task 3 (needs stdin line semantics)
-    Ok(ToolResult::error("send not yet implemented"))
+    };
+    let mut s = sess.lock().unwrap();
+    // PTY stdin is line-oriented: always terminate with a newline.
+    s.writer
+        .write_all(input.as_bytes())
+        .and_then(|_| s.writer.write_all(b"\n"))
+        .and_then(|_| s.writer.flush())
+        .map_err(|e| ToolError::Message(format!("stdin write failed: {e}")))?;
+    Ok(ToolResult {
+        content: vec![ContentBlock::text("sent")],
+        details: serde_json::json!({"session": key}),
+        is_error: false,
+    })
 }
 
 #[cfg(test)]
@@ -259,7 +271,8 @@ mod tests {
     #[test]
     fn oversized_chunk_keeps_tail_on_char_boundary() {
         let mut r = OutputRing::default();
-        r.push_str(&format!("{}é", "x".repeat(OutputRing::MAX_BYTES)));
+        // MAX_BYTES - 1 x's: cut lands mid-é, so the walk-back loop must run.
+        r.push_str(&format!("{}é", "x".repeat(OutputRing::MAX_BYTES - 1)));
         let out = r.drain();
         assert!(
             out.ends_with('é'),
@@ -343,5 +356,36 @@ mod tests {
         .await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "no active session");
+    }
+
+    #[tokio::test]
+    async fn send_writes_to_stdin_of_running_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = format!("send-{}", std::process::id());
+        // `read` a line then echo it back — proves stdin round-trip through the PTY.
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "read line; echo got:$line"}),
+            tmp.path(),
+            &s,
+        )
+        .await;
+        assert!(!r.is_error);
+        let r = exec(
+            serde_json::json!({"action": "send", "command": "ping"}),
+            tmp.path(),
+            &s,
+        )
+        .await;
+        assert!(!r.is_error, "send failed");
+        let mut got = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
+            got = text(&r);
+            if got.contains("got:ping") {
+                break;
+            }
+        }
+        assert!(got.contains("got:ping"), "got: {got}");
     }
 }

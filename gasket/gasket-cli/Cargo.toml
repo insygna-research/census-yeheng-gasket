@@ -18,5 +18,6 @@ serde_json = { workspace = true }
 
 [features]
 default = []
-# Link optional in-process extensions (hello / todo / permission_gate).
-ext = ["dep:gasket-ext"]
+# Link optional in-process extensions (hello / todo / permission_gate),
+# plus the terminal PTY tool (forwarded feature).
+ext = ["dep:gasket-ext", "gasket-ext?/terminal"]
