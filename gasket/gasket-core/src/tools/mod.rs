@@ -48,8 +48,8 @@ pub(crate) fn truncate_output(s: &str) -> String {
 
 /// Spill threshold-sharing wrapper around [`truncate_output`]: content over
 /// [`MAX_OUTPUT_BYTES`] is written whole to `<state_dir>/spill/` and replaced
-/// in-context by a head preview + file path (the model can `read` it back
-/// with offsets). Falls back to plain truncation if the disk write fails —
+/// in-context by a head preview + file path (the full output is preserved
+/// on disk at that path). Falls back to plain truncation if the disk write fails —
 /// a spill problem must never fail the tool.
 pub(crate) fn spill_or_truncate(ctx: &crate::types::tool::ToolCallCtx, s: &str) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {

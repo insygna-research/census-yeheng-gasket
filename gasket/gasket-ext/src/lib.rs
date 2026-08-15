@@ -1,5 +1,6 @@
 //! Optional in-process extensions. Host enables via Cargo feature and calls
-//! [`register_all`] (or individual module `register`s).
+//! [`register_all`] (or individual module `register`s); the production-only
+//! composition root [`prod_register`] is used by the desktop app.
 
 pub mod hello;
 pub mod permission_gate;

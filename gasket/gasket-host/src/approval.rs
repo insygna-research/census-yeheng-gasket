@@ -26,6 +26,12 @@ pub struct ApprovalRegistry {
     seq: u64,
 }
 
+impl Default for ApprovalRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ApprovalRegistry {
     pub fn new() -> Self {
         Self {

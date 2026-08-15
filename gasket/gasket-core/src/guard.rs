@@ -9,6 +9,12 @@ pub struct RepeatGuard {
     count: u32,
 }
 
+impl Default for RepeatGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RepeatGuard {
     pub fn new() -> Self {
         Self {

@@ -364,6 +364,8 @@ mod tests {
     /// End-to-end wiring proof: with the override set, fetch's request must
     /// hit the proxy, not the target host. A real HTTP proxy in ~25 lines:
     /// read the request head, reply with a canned page.
+    // Deliberate cross-await lock: see fetch_rejects_cloud_metadata_endpoint.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fetch_goes_through_tool_proxy() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
