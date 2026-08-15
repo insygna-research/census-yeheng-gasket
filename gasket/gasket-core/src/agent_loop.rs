@@ -45,6 +45,8 @@ where
     emit(AgentEvent::AgentStart);
     tracing::info!(model = %config.model.id, session = %context.session_id, "agent loop start");
 
+    let mut guard = crate::guard::RepeatGuard::new();
+
     // Single outer loop.
     for turn in 0..config.max_turns {
         emit(AgentEvent::TurnStart);
@@ -101,7 +103,8 @@ where
         }
 
         // 3. Execute tool calls (serial in V0.1).
-        let tool_results = execute_tool_calls(&context, &assistant, &config, &mut emit).await?;
+        let tool_results =
+            execute_tool_calls(&context, &assistant, &config, &mut guard, &mut emit).await?;
         for r in &tool_results {
             context.messages.push(AgentMessage::ToolResult(r.clone()));
             new_messages.push(AgentMessage::ToolResult(r.clone()));
@@ -220,6 +223,7 @@ async fn execute_tool_calls<E>(
     context: &AgentContext,
     assistant: &AssistantMessage,
     config: &AgentLoopConfig,
+    guard: &mut crate::guard::RepeatGuard,
     emit: &mut E,
 ) -> Result<Vec<ToolResultMessage>, AgentError>
 where
@@ -320,6 +324,8 @@ where
             }
         };
 
+        let args_key = args.to_string();
+
         emit(AgentEvent::ToolExecutionStart {
             tool_call_id: tc.id.clone(),
             tool_name: tc.function.name.clone(),
@@ -362,6 +368,14 @@ where
         // 4. after_tool_call hook: chain may replace the result (redact, etc.).
         if let Some(h) = &config.hooks {
             result = h.after_tool_call(&tc.id, &result);
+        }
+
+        if let Some(note) = crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key)) {
+            if let Some(crate::ContentBlock::Text { text }) = result.content.first_mut() {
+                text.push_str("\n\n[");
+                text.push_str(&note);
+                text.push(']');
+            }
         }
 
         let is_error = result.is_error;

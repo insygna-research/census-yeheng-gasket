@@ -7,6 +7,7 @@
 pub mod agent_loop;
 pub mod error;
 pub mod extension;
+pub mod guard;
 pub mod providers;
 pub mod proxy;
 pub mod storage;
