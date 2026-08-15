@@ -35,6 +35,9 @@ pub fn init_db(db_path: &Path) -> anyhow::Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(db_path)?;
+    // Concurrent desktop searches open their own connections; a transient
+    // SQLITE_BUSY waits instead of erroring out.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS events USING fts5(\
              session_id UNINDEXED, seq UNINDEXED, kind UNINDEXED, text);\
@@ -96,10 +99,17 @@ fn event_rows(events: &[SessionEvent]) -> Vec<Row> {
 /// Incremental reindex: for every session dir under `store_root`, append
 /// only events past the per-session high-water mark stored in `meta`.
 pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats> {
-    let conn = init_db(db_path)?;
+    let mut conn = init_db(db_path)?;
     let storage = EventStorage::new(store_root);
     let mut stats = Stats::default();
-    let mut ids: Vec<String> = std::fs::read_dir(store_root)?
+    // Fresh install: no store root yet → empty index, not an error (search
+    // just returns no hits). Any other read failure still fails loud.
+    let entries = match std::fs::read_dir(store_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Stats::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut ids: Vec<String> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
@@ -115,8 +125,12 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
             .unwrap_or(-1);
         let mut inserted = 0usize;
         let mut max_seq = last;
+        // One transaction per session: the row inserts and the meta
+        // high-water mark commit together or not at all, so a mid-reindex
+        // failure can never leave rows a later run would duplicate.
+        let tx = conn.transaction()?;
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "INSERT INTO events(session_id, seq, kind, text) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for row in event_rows(&events) {
@@ -129,11 +143,14 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
             }
         }
         if inserted > 0 {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO meta(key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 rusqlite::params![id, max_seq],
             )?;
+        }
+        tx.commit()?;
+        if inserted > 0 {
             stats.sessions += 1;
             stats.events_indexed += inserted;
         }
@@ -277,6 +294,15 @@ mod tests {
                 .unwrap(),
             Stats::default()
         );
+    }
+
+    #[tokio::test]
+    async fn reindex_on_missing_root_is_default_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("no-such-store");
+        let stats = reindex(&root, &tmp.path().join("index.db")).await.unwrap();
+        assert_eq!(stats, Stats::default(), "fresh install → empty index");
+        assert!(!root.exists(), "missing store root must not be created");
     }
 
     #[tokio::test]
