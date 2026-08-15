@@ -50,6 +50,24 @@ impl OutputRing {
     }
 }
 
+/// How many bytes of `bytes` can be decoded now. When a trailing multi-byte
+/// char is split across reads (`error_len() == None`, at most 4 bytes), hold
+/// it back for the next chunk; genuinely invalid tails are flushed in full
+/// (the caller's lossy decode replaces them).
+fn utf8_split(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if e.error_len().is_none() && bytes.len() - valid <= 4 {
+                valid
+            } else {
+                bytes.len()
+            }
+        }
+    }
+}
+
 struct PtySession {
     child: Box<dyn portable_pty::Child + Send>,
     /// Consumed by the `send` action; must be taken at spawn time because
@@ -95,7 +113,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, ToolError> {
     match action {
         "run" => run(&ctx, &key),
         "read" => read(&key).await,
-        "send" => send(&ctx, &key),
+        "send" => send(&ctx, &key).await,
         other => Ok(ToolResult::error(format!("unknown action: {other}"))),
     }
 }
@@ -105,10 +123,14 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
         .as_str()
         .ok_or_else(|| ToolError::Message("command is required for run".into()))?;
 
-    // Replace any live session under this key (kill + drop).
-    if let Some(old) = REGISTRY.write().unwrap().remove(key) {
+    // Replace any live session under this key: SIGHUP then reap, so children
+    // don't linger as zombies. The registry write guard is dropped at the
+    // statement end — a wedged session lock below can't freeze other sessions.
+    let old = REGISTRY.write().unwrap().remove(key);
+    if let Some(old) = old {
         let mut s = old.lock().unwrap();
         let _ = s.child.kill();
+        let _ = s.child.wait();
     }
 
     let pty = native_pty_system();
@@ -131,8 +153,15 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
     }
     cmd.arg(command);
     cmd.cwd(&ctx.ctx.cwd);
-    // Host env is already scrubbed of GASKET_* secrets by the host; CommandBuilder
-    // inherits the process env by default, so nothing to do here.
+    // Env is taken from ToolContext with GASKET_* filtered — same rule as core's
+    // bash tool. CommandBuilder inherits the raw process env by default, which
+    // still holds GASKET_* secrets, so clear it and re-inject explicitly.
+    cmd.env_clear();
+    for (k, v) in &ctx.ctx.env {
+        if !k.starts_with("GASKET_") {
+            cmd.env(k, v);
+        }
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -152,15 +181,29 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
     // reader holds its own dup of the master fd, so dropping `pair` below is
     // safe; the thread exits on EOF when the child closes its end.
     std::thread::spawn(move || {
+        let mut carry: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => pump_ring
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(n) => {
+                    // Carry residual bytes across reads so a multi-byte char
+                    // split at a chunk boundary isn't turned into two U+FFFD.
+                    carry.extend_from_slice(&buf[..n]);
+                    let cut = utf8_split(&carry);
+                    pump_ring
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&carry[..cut]));
+                    carry.drain(..cut);
+                }
             }
+        }
+        if !carry.is_empty() {
+            pump_ring
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&carry));
         }
     });
 
@@ -216,20 +259,27 @@ async fn read(key: &str) -> Result<ToolResult, ToolError> {
     })
 }
 
-fn send(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
+async fn send(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
     let input = ctx.args["command"]
         .as_str()
         .ok_or_else(|| ToolError::Message("command is required for send".into()))?;
     let Some(sess) = REGISTRY.read().unwrap().get(key).cloned() else {
         return Ok(ToolResult::error(format!("no session `{key}`")));
     };
-    let mut s = sess.lock().unwrap();
-    // PTY stdin is line-oriented: always terminate with a newline.
-    s.writer
-        .write_all(input.as_bytes())
-        .and_then(|_| s.writer.write_all(b"\n"))
-        .and_then(|_| s.writer.flush())
-        .map_err(|e| ToolError::Message(format!("stdin write failed: {e}")))?;
+    // Blocking stdin writes run on a std thread, not a tokio worker; the
+    // session lock lives entirely inside the closure, never across an await.
+    let input = input.to_string();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut s = sess.lock().unwrap();
+        // PTY stdin is line-oriented: always terminate with a newline.
+        s.writer
+            .write_all(input.as_bytes())
+            .and_then(|_| s.writer.write_all(b"\n"))
+            .and_then(|_| s.writer.flush())
+    })
+    .await
+    .map_err(|e| ToolError::Message(format!("stdin write failed: {e}")))?;
+    res.map_err(|e| ToolError::Message(format!("stdin write failed: {e}")))?;
     Ok(ToolResult {
         content: vec![ContentBlock::text("sent")],
         details: serde_json::json!({"session": key}),
@@ -294,7 +344,12 @@ mod tests {
         api.tools.remove(0)
     }
 
-    async fn exec(args: serde_json::Value, cwd: &std::path::Path, session: &str) -> ToolResult {
+    async fn exec_with_env(
+        args: serde_json::Value,
+        cwd: &std::path::Path,
+        session: &str,
+        env: std::collections::HashMap<String, String>,
+    ) -> ToolResult {
         let t = registered_tool();
         (t.execute)(ToolCallCtx {
             tool_call_id: "x".into(),
@@ -302,7 +357,7 @@ mod tests {
             signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ctx: ToolContext {
                 cwd: cwd.to_path_buf(),
-                env: std::env::vars().collect(),
+                env,
                 session_id: session.into(),
                 state_dir: cwd.to_path_buf(),
                 spawner: None,
@@ -310,6 +365,10 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn exec(args: serde_json::Value, cwd: &std::path::Path, session: &str) -> ToolResult {
+        exec_with_env(args, cwd, session, std::env::vars().collect()).await
     }
 
     fn text(r: &ToolResult) -> String {
@@ -337,12 +396,87 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
             got = text(&r);
-            if got.contains("[exited") {
+            if got.contains("hello") && got.contains("[exited") {
                 break;
             }
         }
         assert!(got.contains("hello"), "got: {got}");
         assert!(got.contains("[exited code 0]"), "got: {got}");
+    }
+
+    #[test]
+    fn utf8_split_holds_back_incomplete_trailing_char() {
+        // "中" = E4 B8 AD: a char split across two reads must be held back.
+        assert_eq!(utf8_split(&[0xE4]), 0);
+        assert_eq!(utf8_split(&[b'a', 0xE4, 0xB8]), 1);
+        assert_eq!(utf8_split(&[0xE4, 0xB8, 0xAD]), 3);
+    }
+
+    #[test]
+    fn utf8_split_flushes_genuinely_invalid_bytes() {
+        // 0xFF can never start a UTF-8 sequence: no point holding it back.
+        assert_eq!(utf8_split(&[0xFF, 0xFE]), 2);
+        assert_eq!(utf8_split(&[b'a', 0xFF]), 2);
+    }
+
+    #[tokio::test]
+    async fn run_scrubs_gasket_env_and_passes_others_through() {
+        std::env::set_var("GASKET_SENTINEL", "leak-me-12345");
+        let tmp = tempfile::tempdir().unwrap();
+        let s = format!("env-scrub-{}", std::process::id());
+        // GASK_TEST_OK lives only in the ToolContext env, not the process env:
+        // it must pass through. GASKET_SENTINEL is in both and must be scrubbed.
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        env.insert("GASK_TEST_OK".into(), "keep-me".into());
+        let r = exec_with_env(
+            serde_json::json!({
+                "action": "run",
+                "command": "echo sentinel=${GASKET_SENTINEL:-unset} ok=$GASK_TEST_OK"
+            }),
+            tmp.path(),
+            &s,
+            env,
+        )
+        .await;
+        assert!(!r.is_error, "spawn failed");
+        let mut got = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
+            got = text(&r);
+            if got.contains("sentinel=") && got.contains("[exited") {
+                break;
+            }
+        }
+        assert!(got.contains("unset"), "GASKET_SENTINEL leaked: {got}");
+        assert!(
+            !got.contains("leak-me-12345"),
+            "GASKET_SENTINEL leaked: {got}"
+        );
+        assert!(got.contains("keep-me"), "non-GASKET env dropped: {got}");
+    }
+
+    #[tokio::test]
+    async fn run_then_read_preserves_multibyte_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = format!("utf8-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "echo 中文测试"}),
+            tmp.path(),
+            &s,
+        )
+        .await;
+        assert!(!r.is_error);
+        let mut got = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
+            got = text(&r);
+            if got.contains("中文测试") && got.contains("[exited") {
+                break;
+            }
+        }
+        assert!(got.contains("中文测试"), "got: {got}");
     }
 
     #[tokio::test]
