@@ -89,6 +89,50 @@ async fn rename_session(id: String, name: String) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Run a `!Send` `session_index` engine future on a blocking thread. The
+/// engine keeps its SQLite `Connection`/`Statement` alive across internal
+/// `.await`s, so its futures are `!Send` and cannot be awaited directly in
+/// a Tauri async command (command futures must be `Send`). Same bridge as
+/// the gateway's `run_engine`: capture the runtime handle in the async
+/// context before spawning, `Handle::block_on` on the blocking thread —
+/// the engine's `tokio::fs` calls still resolve on the runtime.
+async fn run_engine<T, F, Fut>(f: F) -> Result<T, String>
+where
+  F: FnOnce() -> Fut + Send + 'static,
+  Fut: std::future::Future<Output = Result<T, String>>,
+  T: Send + 'static,
+{
+  let handle = tokio::runtime::Handle::current();
+  tokio::task::spawn_blocking(move || handle.block_on(f()))
+    .await
+    .map_err(|e| format!("engine task join failed: {e}"))?
+}
+
+/// Cross-session full-text search (FTS5 sidecar at `~/.gasket/index.db`).
+/// Stateless per call: open the connection, run the high-water incremental
+/// reindex check, run the query, return hits. No registry, no cached
+/// state — resource state belongs to the host, not process globals.
+#[tauri::command]
+async fn search_sessions(
+  query: String,
+) -> Result<Vec<gasket_host::session_index::SessionHit>, String> {
+  let q = query.trim().to_string();
+  if q.is_empty() {
+    return Err("query must be non-empty".into());
+  }
+  let root = gasket_core::JsonlStorage::default_root().base_dir_clone();
+  let db = gasket_core::storage::config_dir().join("index.db");
+  run_engine(move || async move {
+    gasket_host::session_index::reindex(&root, &db)
+      .await
+      .map_err(|e| e.to_string())?;
+    gasket_host::session_index::search(&root, &db, &q, 20)
+      .await
+      .map_err(|e| e.to_string())
+  })
+  .await
+}
+
 /// `~/.gasket/app_config.json` — the desktop shell's durable mirror of the
 /// browser build's localStorage preferences (theme, sidebar state, chats
 /// meta, hidden sessions). One JSON object keyed by storage key; values are
@@ -185,6 +229,7 @@ pub fn run() {
       list_sessions,
       get_session_messages,
       rename_session,
+      search_sessions,
       delete_session,
       chat::send_message,
       chat::cancel_turn,
