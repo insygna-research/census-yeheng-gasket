@@ -15,6 +15,11 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+anyhow = { workspace = true, optional = true }
+
+[features]
+session-index = ["dep:rusqlite", "dep:anyhow"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

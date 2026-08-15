@@ -20,6 +20,8 @@ pub mod mcp;
 pub mod permission;
 pub mod printer;
 pub mod session;
+#[cfg(feature = "session-index")]
+pub mod session_index;
 pub mod skills;
 pub mod subagent;
 pub mod wire;
