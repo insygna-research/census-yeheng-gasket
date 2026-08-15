@@ -65,7 +65,7 @@ pub(crate) fn spill_or_truncate(ctx: &crate::types::tool::ToolCallCtx, s: &str) 
         Ok(()) => {
             let head: String = s.chars().take(4000).collect();
             format!(
-                "[output too large for context ({} bytes); full output saved to {}; head preview follows]\n{}\n[...preview ends — use `read` with offset on that path for the rest]",
+                "[output too large for context ({} bytes); full output saved to {}; head preview follows]\n{}\n[...preview ends — full output on disk at the path above]",
                 s.len(),
                 path.display(),
                 head
