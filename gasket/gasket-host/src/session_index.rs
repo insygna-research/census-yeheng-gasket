@@ -141,11 +141,46 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
     Ok(stats)
 }
 
+/// FTS5 MATCH search over the index. The query is phrase-quoted (inner
+/// double quotes doubled) so user input can never be parsed as FTS5
+/// syntax. Rows map to the shared `SessionHit`; ordering is bm25 rank,
+/// `name` is enriched from the session's meta.json sidecar.
+pub async fn search(
+    store_root: &Path,
+    db_path: &Path,
+    q: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<SessionHit>> {
+    let conn = init_db(db_path)?;
+    let phrase = format!("\"{}\"", q.replace('"', "\"\""));
+    let mut stmt = conn.prepare(
+        "SELECT session_id, snippet(events, 3, '', '', '…', 16), rank \
+         FROM events WHERE events MATCH ?1 ORDER BY rank LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![phrase, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage = EventStorage::new(store_root);
+    let mut hits = Vec::with_capacity(rows.len());
+    for (session_id, snippet) in rows {
+        let name = storage.load_meta(&session_id).await.and_then(|m| m.name);
+        hits.push(SessionHit {
+            session_id,
+            name,
+            snippet,
+        });
+    }
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gasket_core::types::message::{FunctionCall, ToolCall};
     use gasket_core::types::session_event::TurnEndReason;
+    use gasket_core::SessionMeta;
     use gasket_core::{
         AssistantMessage, ContentBlock, EventStorage, StopReason, ToolResultMessage,
     };
@@ -331,5 +366,68 @@ mod tests {
         );
         let second = reindex(tmp.path(), &db).await.unwrap();
         assert_eq!(second, Stats::default(), "not re-inserted on second run");
+    }
+
+    #[tokio::test]
+    async fn search_returns_snippet_names_phrase_quoting_and_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let db = tmp.path().join("index.db");
+        store
+            .append_events("s1", &[user_ev("the flaky test failed again")])
+            .await
+            .unwrap();
+        store
+            .append_events("s2", &[user_ev("NEAR(a b) is fts5 syntax")])
+            .await
+            .unwrap();
+        store
+            .append_events("s3", &[user_ev("needle one")])
+            .await
+            .unwrap();
+        store
+            .append_events("s4", &[user_ev("needle two")])
+            .await
+            .unwrap();
+        store
+            .append_events("s5", &[user_ev("needle three")])
+            .await
+            .unwrap();
+        store
+            .write_meta(
+                "s1",
+                &SessionMeta {
+                    name: Some("flaky hunt".into()),
+                },
+            )
+            .await
+            .unwrap();
+        reindex(tmp.path(), &db).await.unwrap();
+
+        let hits = search(tmp.path(), &db, "flaky", 20).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "s1");
+        assert_eq!(
+            hits[0].name.as_deref(),
+            Some("flaky hunt"),
+            "name enriched from meta.json"
+        );
+        assert!(hits[0].snippet.contains("flaky"));
+        assert!(
+            search(tmp.path(), &db, "zebra", 20)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no hit is empty, not error"
+        );
+        assert!(
+            search(tmp.path(), &db, "NEAR(a b", 20).await.is_ok(),
+            "syntax-looking input never parsed as FTS5"
+        );
+        assert_eq!(
+            search(tmp.path(), &db, "needle", 2).await.unwrap().len(),
+            2,
+            "limit respected"
+        );
     }
 }
