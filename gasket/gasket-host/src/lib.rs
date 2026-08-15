@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod permission;
 pub mod printer;
 pub mod session;
+pub mod skills;
 pub mod subagent;
 pub mod wire;
 
@@ -32,6 +33,7 @@ pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use session::{SessionInfo, SessionManager};
+pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
 
 #[derive(Debug, thiserror::Error)]
