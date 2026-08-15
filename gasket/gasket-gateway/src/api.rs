@@ -175,6 +175,82 @@ pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Va
     }
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct SearchParams {
+    q: String,
+    limit: Option<usize>,
+}
+
+/// Run a `!Send` `session_index` engine future on a blocking thread. The
+/// engine keeps its SQLite `Connection`/`Statement` alive across internal
+/// `.await`s, so its futures are `!Send` and cannot be awaited directly in
+/// an axum handler (handler futures must be `Send`). `Handle::block_on`
+/// from a `spawn_blocking` thread is the sanctioned bridge — the engine's
+/// `tokio::fs` calls still resolve on the runtime.
+async fn run_engine<F, Fut, T>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+    T: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(f()))
+        .await
+        .map_err(|e| anyhow::anyhow!("engine task join failed: {e}"))?
+}
+
+/// Full-text search across all sessions' event logs. The first request per
+/// process builds/updates the FTS5 sidecar index (reindex-on-demand, then
+/// latched); a store/index failure is a 500 (fail loud, same policy as
+/// `get_messages`). No hits is a legitimate empty list — not a 404.
+/// The engine itself lives in `gasket_host::session_index` (feature
+/// `session-index`); the gateway is only transport.
+pub(crate) async fn search_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<SearchParams>,
+) -> Response {
+    let q = params.q.trim().to_string();
+    if q.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "q must be non-empty" })),
+        )
+            .into_response();
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let root = state.store_root.clone();
+    let db = state.index_db.clone();
+    let init = state
+        .search_ready
+        .get_or_init(|| async {
+            run_engine(move || async move { gasket_host::session_index::reindex(&root, &db).await })
+                .await
+                .map(|_| ())
+        })
+        .await;
+    if let Err(e) = init {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("index build failed: {e}") })),
+        )
+            .into_response();
+    }
+    let root = state.store_root.clone();
+    let db = state.index_db.clone();
+    match run_engine(move || async move {
+        gasket_host::session_index::search(&root, &db, &q, limit).await
+    })
+    .await
+    {
+        Ok(hits) => Json(json!({ "hits": hits })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// Rename a session: persist the display name in the session's `meta.json`
 /// sidecar. Creates the session directory if needed, so a chat can be named
 /// before its first turn lands on disk. 400 on an unsafe id or bad name.
@@ -277,13 +353,16 @@ mod tests {
     fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
         Arc::new(AppState {
             sessions: DashMap::new(),
-            store_root: root,
+            store_root: root.clone(),
+            index_db: root.join("index.db"),
+            search_ready: tokio::sync::OnceCell::new(),
         })
     }
 
     fn api_router(state: Arc<AppState>) -> Router {
         Router::new()
             .route("/api/sessions", get(list_sessions))
+            .route("/api/sessions/search", get(search_sessions))
             .route("/api/sessions/{key}/messages", get(get_messages))
             .route("/api/sessions/{key}/name", put(rename_session))
             .route("/api/sessions/{key}", delete(delete_session))
@@ -333,6 +412,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn search_route_returns_hits_and_rejects_blank_q() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = EventStorage::new(tmp.path().to_path_buf());
+        storage
+            .append_event("sess-1", &user_event("the flaky test"))
+            .await
+            .unwrap();
+        let app = api_router(test_state(tmp.path().to_path_buf()));
+        let res = app
+            .clone()
+            .oneshot(get_uri("/api/sessions/search?q=flaky"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"][0]["session_id"], "sess-1");
+        assert!(v["hits"][0]["snippet"].as_str().unwrap().contains("flaky"));
+        assert!(
+            v["hits"][0]["name"].is_null(),
+            "unnamed session serializes name as null"
+        );
+        let res = app
+            .oneshot(get_uri("/api/sessions/search?q=%20"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

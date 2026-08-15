@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gasket-core = { workspace = true }
-gasket-host = { workspace = true }
+gasket-host = { workspace = true, features = ["session-index"] }
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "cors"] }

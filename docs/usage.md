@@ -111,7 +111,7 @@ cargo run --release --bin gasket-gateway
 
 - 默认监听 `0.0.0.0:3000`(`GASKET_GATEWAY_PORT` 可改)。
 - 自动托管 `web/dist` 静态资源(`GASKET_GATEWAY_STATIC_DIR` 可改,默认 `../web/dist`)——**先 `pnpm build` 出 dist,网关就能直接serve 整个 Web 应用**(无需单独跑前端服务器)。
-- 暴露:WebSocket `/ws`、REST `/api/commands`、`/api/sessions`、`/api/sessions/{key}/context`、`/api/sessions/{key}/context/compact`、`/api/sessions/{key}/messages`(后端真相端点:对磁盘 `events.jsonl` 跑 `derive_messages`,未知 key→404、损坏日志→500)。
+- 暴露:WebSocket `/ws`、REST `/api/commands`、`/api/sessions`、`GET /api/sessions/search?q=…`(FTS5 跨会话全文检索;每进程首个请求先增量重建 `~/.gasket/index.db` 索引)、`/api/sessions/{key}/context`、`/api/sessions/{key}/context/compact`、`/api/sessions/{key}/messages`(后端真相端点:对磁盘 `events.jsonl` 跑 `derive_messages`,未知 key→404、损坏日志→500)。
 - **会话存储**:每个会话是 `~/.gasket/sessions/<id>/events.jsonl` 的一份**崩溃安全事件日志**——一轮里每个已发生的事实(助手消息、工具结果)在它发生时就落盘,而非等到整轮成功才追加;崩溃 / 失败 / 中断的轮次仍保有其已经发生的全部副作用。旧 `messages.jsonl` 会话首次打开时自动迁移并删除旧文件(不可逆)。详见 [架构 §5.5](./architecture.md) 与 [ADR 0001](./adr/0001-event-sourced-session-log.md)。
 
 ### 4.2 终端 REPL `gasket`(纯命令行)

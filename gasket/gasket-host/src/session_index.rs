@@ -145,6 +145,9 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
 /// double quotes doubled) so user input can never be parsed as FTS5
 /// syntax. Rows map to the shared `SessionHit`; ordering is bm25 rank,
 /// `name` is enriched from the session's meta.json sidecar.
+/// Callers must guard the empty-string query themselves: the engine
+/// returns Err for "" (FTS5 empty-phrase syntax error); the gateway route
+/// and the desktop command reject blank `q` before calling.
 pub async fn search(
     store_root: &Path,
     db_path: &Path,

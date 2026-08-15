@@ -44,7 +44,7 @@ use tracing::info;
 
 use crate::api::{
     compact_context, delete_session, get_commands, get_context, get_messages, list_sessions,
-    rename_session,
+    rename_session, search_sessions,
 };
 use crate::state::AppState;
 use crate::ws::ws_handler;
@@ -64,6 +64,8 @@ async fn main() {
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         store_root: gasket_core::JsonlStorage::default_root().base_dir_clone(),
+        index_db: gasket_core::storage::config_dir().join("index.db"),
+        search_ready: tokio::sync::OnceCell::new(),
     });
     let frontend_dist =
         std::env::var("GASKET_GATEWAY_STATIC_DIR").unwrap_or_else(|_| "../web/dist".to_string());
@@ -72,6 +74,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(list_sessions))
         .route("/api/commands", get(get_commands))
+        .route("/api/sessions/search", get(search_sessions))
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))
         .route("/api/sessions/{key}/messages", get(get_messages))

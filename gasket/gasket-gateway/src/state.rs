@@ -16,6 +16,12 @@ pub(crate) struct AppState {
     /// endpoints that read disk (list, messages) and new WS connections
     /// build their `SessionManager` from this root; tests inject a tempdir.
     pub(crate) store_root: PathBuf,
+    /// FTS5 sidecar index (production: `~/.gasket/index.db`; tests inject
+    /// a tempdir path).
+    pub(crate) index_db: PathBuf,
+    /// Reindex-on-demand latch: the first search request per process (per
+    /// state, in tests) populates the index; later requests reuse it.
+    pub(crate) search_ready: tokio::sync::OnceCell<anyhow::Result<()>>,
 }
 
 /// Per-connection state. The transcript itself is NOT kept here - the
