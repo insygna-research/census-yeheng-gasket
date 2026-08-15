@@ -370,7 +370,9 @@ where
             result = h.after_tool_call(&tc.id, &result);
         }
 
-        if let Some(note) = crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key)) {
+        if let Some(note) =
+            crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key))
+        {
             if let Some(crate::ContentBlock::Text { text }) = result.content.first_mut() {
                 text.push_str("\n\n[");
                 text.push_str(&note);
