@@ -17,6 +17,8 @@ use gasket_core::ExtensionApi;
 /// [`register_all`] behind `--features ext`.
 pub fn prod_register(api: &mut dyn gasket_core::ExtensionApi) {
     search::register(api);
+    #[cfg(feature = "terminal")]
+    terminal::register(api);
 }
 
 /// Register every extension in this crate.
@@ -36,6 +38,13 @@ mod tests {
         let mut api = gasket_core::ExtensionApiImpl::new();
         prod_register(&mut api);
         let names: Vec<_> = api.tools.iter().map(|t| t.name.clone()).collect();
-        assert_eq!(names, vec!["web_search".to_string()]);
+        // `--all-features` (CI) turns the terminal feature on; without it the
+        // module is compiled out entirely.
+        let expected: Vec<&str> = if cfg!(feature = "terminal") {
+            vec!["web_search", "terminal"]
+        } else {
+            vec!["web_search"]
+        };
+        assert_eq!(names, expected);
     }
 }
