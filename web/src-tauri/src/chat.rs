@@ -248,7 +248,8 @@ async fn build_session(
     .await
     .map_err(|e| format!("Session error: {e}"))?;
 
-  let system_prompt = "You are a helpful, concise assistant.".to_string();
+  let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+  let system_prompt = gasket_host::append_skills("You are a helpful, concise assistant.", &cwd);
   // Intentionally the gateway's env knob: one mode setting shared by both
   // transports.
   let mode = std::env::var("GASKET_GATEWAY_MODE")

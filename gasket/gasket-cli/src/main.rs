@@ -82,11 +82,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     hook_stack.push(policy.clone());
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut host = Host::new(
         host_cfg,
         session,
         policy.clone(),
-        "You are a helpful, concise assistant.".to_string(),
+        gasket_host::append_skills("You are a helpful, concise assistant.", &cwd),
         assemble_tools(&ext_tools, &extra_tools, &mcp_tools),
     )
     .with_hooks(Arc::new(hook_stack));
