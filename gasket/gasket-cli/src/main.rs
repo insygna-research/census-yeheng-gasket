@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     hook_stack.push(policy.clone());
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = gasket_host::project_dir();
     let mut host = Host::new(
         host_cfg,
         session,

@@ -181,24 +181,6 @@ pub(crate) struct SearchParams {
     limit: Option<usize>,
 }
 
-/// Run a `!Send` `session_index` engine future on a blocking thread. The
-/// engine keeps its SQLite `Connection`/`Statement` alive across internal
-/// `.await`s, so its futures are `!Send` and cannot be awaited directly in
-/// an axum handler (handler futures must be `Send`). `Handle::block_on`
-/// from a `spawn_blocking` thread is the sanctioned bridge — the engine's
-/// `tokio::fs` calls still resolve on the runtime.
-async fn run_engine<F, Fut, T>(f: F) -> anyhow::Result<T>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-    T: Send + 'static,
-{
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(f()))
-        .await
-        .map_err(|e| anyhow::anyhow!("engine task join failed: {e}"))?
-}
-
 /// Full-text search across all sessions' event logs. The first request per
 /// process builds/updates the FTS5 sidecar index (reindex-on-demand, then
 /// latched); a store/index failure is a 500 (fail loud, same policy as
@@ -223,8 +205,9 @@ pub(crate) async fn search_sessions(
     let init = state
         .search_ready
         .get_or_init(|| async {
-            run_engine(move || async move { gasket_host::session_index::reindex(&root, &db).await })
+            tokio::task::spawn_blocking(move || gasket_host::session_index::reindex(&root, &db))
                 .await
+                .map_err(|e| anyhow::anyhow!("engine task join failed: {e}"))?
                 .map(|_| ())
         })
         .await;
@@ -237,18 +220,28 @@ pub(crate) async fn search_sessions(
     }
     let root = state.store_root.clone();
     let db = state.index_db.clone();
-    match run_engine(move || async move {
-        gasket_host::session_index::search(&root, &db, &q, limit).await
+    let hits = match tokio::task::spawn_blocking(move || {
+        gasket_host::session_index::search(&root, &db, &q, limit)
     })
     .await
     {
-        Ok(hits) => Json(json!({ "hits": hits })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+        Ok(Ok(hits)) => hits,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("engine task join failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({ "hits": hits })).into_response()
 }
 
 /// Rename a session: persist the display name in the session's `meta.json`

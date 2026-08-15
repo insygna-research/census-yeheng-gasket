@@ -2,11 +2,18 @@
 //!
 //! Global skills live at `<config_dir>/skills/*.md`; project skills at
 //! `<cwd>/.gasket/skills/*.md` (same `name:` wins over the global one).
-//! Only the catalog line + absolute path is appended — the model reads a
-//! skill's full content with the `read` tool on demand.
+//! Only the catalog line + readable path is appended — the model reads a
+//! skill's full content with the `read` tool on demand. Global entries carry
+//! an absolute path (under `~/.gasket`, which `read` accepts); project
+//! entries carry a cwd-relative path (`read` resolves those within cwd).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Catalog descriptions are capped at this many chars: the catalog rides in
+/// the system prompt (paid on every request), so a runaway frontmatter
+/// description must not leak skill bodies into it.
+const MAX_DESCRIPTION_CHARS: usize = 200;
 
 struct SkillMeta {
     description: String,
@@ -21,8 +28,8 @@ pub fn append_skills(base: &str, cwd: &Path) -> String {
 /// Testable core: `global_root` is injected (production uses the config dir).
 pub fn append_skills_in(base: &str, cwd: &Path, global_root: &Path) -> String {
     let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
-    scan_dir(&global_root.join("skills"), &mut catalog);
-    scan_dir(&cwd.join(".gasket").join("skills"), &mut catalog);
+    scan_dir(&global_root.join("skills"), None, &mut catalog);
+    scan_dir(&cwd.join(".gasket").join("skills"), Some(cwd), &mut catalog);
     if catalog.is_empty() {
         return base.to_string();
     }
@@ -34,14 +41,14 @@ pub fn append_skills_in(base: &str, cwd: &Path, global_root: &Path) -> String {
     for (name, meta) in &catalog {
         out.push_str(&format!(
             "- name: {name} — {} (source: {})\n",
-            meta.description,
+            catalog_description(&meta.description),
             meta.source.display()
         ));
     }
     out
 }
 
-fn scan_dir(dir: &Path, catalog: &mut BTreeMap<String, SkillMeta>) {
+fn scan_dir(dir: &Path, relative_to: Option<&Path>, catalog: &mut BTreeMap<String, SkillMeta>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return, // no dir = no skills; not an error
@@ -56,11 +63,19 @@ fn scan_dir(dir: &Path, catalog: &mut BTreeMap<String, SkillMeta>) {
             .and_then(|c| parse_frontmatter(&c))
         {
             Some((name, description)) => {
+                // Project skills are stored cwd-relative: `read` resolves
+                // relative paths within cwd, while absolute paths are only
+                // allowed under the gasket config dir. Global skills keep
+                // the absolute path.
+                let source = relative_to
+                    .and_then(|base| path.strip_prefix(base).ok())
+                    .unwrap_or(&path)
+                    .to_path_buf();
                 catalog.insert(
                     name,
                     SkillMeta {
                         description,
-                        source: path,
+                        source,
                     },
                 );
             }
@@ -71,12 +86,25 @@ fn scan_dir(dir: &Path, catalog: &mut BTreeMap<String, SkillMeta>) {
     }
 }
 
+/// One-line, bounded description for the catalog line.
+fn catalog_description(d: &str) -> String {
+    if d.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return d.replace(['\n', '\r'], " ");
+    }
+    let mut t: String = d.chars().take(MAX_DESCRIPTION_CHARS).collect();
+    t.push('…');
+    t
+}
+
 /// Hand-parsed frontmatter: `---\n` … `---` block carrying both `name:` and
-/// `description:` lines. Anything else is None (caller warns + skips).
+/// `description:` lines. `description` may use a block scalar (`|`/`>` with
+/// optional `-`/`+` chomping) — the indented lines that follow are collapsed
+/// to one line for the catalog. Anything else is None (caller warns + skips).
 fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     let mut name = None;
     let mut description = None;
-    for line in content.strip_prefix("---\n")?.lines() {
+    let mut lines = content.strip_prefix("---\n")?.lines().peekable();
+    while let Some(line) = lines.next() {
         if line.trim_end() == "---" {
             return match (name, description) {
                 (Some(n), Some(d)) => Some((n, d)),
@@ -84,12 +112,42 @@ fn parse_frontmatter(content: &str) -> Option<(String, String)> {
             };
         }
         if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().to_string());
+            name = parse_value(v, &mut lines);
         } else if let Some(v) = line.strip_prefix("description:") {
-            description = Some(v.trim().to_string());
+            description = parse_value(v, &mut lines);
         }
     }
     None // unterminated frontmatter block
+}
+
+/// Value of a frontmatter key: a plain single-line scalar, or a `|`/`>`
+/// block scalar (the indented lines that follow) collapsed to one line.
+/// `None` for an empty value.
+fn parse_value(v: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) -> Option<String> {
+    let v = v.trim();
+    // `|`/`>` optionally followed by a chomping indicator (`-`/`+`) opens a
+    // block scalar; anything else after the indicator (e.g. `|2`) is treated
+    // as a plain scalar.
+    let block_scalar = matches!(v.as_bytes().first(), Some(b'|') | Some(b'>'))
+        && v[1..].bytes().all(|b| b == b'-' || b == b'+');
+    if !block_scalar {
+        return (!v.is_empty()).then(|| v.to_string());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    while let Some(l) = lines.peek() {
+        if l.starts_with(' ') || l.starts_with('\t') {
+            let trimmed = l.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed);
+            }
+            lines.next();
+        } else if l.trim().is_empty() {
+            lines.next(); // blank line inside a block adds nothing once collapsed
+        } else {
+            break; // dedent: the block ends, this line is a normal entry
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 #[cfg(test)]
@@ -183,6 +241,84 @@ mod tests {
         );
         assert!(
             append_skills_in("BASE", p.path(), g.path()).contains("- name: proj — from project")
+        );
+    }
+
+    #[test]
+    fn project_skill_source_is_cwd_relative() {
+        let g = tempfile::tempdir().unwrap();
+        let p = tempfile::tempdir().unwrap();
+        skill_file(g.path(), "glob.md", OK);
+        skill_file(
+            &p.path().join(".gasket"),
+            "proj.md",
+            "---\nname: proj\ndescription: from project\n---\n",
+        );
+        let out = append_skills_in("BASE", p.path(), g.path());
+        // Project entries must be cwd-relative: `read` rejects absolute
+        // paths outside `~/.gasket`, so the catalog must hand the model a
+        // path it can actually use.
+        assert!(
+            out.contains("(source: .gasket/skills/proj.md)"),
+            "project source should be cwd-relative, got: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "(source: {})",
+                g.path().join("skills/glob.md").display()
+            )),
+            "global source should stay absolute"
+        );
+    }
+
+    #[test]
+    fn literal_block_scalar_description_is_collapsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        skill_file(
+            tmp.path(),
+            "block.md",
+            "---\nname: blk\ndescription: |\n  First line of purpose.\n  Second line, more detail.\n---\nbody\n",
+        );
+        let out = append_skills_in("BASE", Path::new("/nope"), tmp.path());
+        assert!(
+            out.contains("- name: blk — First line of purpose. Second line, more detail."),
+            "block scalar must collapse to one catalog line, got: {out}"
+        );
+    }
+
+    #[test]
+    fn folded_block_scalar_with_chomp_is_collapsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        skill_file(
+            tmp.path(),
+            "fold.md",
+            "---\nname: fold\ndescription: >-\n  folded one\n  folded two\n---\n",
+        );
+        let out = append_skills_in("BASE", Path::new("/nope"), tmp.path());
+        assert!(
+            out.contains("- name: fold — folded one folded two"),
+            "folded scalar with chomping must collapse, got: {out}"
+        );
+    }
+
+    #[test]
+    fn long_description_is_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long: String = "x".repeat(300);
+        skill_file(
+            tmp.path(),
+            "long.md",
+            &format!("---\nname: long\ndescription: {long}\n---\n"),
+        );
+        let out = append_skills_in("BASE", Path::new("/nope"), tmp.path());
+        let expected: String = "x".repeat(MAX_DESCRIPTION_CHARS);
+        assert!(
+            out.contains(&format!("- name: long — {expected}…")),
+            "description must be capped at {MAX_DESCRIPTION_CHARS} chars, got: {out}"
+        );
+        assert!(
+            !out.contains(&"x".repeat(MAX_DESCRIPTION_CHARS + 1)),
+            "no run longer than the cap may appear"
         );
     }
 }

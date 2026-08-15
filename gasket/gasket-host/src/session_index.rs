@@ -98,7 +98,13 @@ fn event_rows(events: &[SessionEvent]) -> Vec<Row> {
 
 /// Incremental reindex: for every session dir under `store_root`, append
 /// only events past the per-session high-water mark stored in `meta`.
-pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats> {
+///
+/// Pure synchronous disk work (JSONL reads + SQLite writes), so it holds a
+/// `rusqlite::Connection` across the whole run. Callers run it on a
+/// blocking thread (`tokio::task::spawn_blocking`); there is deliberately
+/// no async variant — the connection is `!Send` and must never ride a
+/// `.await` point.
+pub fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats> {
     let mut conn = init_db(db_path)?;
     let storage = EventStorage::new(store_root);
     let mut stats = Stats::default();
@@ -117,7 +123,7 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
         .collect();
     ids.sort(); // deterministic order for tests and logging
     for id in ids {
-        let events = storage.load_events(&id).await?;
+        let events = storage.load_events_sync(&id)?;
         // No mark yet → -1, so a text event at seq 0 is indexed on first run.
         let last: i64 = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [&id], |r| r.get(0))
@@ -165,7 +171,10 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
 /// Callers must guard the empty-string query themselves: the engine
 /// returns Err for "" (FTS5 empty-phrase syntax error); the gateway route
 /// and the desktop command reject blank `q` before calling.
-pub async fn search(
+///
+/// Pure synchronous disk work — same blocking-thread contract as
+/// [`reindex`].
+pub fn search(
     store_root: &Path,
     db_path: &Path,
     q: &str,
@@ -185,7 +194,7 @@ pub async fn search(
     let storage = EventStorage::new(store_root);
     let mut hits = Vec::with_capacity(rows.len());
     for (session_id, snippet) in rows {
-        let name = storage.load_meta(&session_id).await.and_then(|m| m.name);
+        let name = storage.load_meta_sync(&session_id).and_then(|m| m.name);
         hits.push(SessionHit {
             session_id,
             name,
@@ -253,7 +262,7 @@ mod tests {
             .append_events("s1", &[SessionEvent::TurnStart, user_ev("first message")])
             .await
             .unwrap();
-        let first = reindex(tmp.path(), &db).await.unwrap();
+        let first = reindex(tmp.path(), &db).unwrap();
         assert_eq!((first.sessions, first.events_indexed), (1, 1));
 
         store
@@ -268,7 +277,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let second = reindex(tmp.path(), &db).await.unwrap();
+        let second = reindex(tmp.path(), &db).unwrap();
         assert_eq!(
             second.events_indexed, 1,
             "only the newly appended text event"
@@ -289,9 +298,7 @@ mod tests {
     async fn reindex_on_empty_root_is_zero_stats() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            reindex(tmp.path(), &tmp.path().join("index.db"))
-                .await
-                .unwrap(),
+            reindex(tmp.path(), &tmp.path().join("index.db")).unwrap(),
             Stats::default()
         );
     }
@@ -300,7 +307,7 @@ mod tests {
     async fn reindex_on_missing_root_is_default_and_creates_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("no-such-store");
-        let stats = reindex(&root, &tmp.path().join("index.db")).await.unwrap();
+        let stats = reindex(&root, &tmp.path().join("index.db")).unwrap();
         assert_eq!(stats, Stats::default(), "fresh install → empty index");
         assert!(!root.exists(), "missing store root must not be created");
     }
@@ -325,7 +332,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let stats = reindex(tmp.path(), &db).await.unwrap();
+        let stats = reindex(tmp.path(), &db).unwrap();
         assert_eq!((stats.sessions, stats.events_indexed), (1, 1));
         let conn = init_db(&db).unwrap();
         let text: String = conn
@@ -368,7 +375,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let stats = reindex(tmp.path(), &db).await.unwrap();
+        let stats = reindex(tmp.path(), &db).unwrap();
         assert_eq!(stats, Stats::default(), "no text content → no row");
         let conn = init_db(&db).unwrap();
         let n: i64 = conn
@@ -387,13 +394,13 @@ mod tests {
             .append_events("s1", &[user_ev("sole message")])
             .await
             .unwrap();
-        let first = reindex(tmp.path(), &db).await.unwrap();
+        let first = reindex(tmp.path(), &db).unwrap();
         assert_eq!(
             (first.sessions, first.events_indexed),
             (1, 1),
             "seq-0 text is indexed on first run"
         );
-        let second = reindex(tmp.path(), &db).await.unwrap();
+        let second = reindex(tmp.path(), &db).unwrap();
         assert_eq!(second, Stats::default(), "not re-inserted on second run");
     }
 
@@ -431,9 +438,9 @@ mod tests {
             )
             .await
             .unwrap();
-        reindex(tmp.path(), &db).await.unwrap();
+        reindex(tmp.path(), &db).unwrap();
 
-        let hits = search(tmp.path(), &db, "flaky", 20).await.unwrap();
+        let hits = search(tmp.path(), &db, "flaky", 20).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "s1");
         assert_eq!(
@@ -443,18 +450,15 @@ mod tests {
         );
         assert!(hits[0].snippet.contains("flaky"));
         assert!(
-            search(tmp.path(), &db, "zebra", 20)
-                .await
-                .unwrap()
-                .is_empty(),
+            search(tmp.path(), &db, "zebra", 20).unwrap().is_empty(),
             "no hit is empty, not error"
         );
         assert!(
-            search(tmp.path(), &db, "NEAR(a b", 20).await.is_ok(),
+            search(tmp.path(), &db, "NEAR(a b", 20).is_ok(),
             "syntax-looking input never parsed as FTS5"
         );
         assert_eq!(
-            search(tmp.path(), &db, "needle", 2).await.unwrap().len(),
+            search(tmp.path(), &db, "needle", 2).unwrap().len(),
             2,
             "limit respected"
         );

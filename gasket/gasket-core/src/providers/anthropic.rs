@@ -182,7 +182,7 @@ fn build_request_body(
     system_prompt: &str,
     tools: &[ToolDefinition],
 ) -> serde_json::Value {
-    let msgs: Vec<_> = messages.iter().filter_map(convert_message).collect();
+    let msgs = fold_same_role(messages.iter().filter_map(convert_message).collect());
 
     let mut body = json!({
         "model": model.id,
@@ -263,6 +263,31 @@ fn convert_message(msg: &AgentMessage) -> Option<serde_json::Value> {
         })),
         AgentMessage::Custom(_) => None,
     }
+}
+
+/// Fold adjacent same-role messages into one. Anthropic requires the
+/// `messages` array to strictly alternate `user`/`assistant`, but the
+/// internal history is fragmentary: every tool result is its own
+/// `AgentMessage::ToolResult` (each converts to `role: "user"`), and
+/// compaction can prepend a user notice ahead of a kept user message.
+/// Concatenating adjacent same-role content block arrays restores the
+/// alternation at the wire boundary without touching stored history.
+fn fold_same_role(msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut folded: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        if let Some(last) = folded.last_mut() {
+            if last["role"] == msg["role"] {
+                if let (Some(dst), Some(src)) =
+                    (last["content"].as_array_mut(), msg["content"].as_array())
+                {
+                    dst.extend(src.iter().cloned());
+                    continue;
+                }
+            }
+        }
+        folded.push(msg);
+    }
+    folded
 }
 
 fn tool_to_anthropic(t: &ToolDefinition) -> serde_json::Value {
@@ -420,5 +445,148 @@ mod tests {
         // the (last) tool carries a cache breakpoint.
         let tools_arr = body["tools"].as_array().expect("tools is array");
         assert_eq!(tools_arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    // ── Role-alternation folding (Anthropic 400s on adjacent same roles) ──
+
+    use crate::types::message::{
+        AssistantMessage, FunctionCall, StopReason, ToolCall, ToolResultMessage, UserMessage,
+    };
+
+    fn request_body(messages: &[AgentMessage]) -> serde_json::Value {
+        use crate::types::context::{ModelSpec, ProviderApi};
+        let model = ModelSpec {
+            id: "claude".into(),
+            api: ProviderApi::Anthropic,
+            max_tokens: 1024,
+            supports_thinking: false,
+        };
+        build_request_body(&model, messages, "", &[])
+    }
+
+    fn roles(body: &serde_json::Value) -> Vec<&str> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect()
+    }
+
+    fn user_msg(t: &str) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(t)],
+            timestamp: 0,
+        })
+    }
+
+    fn assistant_tool_calls(ids: &[&str]) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| ContentBlock::ToolCall {
+                    tool_call: ToolCall {
+                        id: (*id).into(),
+                        function: FunctionCall {
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                })
+                .collect(),
+            model: "claude".into(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            timestamp: 0,
+        })
+    }
+
+    fn tool_result(id: &str, out: &str) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::text(out)],
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn folds_parallel_tool_results_into_one_user_message() {
+        // One assistant turn with two tool calls → two ToolResult messages,
+        // both `role: "user"` after conversion. Unfolded this is an instant
+        // HTTP 400 ("roles must alternate").
+        let messages = vec![
+            user_msg("list files"),
+            assistant_tool_calls(&["t1", "t2"]),
+            tool_result("t1", "out1"),
+            tool_result("t2", "out2"),
+        ];
+        let body = request_body(&messages);
+        assert_eq!(roles(&body), vec!["user", "assistant", "user"]);
+        let blocks = body["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "both tool_results in one user message");
+        assert_eq!(blocks[0]["tool_use_id"], "t1");
+        assert_eq!(blocks[1]["tool_use_id"], "t2");
+    }
+
+    #[test]
+    fn folds_compaction_notice_ahead_of_kept_user_message() {
+        // compact_by_count prepends a user notice; if the first kept
+        // message is also user, the roles would repeat.
+        let messages = vec![
+            user_msg("[compacted 3 earlier messages]"),
+            user_msg("real question"),
+        ];
+        let body = request_body(&messages);
+        assert_eq!(roles(&body), vec!["user"]);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "[compacted 3 earlier messages]");
+        assert_eq!(blocks[1]["text"], "real question");
+    }
+
+    #[test]
+    fn folds_consecutive_assistant_messages() {
+        let messages = vec![
+            user_msg("q"),
+            assistant_tool_calls(&["t1"]),
+            tool_result("t1", "out1"),
+            assistant_tool_calls(&["t2"]),
+            tool_result("t2", "out2"),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![ContentBlock::text("done")],
+                model: "claude".into(),
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                timestamp: 0,
+            }),
+        ];
+        let body = request_body(&messages);
+        assert_eq!(
+            roles(&body),
+            vec![
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_tool_round_trip_is_unchanged() {
+        // The common case must not over-merge: one user, one assistant
+        // tool_use, one tool_result → three alternating messages.
+        let messages = vec![
+            user_msg("q"),
+            assistant_tool_calls(&["t1"]),
+            tool_result("t1", "out1"),
+        ];
+        let body = request_body(&messages);
+        assert_eq!(roles(&body), vec!["user", "assistant", "user"]);
+        assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 1);
     }
 }

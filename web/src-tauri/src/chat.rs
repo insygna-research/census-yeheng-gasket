@@ -248,7 +248,9 @@ async fn build_session(
     .await
     .map_err(|e| format!("Session error: {e}"))?;
 
-  let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+  // Skills (and the Host's tool sandbox) follow the project dir, not the
+  // process cwd — the desktop app is launched outside the project it serves.
+  let cwd = gasket_host::project_dir();
   let system_prompt = gasket_host::append_skills("You are a helpful, concise assistant.", &cwd);
   // Intentionally the gateway's env knob: one mode setting shared by both
   // transports.
@@ -368,7 +370,7 @@ async fn build_session(
         subagent_tools,
         spawner_hooks,
         spawner_signal,
-        std::env::current_dir().unwrap_or_default(),
+        gasket_host::project_dir(),
         loop_config,
       )
       .with_ws_emit(emit),

@@ -3,12 +3,14 @@
 //! `terminal`; the session registry is process-global within this crate.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use gasket_core::{
     ContentBlock, ExtensionApi, RiskLevel, ToolCallCtx, ToolDefinition, ToolError, ToolResult,
 };
+use parking_lot::{Mutex, RwLock};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 /// Rolling output buffer for one PTY session, capped at MAX_BYTES: pushing
@@ -48,6 +50,11 @@ impl OutputRing {
         self.bytes = 0;
         out
     }
+
+    /// Whether nothing is buffered — the sweep's "fully read" precondition.
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
 }
 
 /// How many bytes of `bytes` can be decoded now. When a trailing multi-byte
@@ -74,11 +81,17 @@ struct PtySession {
     /// `take_writer` succeeds only once per master.
     writer: Box<dyn Write + Send>,
     ring: Arc<Mutex<OutputRing>>,
+    /// Set by the pump thread (Release) after it hit EOF/error and flushed
+    /// its final bytes. Together with a reaped child this is the only safe
+    /// reap point for the session: exit alone doesn't prove the last output
+    /// landed in the ring yet.
+    reader_done: Arc<AtomicBool>,
 }
 
 /// Sessions keyed by `<tool session_id>/<name>`; same global-state pattern
-/// as gasket-core's `proxy.rs` override. Known limitation: no reaper — a
-/// session is killed only when a new `run` reuses its key.
+/// as gasket-core's `proxy.rs` override. Dead sessions are reaped on
+/// `read` (exited + fully drained) and swept on the next `run` — see
+/// [`reap_dead_sessions`].
 static REGISTRY: LazyLock<RwLock<HashMap<String, Arc<Mutex<PtySession>>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -126,12 +139,16 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
     // Replace any live session under this key: SIGHUP then reap, so children
     // don't linger as zombies. The registry write guard is dropped at the
     // statement end — a wedged session lock below can't freeze other sessions.
-    let old = REGISTRY.write().unwrap().remove(key);
+    let old = REGISTRY.write().remove(key);
     if let Some(old) = old {
-        let mut s = old.lock().unwrap();
+        let mut s = old.lock();
         let _ = s.child.kill();
         let _ = s.child.wait();
     }
+
+    // Sessions the model stopped reading after their child exited would
+    // otherwise accumulate forever; sweep them before spawning the new one.
+    reap_dead_sessions();
 
     let pty = native_pty_system();
     let pair = pty
@@ -177,6 +194,8 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
 
     let ring = Arc::new(Mutex::new(OutputRing::default()));
     let pump_ring = Arc::clone(&ring);
+    let reader_done = Arc::new(AtomicBool::new(false));
+    let pump_done = Arc::clone(&reader_done);
     // Blocking reads live on a plain thread — portable-pty is sync IO. The
     // reader holds its own dup of the master fd, so dropping `pair` below is
     // safe; the thread exits on EOF when the child closes its end.
@@ -193,26 +212,26 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
                     let cut = utf8_split(&carry);
                     pump_ring
                         .lock()
-                        .unwrap()
                         .push_str(&String::from_utf8_lossy(&carry[..cut]));
                     carry.drain(..cut);
                 }
             }
         }
         if !carry.is_empty() {
-            pump_ring
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&carry));
+            pump_ring.lock().push_str(&String::from_utf8_lossy(&carry));
         }
+        // Publish after the final flush so a reaper that observes `done`
+        // knows no more bytes will ever land in the ring.
+        pump_done.store(true, Ordering::Release);
     });
 
-    REGISTRY.write().unwrap().insert(
+    REGISTRY.write().insert(
         key.to_string(),
         Arc::new(Mutex::new(PtySession {
             child,
             writer,
             ring,
+            reader_done,
         })),
     );
     Ok(ToolResult {
@@ -223,7 +242,7 @@ fn run(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
 }
 
 async fn read(key: &str) -> Result<ToolResult, ToolError> {
-    let Some(sess) = REGISTRY.read().unwrap().get(key).cloned() else {
+    let Some(sess) = REGISTRY.read().get(key).cloned() else {
         return Ok(ToolResult {
             content: vec![ContentBlock::text("no active session")],
             details: serde_json::json!({"exited": true}),
@@ -234,18 +253,25 @@ async fn read(key: &str) -> Result<ToolResult, ToolError> {
     // itself bounds output at 64KiB — core's spill_or_truncate is pub(crate)
     // and not exported, so ext returns the drained text directly (consistent
     // with ext's search/web tools, which don't spill either).
-    let (mut text, status) = {
-        let mut s = sess.lock().unwrap();
-        let out = s.ring.lock().unwrap().drain();
+    let (mut text, exit_code, reapable) = {
+        let mut s = sess.lock();
+        let out = s.ring.lock().drain();
         // try_wait: Ok(Some(status)) = exited, Ok(None) = still running.
         let status = s
             .child
             .try_wait()
             .map_err(|e| ToolError::Message(format!("wait failed: {e}")))?;
-        (out, status)
+        let exit_code = status.map(|st| st.exit_code() as i32);
+        // Reap only when the child is gone AND the pump thread has flushed
+        // its last byte (`reader_done`): exit alone doesn't prove the final
+        // output landed in the ring yet. The drained text is returned in
+        // this same call, so nothing is lost by removing the session.
+        let reapable = exit_code.is_some() && s.reader_done.load(Ordering::Acquire);
+        (out, exit_code, reapable)
     };
-    // `ExitStatus` is not Copy: derive `exited`/`exit_code` from one Option.
-    let exit_code = status.map(|s| s.exit_code() as i32);
+    if reapable {
+        remove_if_current(key, &sess);
+    }
     if let Some(code) = exit_code {
         text.push_str(&format!("\n[exited code {code}]"));
     }
@@ -258,19 +284,59 @@ async fn read(key: &str) -> Result<ToolResult, ToolError> {
         is_error: false,
     })
 }
+/// Remove `key` from the registry only if it still maps to `sess` — a
+/// concurrent `run` under the same key must keep its fresh session.
+fn remove_if_current(key: &str, sess: &Arc<Mutex<PtySession>>) {
+    let mut reg = REGISTRY.write();
+    if reg.get(key).is_some_and(|v| Arc::ptr_eq(v, sess)) {
+        reg.remove(key);
+    }
+}
+
+/// Sweep sessions whose child has exited and whose pump thread finished
+/// (final output already landed in a ring nobody will read again). Called
+/// from `run` before spawning a replacement — without it, sessions the
+/// model stops reading after exit accumulate forever in the process-global
+/// registry (child handles, 64KiB rings, reader-thread Arcs).
+///
+/// `try_lock` per session: a busy session (concurrent read/send) is simply
+/// skipped — the next sweep gets it; a wedged session lock can never block
+/// the sweep or the registry.
+fn reap_dead_sessions() {
+    let snapshot: Vec<(String, Arc<Mutex<PtySession>>)> = REGISTRY
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), Arc::clone(v)))
+        .collect();
+    for (key, sess) in snapshot {
+        let dead = match sess.try_lock() {
+            Some(mut s) => {
+                s.child.try_wait().map_or(false, |st| st.is_some())
+                    && s.reader_done.load(Ordering::Acquire)
+                    // Undrained output must stay readable by a later
+                    // `read` — only fully-read sessions may be culled.
+                    && s.ring.lock().is_empty()
+            }
+            None => false,
+        };
+        if dead {
+            remove_if_current(&key, &sess);
+        }
+    }
+}
 
 async fn send(ctx: &ToolCallCtx, key: &str) -> Result<ToolResult, ToolError> {
     let input = ctx.args["command"]
         .as_str()
         .ok_or_else(|| ToolError::Message("command is required for send".into()))?;
-    let Some(sess) = REGISTRY.read().unwrap().get(key).cloned() else {
+    let Some(sess) = REGISTRY.read().get(key).cloned() else {
         return Ok(ToolResult::error(format!("no session `{key}`")));
     };
     // Blocking stdin writes run on a std thread, not a tokio worker; the
     // session lock lives entirely inside the closure, never across an await.
     let input = input.to_string();
     let res = tokio::task::spawn_blocking(move || {
-        let mut s = sess.lock().unwrap();
+        let mut s = sess.lock();
         // PTY stdin is line-oriented: always terminate with a newline.
         s.writer
             .write_all(input.as_bytes())
@@ -521,5 +587,92 @@ mod tests {
             }
         }
         assert!(got.contains("got:ping"), "got: {got}");
+    }
+
+    /// True once `key`'s child has exited AND its pump thread finished —
+    /// the preconditions the reaper acts on — without draining the ring.
+    fn session_is_dead(key: &str) -> bool {
+        let reg = REGISTRY.read();
+        let Some(sess) = reg.get(key) else {
+            return true; // already reaped
+        };
+        let mut s = sess.lock();
+        s.child.try_wait().map_or(false, |st| st.is_some())
+            && s.reader_done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[tokio::test]
+    async fn read_reaps_exited_and_fully_drained_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = format!("reap-read-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "echo done"}),
+            tmp.path(),
+            &s,
+        )
+        .await;
+        assert!(!r.is_error);
+        // Poll read until the session is dead AND the reaper had its turn:
+        // the first exited read may still race the pump thread's final
+        // flush; a later one observes reader_done and removes the entry.
+        let mut got = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
+            got = text(&r);
+            if got.contains("done") && got.contains("[exited code 0]") {
+                if !REGISTRY.read().contains_key(&format!("{s}/default")) {
+                    break;
+                }
+            }
+        }
+        assert!(got.contains("done"), "got: {got}");
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{s}/default")),
+            "exited+drained session must leave the registry"
+        );
+        // A read after the reap is the honest "no active session" answer.
+        let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
+        assert_eq!(text(&r), "no active session");
+    }
+
+    #[tokio::test]
+    async fn run_sweeps_dead_sessions_the_model_stopped_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = format!("reap-sweep-a-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "true"}),
+            tmp.path(),
+            &a,
+        )
+        .await;
+        assert!(!r.is_error);
+        // the session is cullable without dropping unread bytes.
+        for _ in 0..50 {
+            if session_is_dead(&format!("{a}/default")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            session_is_dead(&format!("{a}/default")),
+            "test precondition: session must die first"
+        );
+        assert!(REGISTRY.read().contains_key(&format!("{a}/default")));
+
+        // Any new run sweeps the registry before spawning.
+        let b = format!("reap-sweep-b-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "echo live"}),
+            tmp.path(),
+            &b,
+        )
+        .await;
+        assert!(!r.is_error);
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{a}/default")),
+            "dead unread session must be swept by run"
+        );
+        assert!(REGISTRY.read().contains_key(&format!("{b}/default")));
     }
 }

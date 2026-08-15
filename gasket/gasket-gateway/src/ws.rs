@@ -130,7 +130,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         }
     };
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Skills (and the Host's tool sandbox) follow the project dir, not the
+    // gateway process's cwd — servers don't run inside the project they
+    // serve. GASKET_PROJECT_DIR overrides; unset = process cwd.
+    let cwd = gasket_host::project_dir();
     let system_prompt = gasket_host::append_skills("You are a helpful, concise assistant.", &cwd);
     let mode = std::env::var("GASKET_GATEWAY_MODE")
         .ok()
@@ -340,7 +343,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                 subagent_tools,
                 spawner_hooks,
                 spawner_signal,
-                std::env::current_dir().unwrap_or_default(),
+                gasket_host::project_dir(),
                 loop_config,
             )
             .with_ws_emit(ws_emit),

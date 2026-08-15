@@ -348,14 +348,14 @@ GASKET_EXTERNAL_TOOLS=rg,jq
 
 ### 9.7 Skills(可选)
 
-技能是磁盘上的 Markdown 指令文件。启动时 gasket 只把「名称 + 描述 + 文件路径」目录追加到系统提示;模型需要某个技能时,用 `read` 工具按目录给出的路径读取全文。全文不进入系统提示,不占用上下文预算。子代理(subagent)提示不参与技能目录。
+技能是磁盘上的 Markdown 指令文件。启动时 gasket 只把「名称 + 描述 + 文件路径」目录追加到系统提示;模型需要某个技能时,用 `read` 工具按目录给出的路径读取全文。全文不进入系统提示,不占用上下文预算。描述超过 200 字符会被截断(目录随每个请求付费,这是护栏)。子代理(subagent)提示不参与技能目录。
 
 两个存放位置(同名时项目覆盖全局):
 
-- 全局:`~/.gasket/skills/*.md`(绝对路径,`read` 已允许读取 `~/.gasket` 内的绝对路径)
-- 项目:`<项目根>/.gasket/skills/*.md`
+- 全局:`~/.gasket/skills/*.md`(目录里给绝对路径,`read` 已允许读取 `~/.gasket` 内的绝对路径)
+- 项目:`<项目根>/.gasket/skills/*.md`(目录里给相对项目根的路径,`read` 在项目根内解析相对路径)
 
-文件必须以 YAML frontmatter 开头,`name` 与 `description` 缺一不可,否则该文件被跳过并在日志告警。文件需使用 LF(Unix)换行符——CRLF 文件无法通过严格的 `---\n` frontmatter 校验,同样会被跳过并在日志告警。示例 `~/.gasket/skills/commit-style.md`:
+文件必须以 YAML frontmatter 开头,`name` 与 `description` 缺一不可,否则该文件被跳过并在日志告警。`description` 支持单行标量与块标量(`|`/`>`,含 `-`/`+` chomping 指示);块标量会被折叠成一行进目录。文件需使用 LF(Unix)换行符——CRLF 文件无法通过严格的 `---\n` frontmatter 校验,同样会被跳过并在日志告警。示例 `~/.gasket/skills/commit-style.md`:
 
 ```markdown
 ---
@@ -366,6 +366,8 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 ```
 
 ---
+
+> **服务器宿主(gateway / 桌面端)不会运行在它们服务的项目里** —— 项目技能与工具沙箱跟随 `GASKET_PROJECT_DIR`(见 §10),不设置时退化为进程 cwd。Web 端要用项目技能,在 gateway 的 `.env` 里设 `GASKET_PROJECT_DIR=<项目根>`。
 
 ## 10. 环境变量完整参考
 
@@ -390,7 +392,6 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 | `GASKET_MAX_TOKENS` | `4096` | 模型输出 token 上限 |
 | `GASKET_THINKING` | `off` | `off`/`low`/`medium`/`high`(模型不支持时无效) |
 | `GASKET_RETRY_MAX` | `2` | LLM 调用最大重试次数(仅流前失败) |
-| `GASKET_RETRY_INITIAL_MS` | `500` | 首次重试退避(ms) |
 | `GASKET_RETRY_MAX_MS` | `8000` | 退避上限(ms) |
 
 ### 网关服务器
@@ -401,6 +402,7 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 | `GASKET_GATEWAY_STATIC_DIR` | `../web/dist` | 前端静态资源目录 |
 | `GASKET_GATEWAY_MODE` | `auto-edit` | 审批模式 `suggest`/`auto-edit`/`full-auto` |
 | `GASKET_APPROVAL_TIMEOUT_S` | `300` | 审批等待超时(秒) |
+| `GASKET_PROJECT_DIR` | 进程 cwd | 项目根:工具沙箱边界与 `<dir>/.gasket/skills` 项目技能扫描根(服务器宿主用,见 §9.7) |
 
 ### 上下文压缩
 
@@ -436,6 +438,7 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 |---|---|
 | CLI 启动报 `config error` 并退出 | 三项必填 env 缺失。确认 `gasket/.env` 有 `GASKET_LLM_BASE_URL`/`GASKET_LLM_KEY`/`GASKET_LLM_MODEL`,或在 shell 里 `export`。 |
 | Web 端连不上、一直离线 | `VITE_WS_URL` 指向错或后端未起。确认 `gasket-gateway` 在跑(默认 3000),且 `VITE_WS_URL=ws://localhost:3000`。重连 5 次后会显示手动 Reconnect 按钮。 |
+| Web/桌面端用不了项目技能 | 服务器宿主的项目根由 `GASKET_PROJECT_DIR` 决定(不设 = 进程 cwd,通常不是你的项目)。在 gateway/桌面端的 `.env` 设 `GASKET_PROJECT_DIR=<项目根>`,并确认 `<项目根>/.gasket/skills/*.md` 的 frontmatter 有 `name` 和 `description`。 |
 | 端口 3000 被占用 | 用 `GASKET_GATEWAY_PORT=<其它端口>` 改网关端口,并把前端 `VITE_WS_URL`/`VITE_API_URL` 同步改掉。 |
 | 报 `orphan tool_call` / 工具结果错乱 | 通常与压缩有关;确认没有手动设异常小的 `GASKET_COMPACT_MAX_MESSAGES`。正常情况下原子组会保护 tool_call↔result。 |
 | 模型不支持 thinking | `GASKET_THINKING` 设了 `low/medium/high` 但模型不支持时自动无效化;`ModelSpec.supports_thinking` 控制是否发送 thinking 参数。 |

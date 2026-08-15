@@ -224,13 +224,73 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
+    let (items, torn) = scan_jsonl_buffer(&bytes, path, fail_closed_on_data)?;
+    if let Some(torn) = torn {
+        warn_torn_tail(path, &torn);
+        if repair_tail {
+            repair_torn_tail(path, torn.start).await?;
+        }
+    }
+    Ok(items)
+}
+
+/// Sync twin of [`scan_jsonl`] on `std::fs`, for engines that already run
+/// on a blocking thread (the session-index reindex in `spawn_blocking`).
+/// Identical policy — the parse core is shared, so the two cannot drift.
+fn scan_jsonl_sync<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    repair_tail: bool,
+    fail_closed_on_data: bool,
+) -> Result<Vec<T>, AgentError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let (items, torn) = scan_jsonl_buffer(&bytes, path, fail_closed_on_data)?;
+    if let Some(torn) = torn {
+        warn_torn_tail(path, &torn);
+        if repair_tail {
+            repair_torn_tail_sync(path, torn.start)?;
+        }
+    }
+    Ok(items)
+}
+
+/// A torn-tail verdict from [`scan_jsonl_buffer`]: the bad line's number,
+/// its start byte offset (the truncation point), and the parse error.
+struct TornTail {
+    line_no: usize,
+    start: usize,
+    err: serde_json::Error,
+}
+
+fn warn_torn_tail(path: &Path, torn: &TornTail) {
+    tracing::warn!(
+        path = %path.display(),
+        line = torn.line_no,
+        error = %torn.err,
+        "dropping torn transcript tail"
+    );
+}
+
+/// Pure scan of an in-memory JSONL buffer into rows plus an optional torn
+/// tail. Shared core of [`scan_jsonl`] and [`scan_jsonl_sync`] — all the
+/// line-walking and error-precedence policy lives here, the wrappers only
+/// own file IO and the tail repair.
+///
+/// A parse failure is only a torn tail if no further line follows it
+/// (i.e. it is the last non-blank line). Defer the verdict instead of
+/// rescanning the remainder per line — one pass, O(n).
+fn scan_jsonl_buffer<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    path: &Path,
+    fail_closed_on_data: bool,
+) -> Result<(Vec<T>, Option<TornTail>), AgentError> {
     let mut items = Vec::new();
     let mut line_start = 0usize;
     let mut line_no = 0usize;
-    // A parse failure is only a torn tail if no further line follows it
-    // (i.e. it is the last non-blank line). Defer the verdict instead of
-    // rescanning the remainder per line — one pass, O(n).
-    let mut pending: Option<(usize, usize, serde_json::Error)> = None; // (line_no, byte offset, error)
+    let mut pending: Option<TornTail> = None;
     for (idx, b) in bytes.iter().enumerate() {
         if *b != b'\n' {
             continue;
@@ -244,12 +304,14 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         }
         match serde_json::from_slice::<T>(line) {
             Ok(m) => {
-                if let Some((bad_no, _, err)) = pending.take() {
+                if let Some(bad) = pending.take() {
                     // A good line after the bad one proves the bad line was
                     // mid-file damage, not a torn tail.
                     return Err(AgentError::Transcript(format!(
-                        "invalid line {bad_no} in {}: {err}",
-                        path.display()
+                        "invalid line {} in {}: {}",
+                        bad.line_no,
+                        path.display(),
+                        bad.err
                     )));
                 }
                 items.push(m);
@@ -261,14 +323,20 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
                         path.display()
                     )));
                 }
-                if let Some((bad_no, _, err)) = pending.take() {
+                if let Some(bad) = pending.take() {
                     // A second bad line proves the first was mid-file too.
                     return Err(AgentError::Transcript(format!(
-                        "invalid line {bad_no} in {}: {err}",
-                        path.display()
+                        "invalid line {} in {}: {}",
+                        bad.line_no,
+                        path.display(),
+                        bad.err
                     )));
                 }
-                pending = Some((line_no, this_line_start, e));
+                pending = Some(TornTail {
+                    line_no,
+                    start: this_line_start,
+                    err: e,
+                });
             }
         }
     }
@@ -278,10 +346,12 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
         line_no += 1;
         match serde_json::from_slice::<T>(tail) {
             Ok(m) => {
-                if let Some((bad_no, _, err)) = pending.take() {
+                if let Some(bad) = pending.take() {
                     return Err(AgentError::Transcript(format!(
-                        "invalid line {bad_no} in {}: {err}",
-                        path.display()
+                        "invalid line {} in {}: {}",
+                        bad.line_no,
+                        path.display(),
+                        bad.err
                     )));
                 }
                 items.push(m);
@@ -289,10 +359,12 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
             Err(e) => {
                 // A torn fragment after a bad complete line proves the bad
                 // line was mid-file (old semantics: error, not double-heal).
-                if let Some((bad_no, _, err)) = pending.take() {
+                if let Some(bad) = pending.take() {
                     return Err(AgentError::Transcript(format!(
-                        "invalid line {bad_no} in {}: {err}",
-                        path.display()
+                        "invalid line {} in {}: {}",
+                        bad.line_no,
+                        path.display(),
+                        bad.err
                     )));
                 }
                 if fail_closed_on_data && e.classify() == serde_json::error::Category::Data {
@@ -301,33 +373,21 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
                         path.display()
                     )));
                 }
-                tracing::warn!(
-                    path = %path.display(),
-                    line = line_no,
-                    error = %e,
-                    "dropping torn transcript tail"
-                );
-                if repair_tail {
-                    repair_torn_tail(path, line_start).await?;
-                }
+                return Ok((
+                    items,
+                    Some(TornTail {
+                        line_no,
+                        start: line_start,
+                        err: e,
+                    }),
+                ));
             }
         }
     }
     // A bad complete line with nothing but (optional) blank lines after it is
     // the torn tail: drop it, and truncate the file at its start so later
     // appends land after valid data.
-    if let Some((bad_no, bad_start, err)) = pending.take() {
-        tracing::warn!(
-            path = %path.display(),
-            line = bad_no,
-            error = %err,
-            "dropping torn transcript tail"
-        );
-        if repair_tail {
-            repair_torn_tail(path, bad_start).await?;
-        }
-    }
-    Ok(items)
+    Ok((items, pending))
 }
 
 /// Truncate the transcript at `keep_until` (the byte offset where a torn line
@@ -336,6 +396,13 @@ async fn scan_jsonl<T: serde::de::DeserializeOwned>(
 async fn repair_torn_tail(path: &Path, keep_until: usize) -> Result<(), AgentError> {
     let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     file.set_len(keep_until as u64).await?;
+    Ok(())
+}
+
+/// Sync twin of [`repair_torn_tail`].
+fn repair_torn_tail_sync(path: &Path, keep_until: usize) -> Result<(), AgentError> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(keep_until as u64)?;
     Ok(())
 }
 
@@ -435,14 +502,7 @@ impl EventStorage {
     /// closure) so they never have to bridge onto the async runtime.
     pub fn append_event_sync(&self, session_id: &str, ev: &SessionEvent) -> Result<(), AgentError> {
         validate_session_id(session_id)?;
-        let path = self.events_path(session_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = open_append_sync(&self.events_path(session_id))?;
         append_line_sync(&mut file, ev)
     }
 
@@ -458,14 +518,7 @@ impl EventStorage {
             return Ok(());
         }
         validate_session_id(session_id)?;
-        let path = self.events_path(session_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = open_append_sync(&self.events_path(session_id))?;
         for ev in evs {
             append_line_sync(&mut file, ev)?;
         }
@@ -525,6 +578,15 @@ impl EventStorage {
         scan_jsonl::<SessionEvent>(&self.events_path(session_id), true, true).await
     }
 
+    /// Synchronous twin of [`load_events`](Self::load_events) on `std::fs`,
+    /// for engines that already run on a blocking thread (the session-index
+    /// reindex inside `spawn_blocking`). Identical torn-tail and
+    /// fail-closed policy — the parse core is shared.
+    pub fn load_events_sync(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+        validate_session_id(session_id)?;
+        scan_jsonl_sync::<SessionEvent>(&self.events_path(session_id), true, true)
+    }
+
     /// Load the legacy `messages.jsonl` for a session — the migration source.
     /// Returns empty vec when there is nothing to migrate. Legacy semantics
     /// are frozen: identical recovery policy to
@@ -559,6 +621,15 @@ impl EventStorage {
             return None;
         }
         let bytes = tokio::fs::read(self.meta_path(session_id)).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Synchronous twin of [`load_meta`](Self::load_meta).
+    pub fn load_meta_sync(&self, session_id: &str) -> Option<SessionMeta> {
+        if !is_valid_session_id(session_id) {
+            return None;
+        }
+        let bytes = std::fs::read(self.meta_path(session_id)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -598,6 +669,30 @@ impl EventStorage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Open `path` for `O_APPEND` creation, creating the parent directory only
+/// when the open proves it missing. The sync append paths are the agent
+/// loop's per-event persist callback — an unconditional `create_dir_all`
+/// there walks the directory tree on every event; the NotFound fallback
+/// pays for directory creation exactly once per session.
+fn open_append_sync(path: &Path) -> Result<std::fs::File, AgentError> {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+    match open() {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(open()?)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

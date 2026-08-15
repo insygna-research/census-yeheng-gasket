@@ -38,6 +38,23 @@ pub use session::{SessionInfo, SessionManager};
 pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
 
+/// Project directory: the sandbox root for tool paths and the base for
+/// `<dir>/.gasket/skills` project skills. `GASKET_PROJECT_DIR` overrides the
+/// process cwd — servers (gateway, desktop app) don't run inside the project
+/// they serve, so they need an explicit knob; the CLI leaves it unset.
+pub fn project_dir() -> PathBuf {
+    project_dir_with(std::env::var("GASKET_PROJECT_DIR").ok().as_deref())
+}
+
+/// Testable core of [`project_dir`]; the override comes from env in
+/// production.
+fn project_dir_with(override_dir: Option<&str>) -> PathBuf {
+    match override_dir.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => PathBuf::from(v),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("config error: {0}")]
@@ -95,9 +112,10 @@ impl Host {
         tools: Vec<ToolDefinition>,
     ) -> Self {
         let hooks: Arc<dyn gasket_core::HookChain> = Arc::new(HookStack::new(vec![policy.clone()]));
-        // cwd failure is practically impossible (the process runs from it);
-        // falling back to `.` keeps tools resolving relative to the same place.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Tool sandbox + project skills follow the project dir (env
+        // override for servers); unset = process cwd, so the CLI is
+        // unchanged. `.` fallback keeps tools resolving to the same place.
+        let cwd = project_dir();
         Self {
             cwd,
             signal: Arc::new(AtomicBool::new(false)),
@@ -360,6 +378,20 @@ mod tests {
             ("GASKET_LLM_MODEL", "m"),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn project_dir_env_override_beats_process_cwd() {
+        assert_eq!(
+            project_dir_with(Some("/some/project")),
+            PathBuf::from("/some/project")
+        );
+        // Blank/empty override must not win over the cwd fallback.
+        assert_eq!(
+            project_dir_with(Some("   ")),
+            std::env::current_dir().unwrap()
+        );
+        assert_eq!(project_dir_with(None), std::env::current_dir().unwrap());
     }
 
     #[test]
