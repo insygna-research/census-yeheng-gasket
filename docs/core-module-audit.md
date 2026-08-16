@@ -9,10 +9,10 @@
 | 分类 | 文件数 | 模块 |
 |---|---|---|
 | **底座必需 core-required** | 20 | `lib.rs`, `agent_loop.rs`, `error.rs`, `extension/{mod,api}.rs`, `guard.rs`, `providers/{mod,anthropic,openai_compat,sse}.rs`, `proxy.rs`, `storage/mod.rs`, `subagent.rs`(trait 文件), `types/{mod,context,message,tool,event,session_event}.rs`, `test_util.rs`(cfg(test) 内部) |
-| **host 专属 host-only** | 11 | `tools/*` 全部 11 个文件(mod/read/write/edit/bash/list/grep/fetch/sandbox/subagent)——仅被 host 层二进制(conga-host / conga-cli / conga-gateway / web/src-tauri)与 example/文档消费 |
+| **host 专属 host-only** | 11 | `tools/*` 全部 10 个文件(mod/read/write/edit/bash/list/grep/fetch/sandbox/subagent)——仅被 host 层二进制(conga-host / conga-cli / conga-gateway / web/src-tauri)与 example/文档消费 |
 | **待裁决 undecided** | 0 | 无:未发现任何「内核 + host 混用」的非 tools 模块 |
 
-与控制器锁定裁决(progress.md §Controller rulings #2/#3)一致:`tools/*` 全量 11 文件进 `built-in-tools` feature;其余全部无条件保留。**未发现与裁决冲突的证据。**
+与控制器锁定裁决(progress.md §Controller rulings #2/#3)一致:`tools/*` 全量 10 文件进 `built-in-tools` feature;其余全部无条件保留。**未发现与裁决冲突的证据。**
 
 ## 1. 底座必需模块(core-required)
 
