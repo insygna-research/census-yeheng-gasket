@@ -444,8 +444,16 @@ mod tests {
         }
     }
 
+    /// Integration tests share the process-global REGISTRY, and every `run`
+    /// sweeps ALL dead sessions in it — one test's sweep would cull
+    /// another's fixture mid-test (e.g. the "still present" precondition in
+    /// run_sweeps_dead_sessions). Serialize every test that calls `run`;
+    /// tokio's Mutex because the guard is held across awaits.
+    static REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn run_then_read_returns_output_and_exit() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         // unique session key so parallel tests never share a registry slot
         let s = format!("run-read-{}", std::process::id());
@@ -487,6 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_scrubs_conga_env_and_passes_others_through() {
+        let _registry = REGISTRY_LOCK.lock().await;
         std::env::set_var("CONGA_SENTINEL", "leak-me-12345");
         let tmp = tempfile::tempdir().unwrap();
         let s = format!("env-scrub-{}", std::process::id());
@@ -524,6 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_then_read_preserves_multibyte_output() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let s = format!("utf8-{}", std::process::id());
         let r = exec(
@@ -560,6 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_writes_to_stdin_of_running_child() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let s = format!("send-{}", std::process::id());
         // `read` a line then echo it back — proves stdin round-trip through the PTY.
@@ -603,6 +614,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_reaps_exited_and_fully_drained_session() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let s = format!("reap-read-{}", std::process::id());
         let r = exec(
@@ -638,6 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_sweeps_dead_sessions_the_model_stopped_reading() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let a = format!("reap-sweep-a-{}", std::process::id());
         let r = exec(

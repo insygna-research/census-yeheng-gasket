@@ -58,6 +58,7 @@ fn full_auto_policy() -> PermissionPolicy {
 /// FakeStream's other scripts).
 fn write_call(id: &str, path: &str, content: &str) -> StreamChunk {
     StreamChunk::ToolCallDelta {
+        index: None,
         id: id.into(),
         name: Some("write".into()),
         args_delta: serde_json::json!({ "path": path, "content": content }).to_string(),
@@ -527,4 +528,77 @@ async fn corrupted_session_errors_instead_of_adopting() {
         !dir2.join("events.jsonl").exists(),
         "no partial events.jsonl may be written from a corrupt source"
     );
+}
+
+/// Mid-turn compaction through the `transform_context` seam: within ONE
+/// turn the working transcript grows with every assistant+tool-result
+/// pair, and the wire view handed to the provider must be re-compacted
+/// before EVERY call — not just once at turn start.
+#[tokio::test]
+async fn run_turn_compacts_before_every_llm_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = format!(
+        "{}/c.txt",
+        work.path().file_name().unwrap().to_string_lossy()
+    );
+
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let fake = Arc::new(FakeStream::new(vec![
+        vec![write_call("t1", &rel, "one"), StreamChunk::Done],
+        vec![write_call("t2", &rel, "two"), StreamChunk::Done],
+        vec![StreamChunk::TextDelta("done".into()), StreamChunk::Done],
+    ]));
+    let stream_fn: Arc<dyn conga::StreamFn> = fake.clone();
+    // No recorded usage → count-fallback path with a tiny cap of 3.
+    let budget =
+        conga_host::ContextBudget::from_env_with(&fake_env(&[("CONGA_COMPACT_MAX_MESSAGES", "3")]));
+    let host = Host::new(
+        test_cfg(true),
+        session,
+        Arc::new(full_auto_policy()),
+        "sys".into(),
+        conga::built_in_tools(),
+    )
+    .with_stream_fn(stream_fn)
+    .with_budget(budget);
+
+    let summary = host.run_turn("go", |_| {}).await.unwrap();
+    assert!(matches!(summary.reason, TurnEndReason::Completed));
+
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "three LLM calls expected");
+    // Call 1: history is just the user prompt.
+    assert_eq!(seen[0].len(), 1);
+    // Call 2: user + assistant + tool_result = 3, still within cap.
+    assert_eq!(seen[1].len(), 3);
+    // Call 3: history is 5 (user + 2×(assistant+tool_result)); the wire
+    // view must be compacted back to the cap, notice included — under the
+    // old compact-once-at-turn-start behavior this call saw all 5.
+    assert!(
+        seen[2].len() <= 3,
+        "third call must be compacted, got {}",
+        seen[2].len()
+    );
+    let notice = match &seen[2][0] {
+        AgentMessage::User(u) => match &u.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        },
+        _ => panic!("expected compaction notice first, got {:?}", seen[2][0]),
+    };
+    assert!(
+        notice.starts_with("[compacted"),
+        "expected compaction notice, got: {notice}"
+    );
+    // The on-disk log keeps the FULL transcript: every assistant message,
+    // uncompacted — the seam is a wire view only.
+    let sid = host.session().current_id().to_string();
+    let reopen = SessionManager::with_root(tmp.path().to_path_buf());
+    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let assistants = events
+        .iter()
+        .filter(|ev| matches!(ev, SessionEvent::Assistant { .. }))
+        .count();
+    assert_eq!(assistants, 3, "log keeps every assistant, uncompacted");
 }

@@ -467,6 +467,7 @@ mod tests {
                 hooks: None,
                 retry: RetryPolicy::off(),
                 persist: None,
+                transform_context: None,
             },
         )
         .with_ws_emit(Arc::new(move |ev| {
@@ -495,6 +496,7 @@ mod tests {
         let spawner = test_spawner(
             Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
+                    index: None,
                     id: "t1".into(),
                     name: Some("bash".into()),
                     args_delta: "{\"command\":\"echo hi\"}".into(),
@@ -617,6 +619,7 @@ mod tests {
             Arc::new(MockStream(vec![
                 StreamChunk::TextDelta("Searching the codebase".into()),
                 StreamChunk::ToolCallDelta {
+                    index: None,
                     id: "tc1".into(),
                     name: Some("list".into()),
                     args_delta: "{}".into(),

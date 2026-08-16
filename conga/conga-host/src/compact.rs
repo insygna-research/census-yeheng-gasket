@@ -211,6 +211,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             usage: None,
             timestamp: 1,
+            stream_indices: Vec::new(),
         })
     }
 
@@ -230,6 +231,7 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             usage: None,
             timestamp: 1,
+            stream_indices: Vec::new(),
         })
     }
 

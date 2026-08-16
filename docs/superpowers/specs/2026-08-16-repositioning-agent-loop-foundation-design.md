@@ -112,6 +112,10 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 
 ### T1 命名决策（P0）
 
+> **已完成（2026-08-16）**：定名 `conga` 并全局执行完毕（见 §8-D1 执行记录）。
+> crates.io 占位注册随 D4（暂不发布）延后——FREE 状态窗口风险自担。
+
+
 - **目标**：敲定 crates.io 发布名，一次到位。发布后改名 = 破坏 userspace；发布前 = 免费。
 - **范围**：workspace `Cargo.toml` package name、README/docs/CI badge、Docker 镜像名。
   **不动** `events.jsonl` 格式、`~/.gasket/` 目录、gateway WS/REST 协议。
@@ -120,6 +124,16 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 - **开放选项**：见 §8-D1。
 
 ### T2 修复 `append_tool_call` 盲匹配（P1 地基）
+> **已完成（2026-08-16）**：TDD 执行，11 套件全绿（conga lib 156→165），fmt/clippy/
+> src-tauri check 全绿。实施超出原案——排查中发现 **Anthropic 流式工具调用本就是坏的**：
+> `parse_anthropic_chunk` 没有 `content_block_start` 分支，`tool_use` 的 id/name 从未
+> 进入累积消息（每次工具调用都执行为 unknown tool）。同一接缝一并修复。
+> 最终方案比原案「打开指针」更对：捡回 OpenAI 协议自带的 `tool_calls[].index`
+> 路由键——`StreamChunk::ToolCallDelta` 增加 `index: Option<u32>`，
+> `AssistantMessage` 增加 `#[serde(skip)] stream_indices` 路由表（磁盘格式零变化，
+> 有序列化不变量测试锁定）。三条路由统一为一张查找表：index（OpenAI 并行）→
+> id（Anthropic start）→ last（顺序续片，行为不变有回归锁定）。
+> 变异测试证明新测试咬得住旧 bug（临时回退旧路由 → `two calls, not one merged blob` 红）。
 
 - **目标**：无 id 的 tool 参数 delta 永远路由到正确的 ToolCall。
 - **方案**：统一「按 id 找」与「按序找」两个特例——维护「当前打开的 ToolCall」指针
@@ -130,6 +144,21 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 - **红线**：不动 `AgentMessage`/`SessionEvent` 序列化格式；内核不引入 per-provider 特例。
 
 ### T3 loop 增加 `transform_context` 接缝（P1 地基，R3 的兑现）
+
+> **已完成（2026-08-16）**：TDD 执行，全绿（conga lib +3 测试；host integration +1；
+> 11 套件全绿，fmt/clippy/src-tauri check 绿）。
+> - 核心：`AgentLoopConfig.transform_context: Option<Arc<dyn Fn(&[AgentMessage]) -> Result<Vec<AgentMessage>, AgentError>>>`；
+>   在**每次逻辑 LLM 调用前**于重试循环外计算一次（重试复用同一视图，避免非确定）；
+>   `Err` 经新 `AgentError::ContextTransform` 变体 fail-loud。
+> - **关键不变量（有测试锁定）**：transform 只是 **wire view**——loop 累积器、返回值、
+>   persist 落盘事件永远是全量未压缩历史（`transform_context_never_touches_accumulator_or_persisted_events`）。
+> - host 迁移：`run_turn` 的一次性 `budget.compact(&history)` **已删除**，
+>   compaction 走接缝在每次 LLM 调用前执行（`config.transform_context` 由 run_turn 注入）。
+>   中途增长也被约束（`run_turn_compacts_before_every_llm_call`：同轮第 3 次调用
+>   wire ≤ 预算上限 + `[compacted N]` 通知首条 + 日志全量 assistant）。
+> - 变异测试：闭包换 no-op → `third call must be compacted, got 5` 红；恢复绿。
+> - D2 裁决遵守：未加 steering/follow-up 回调。
+
 
 - **目标**：`AgentLoopConfig` 新增可选回调，loop 在**每次 LLM 调用前**应用。
 - **签名方向**（最终以实现 plan 为准）：
@@ -172,9 +201,11 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 - **验收**：无 feature 的 core 编译通过且依赖树最小；host/cli/gateway 行为零变化。
 - **红线**：不删任何工具实现，只改归属；不改 `ToolDefinition` pub API。
 
-### T7 底座 crate 发布 + 双示例（P3）
+### T7 双示例（P3）——发布部分已冻结（D4，2026-08-16）
 
-- **目标**：crates.io 发布（T1 定名），semver **0.x** 起步——公开 API 还会动，直接发 1.0 是撒谎。
+> **D4 裁决影响**：crates.io 发布、semver、`cargo add` 实测验收**冻结**，解冻由用户定。
+> 本任务只保留示例部分。注意：crate 名已因 D1 全局改名为 `conga`，下文 `gasket-core` 字样
+> 均指 `conga`（底座 crate）。
 - **示例**（同时是重定位的**硬验收标准**与 dogfood）：
   - `examples/minimal_agent.rs`：自定义 1-2 个工具 + provider，**≤50 行**跑通完整 loop 含事件流。
     写示例时暴露的 API 别扭处**回修 core**，不在示例里绕。
@@ -223,7 +254,7 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 
 ---
 
-## 8. 待用户裁决的开放决策点
+## 8. 决策点（D1-D5 已全部裁决，2026-08-16）
 
 ### D1 命名（阻塞 T1，其余不受阻）
 
@@ -286,25 +317,30 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 
 ### D2 `getSteeringMessages` / `getFollowUpMessages`（R4）
 
-推荐**缓抄**（等参考应用真需要「运行中插话」再加，加则两个一起）。
-备选：随 T3 一起加——一次性扩 `AgentLoopConfig`，省一轮 semver minor。
-若选「现在加」，T3 范围扩大为三回调。
+> **已裁决（2026-08-16）：不加。** T3 范围保持单回调（`transform_context`）。
+> 触发条件（重新评估时机）：参考应用出现真实的「运行中插话」需求——届时两个一起加。
+
 
 ### D3 `web/` 前端去留
 
-推荐**留在仓里作参考应用**（叙事降级即可）。
-备选：拆到独立仓库——叙事最干净，但跨仓联调成本立刻上升，且当前无此压力。
+> **已裁决（2026-08-16）：保留在仓里**，叙事降级为参考应用（T9/T10 照此执行）。不拆独立仓库。
 
 ### D4 发布节奏
 
-推荐 T7 在 P2 全部完成后**一次性**发布 0.1.0。
-备选：T2+T3 完成后先发 0.0.x 内测版占名——若 D1 选 b，占名有价值；若选 a，无必要。
+> **已裁决（2026-08-16）：暂不发布。** 影响：
+> - **T7 冻结发布部分**（crates.io publish、semver、`cargo add` 实测验收），解冻时机由用户定；
+> - **T7 保留示例部分**（`minimal_agent.rs` ≤50 行 / `compacting_agent.rs` / `mock.rs`）——
+>   它是重定位的硬验收与 dogfood，与发布无关；
+> - crates.io 占位注册随之延后。风险自担声明：`conga` 目前 FREE，囤名前科
+>   （`bobbin` Reserved、`whirl`/`swirl` Reserved）说明窗口不等人；
+> - §9 验证缺口第 1 条（`cargo add` 实测）随发布冻结一并挂起，第 2-5 条不受影响。
 
 ### D5 cost 追踪（R11）
 
-推荐**不入主线**，作为 backlog。备选：随 T3 顺手在 `Usage` 加 `cost` 字段——
-但「顺手加字段」违反红线 4 的精神，除非有真实用户要求。
+> **已裁决（2026-08-16）：暂不做。** backlog。`Usage` 不加 `cost` 字段；
+> 触发条件：出现真实用户要求。
 
+**D1-D5 全部裁决完毕，无开放决策点。** 规划可执行态：T2 → T3 → T4 → T5/T6 → T7(仅示例) / T8 → T9/T10。
 ---
 
 ## 9. 验证缺口（若跳过本规划直接挂牌，以下即谎言清单）

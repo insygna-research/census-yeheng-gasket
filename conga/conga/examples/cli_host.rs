@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("persist bridge thread panicked")
             })
         })),
+        transform_context: None,
     };
     store
         .append_event(&session_id, &conga::SessionEvent::TurnStart)

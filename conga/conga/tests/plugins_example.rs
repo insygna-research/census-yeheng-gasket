@@ -25,6 +25,7 @@ impl StreamFn for CallToolOnce {
         let args_str = self.args.to_string();
         Box::pin(stream::iter(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "call_1".into(),
                 name: Some(tool),
                 args_delta: args_str,
@@ -67,6 +68,7 @@ async fn hello_extension_greets() {
         hooks: None,
         retry: conga::RetryPolicy::default(),
         persist: None,
+        transform_context: None,
     };
 
     let msgs = conga::agent_loop(vec![], ctx, cfg).await.unwrap();
@@ -118,6 +120,7 @@ async fn permission_gate_blocks_bash() {
         hooks: Some(Arc::new(api) as Arc<dyn conga::types::tool::HookChain>),
         retry: conga::RetryPolicy::default(),
         persist: None,
+        transform_context: None,
     };
 
     let mut saw_block = false;

@@ -362,6 +362,7 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             usage: None,
             timestamp: 0,
+            stream_indices: Vec::new(),
         };
         store
             .append_events(

@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hooks: Some(Arc::new(api)),
         retry: conga::RetryPolicy::default(),
         persist: None,
+        transform_context: None,
     };
 
     let msgs = conga::agent_loop(vec![user_msg], context, config).await?;
@@ -86,6 +87,7 @@ impl StreamFn for MockThatCallsHello {
     ) -> std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         Box::pin(futures_util::stream::iter(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "call_1".into(),
                 name: Some("hello".into()),
                 args_delta: r#"{"name":"Ada"}"#.into(),

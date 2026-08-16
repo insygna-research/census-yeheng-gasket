@@ -334,6 +334,7 @@ pub(crate) fn parse_anthropic_chunk(json_str: &str) -> Vec<StreamChunk> {
                         .unwrap_or("")
                         .to_string();
                     vec![StreamChunk::ToolCallDelta {
+                        index: None,
                         id: String::new(),
                         name: None,
                         args_delta: partial,
@@ -346,6 +347,33 @@ pub(crate) fn parse_anthropic_chunk(json_str: &str) -> Vec<StreamChunk> {
                         .unwrap_or("")
                         .to_string();
                     vec![StreamChunk::ThinkingDelta(thinking)]
+                }
+                _ => vec![],
+            }
+        }
+        "content_block_start" => {
+            // A tool_use block opens here and ONLY here: this event carries
+            // the id+name the accumulator keys later input_json_delta
+            // continuations against. Text/thinking blocks carry nothing the
+            // accumulator needs (their content arrives via deltas).
+            let block = match v.get("content_block") {
+                Some(b) => b,
+                None => return vec![],
+            };
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => {
+                    let id = block
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block.get("name").and_then(|n| n.as_str()).map(String::from);
+                    vec![StreamChunk::ToolCallDelta {
+                        index: None,
+                        id,
+                        name,
+                        args_delta: String::new(),
+                    }]
                 }
                 _ => vec![],
             }
@@ -389,6 +417,30 @@ mod tests {
         match &chunks[0] {
             StreamChunk::ToolCallDelta { args_delta, .. } => {
                 assert_eq!(args_delta, "{\"x\":");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_content_block_start_tool_use() {
+        // The tool_use id+name arrive ONLY on content_block_start;
+        // dropping that event (the pre-fix `_ => vec![]` arm) left
+        // accumulated calls with empty id/name, so every Anthropic
+        // tool call executed as an unknown tool.
+        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#;
+        let chunks = parse_anthropic_chunk(json);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::ToolCallDelta {
+                id,
+                name,
+                args_delta,
+                ..
+            } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name.as_deref(), Some("read"));
+                assert_eq!(args_delta, "");
             }
             _ => panic!("wrong variant"),
         }
@@ -498,6 +550,7 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             usage: None,
             timestamp: 0,
+            stream_indices: Vec::new(),
         })
     }
 
@@ -560,6 +613,7 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 usage: None,
                 timestamp: 0,
+                stream_indices: Vec::new(),
             }),
         ];
         let body = request_body(&messages);

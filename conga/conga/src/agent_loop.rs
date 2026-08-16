@@ -418,6 +418,15 @@ where
 {
     let max_retries = config.retry.max_retries;
     let mut attempt: usize = 0;
+    // Compute the wire view ONCE per logical LLM call, before any provider
+    // request: retries must see the identical view, so the transform runs
+    // outside the retry loop. `Err` fails the run loud. `None` = the
+    // accumulator itself is the view (zero-change default).
+    let transformed: Option<Vec<AgentMessage>> = match &config.transform_context {
+        Some(t) => Some(t(&context.messages)?),
+        None => None,
+    };
+    let wire: &[AgentMessage] = transformed.as_deref().unwrap_or(&context.messages);
     loop {
         if is_aborted(config) {
             // A cancel arrived while the host was waiting (e.g. an approval
@@ -442,7 +451,7 @@ where
         });
         tracing::debug!(model = %config.model.id, attempt, "provider request");
 
-        match attempt_stream_once(context, config, &mut *emit).await {
+        match attempt_stream_once(wire, context, config, &mut *emit).await {
             StreamAttempt::Done(accumulated) => {
                 tracing::debug!(stop_reason = ?accumulated.stop_reason, "provider response");
                 emit(AgentEvent::MessageEnd {
@@ -501,10 +510,8 @@ enum StreamAttempt {
     },
 }
 
-/// Run one streaming attempt: accumulate chunks into an [`AssistantMessage`],
-/// emitting `MessageUpdate` for each delta. Returns [`StreamAttempt::Done`] on
-/// normal completion (or abort), or [`StreamAttempt::Errored`] on a stream error.
 async fn attempt_stream_once<E>(
+    wire: &[AgentMessage],
     context: &AgentContext,
     config: &AgentLoopConfig,
     emit: &mut E,
@@ -515,7 +522,7 @@ where
     let mut stream: Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> =
         (config.stream_fn).stream(
             &config.model,
-            &context.messages,
+            wire,
             &context.system_prompt,
             &context.tools,
             config.signal.clone(),
@@ -541,12 +548,13 @@ where
                 });
             }
             StreamChunk::ToolCallDelta {
+                index,
                 id,
                 name,
                 args_delta,
             } => {
                 emitted_content = true;
-                accumulated.append_tool_call(id.clone(), name.clone(), args_delta.clone());
+                accumulated.append_tool_call(index, id.clone(), name.clone(), args_delta.clone());
                 emit(AgentEvent::MessageUpdate {
                     delta: ContentDelta::ToolCallDelta {
                         id,
@@ -665,6 +673,7 @@ mod tests {
             hooks: None,
             retry: crate::RetryPolicy::off(),
             persist: None,
+            transform_context: None,
         }
     }
 
@@ -729,6 +738,7 @@ mod tests {
         // Model: tool_call(echo, {"x":1}) -> then plain text "done".
         let config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("echo".into()),
                 args_delta: "{\"x\":1}".into(),
@@ -777,11 +787,13 @@ mod tests {
         };
         let config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("echo".into()),
                 args_delta: "{\"x\":".into(),
             },
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: String::new(),
                 name: None,
                 args_delta: "1}".into(),
@@ -835,6 +847,275 @@ mod tests {
             !split,
             "chunked args leaked into a split empty-name tool call"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_assembles_interleaved_indexed_tool_calls() {
+        // OpenAI-compat parallel tool calls, fragments interleaved and keyed
+        // by `index`. Both calls must execute with their own complete args;
+        // the pre-fix accumulator appended B's fragment onto A's arguments.
+        fn echo_tool(name: &'static str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.into(),
+                label: name.into(),
+                description: "echo args".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                risk: RiskLevel::Low,
+                execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                    Box::pin(
+                        async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                    )
+                }),
+            }
+        }
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: Some(0),
+                id: "t0".into(),
+                name: Some("alpha".into()),
+                args_delta: "{\"a\":".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                index: Some(1),
+                id: "t1".into(),
+                name: Some("beta".into()),
+                args_delta: "{\"b\":".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                index: Some(0),
+                id: String::new(),
+                name: None,
+                args_delta: "0}".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                index: Some(1),
+                id: String::new(),
+                name: None,
+                args_delta: "1}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo_tool("alpha"), echo_tool("beta")],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        // The mock replays the same chunk list every turn; every execution
+        // of alpha must carry {"a":0} and every beta {"b":1} - never the
+        // cross-contaminated {"a":{"b":...}} of the pre-fix behavior.
+        for m in &msgs {
+            if let AgentMessage::ToolResult(tr) = m {
+                let text = match &tr.content[0] {
+                    ContentBlock::Text { text } => text.clone(),
+                    _ => panic!("expected text content"),
+                };
+                match tr.tool_name.as_str() {
+                    "alpha" => assert!(text.contains("\"a\":0"), "alpha args: {text}"),
+                    "beta" => assert!(text.contains("\"b\":1"), "beta args: {text}"),
+                    other => panic!("unexpected tool result: {other}"),
+                }
+            }
+        }
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AgentMessage::ToolResult(tr) if tr.tool_name == "beta")),
+            "both interleaved calls must execute"
+        );
+    }
+
+    /// A mock StreamFn that records the message list it was called with.
+    struct RecordingStream {
+        chunks: Vec<StreamChunk>,
+        seen: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
+    }
+    impl StreamFn for RecordingStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[crate::types::tool::ToolDefinition],
+            _signal: Option<std::sync::Arc<AtomicBool>>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            Box::pin(stream::iter(self.chunks.clone()))
+        }
+    }
+
+    fn echo_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo args".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|c: ToolCallCtx| {
+                Box::pin(
+                    async move { Ok(crate::types::tool::ToolResult::text(c.args.to_string())) },
+                )
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn transform_context_applies_before_each_llm_call() {
+        // The seam must run before EVERY provider call, not just the first:
+        // with a tool-calling mock driving max_turns turns, the wire view
+        // stays compacted even as the accumulator grows turn over turn.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        config.max_turns = 3;
+        config.stream_fn = Arc::new(RecordingStream {
+            chunks: vec![
+                StreamChunk::ToolCallDelta {
+                    index: None,
+                    id: "t1".into(),
+                    name: Some("echo".into()),
+                    args_delta: "{}".into(),
+                },
+                StreamChunk::Done,
+            ],
+            seen: Arc::clone(&seen),
+        });
+        let calls2 = Arc::clone(&calls);
+        config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Keep only the last two messages (any compaction-like policy).
+            Ok(msgs.iter().rev().take(2).rev().cloned().collect())
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo_tool()],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        run_agent_loop(
+            vec![AgentMessage::User(crate::types::message::UserMessage {
+                content: vec![ContentBlock::text("go")],
+                timestamp: 1,
+            })],
+            context,
+            config,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one wire view per LLM call");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "transform invoked once per LLM call"
+        );
+        // Accumulator grows 1 → 3 → 5 messages across turns; the wire view
+        // must stay capped at 2 after the first call.
+        assert_eq!(seen[0].len(), 1, "first call sees the seeded prompt");
+        assert!(
+            seen[1].len() <= 2,
+            "second call compacted, got {}",
+            seen[1].len()
+        );
+        assert!(
+            seen[2].len() <= 2,
+            "third call compacted, got {}",
+            seen[2].len()
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_context_error_fails_the_run_loud() {
+        let mut config = test_config(vec![StreamChunk::Done]);
+        config.transform_context = Some(Arc::new(|_msgs: &[AgentMessage]| {
+            Err(AgentError::ContextTransform("budget exploded".into()))
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        let err = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::ContextTransform(ref m) if m.contains("budget exploded")),
+            "expected ContextTransform error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_context_never_touches_accumulator_or_persisted_events() {
+        // The transformed list is a WIRE VIEW only: what the loop
+        // accumulates, returns, and persists is always the full history.
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        config.max_turns = 2;
+        let persisted: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let p2 = Arc::clone(&persisted);
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            p2.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+        config.transform_context = Some(Arc::new(|msgs: &[AgentMessage]| {
+            Ok(msgs.iter().rev().take(1).rev().cloned().collect())
+        }));
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo_tool()],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+            spawner: None,
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        // Full accumulator: 2 × (assistant + tool result) = 4 messages,
+        // none dropped despite the transform keeping only the last one.
+        assert_eq!(msgs.len(), 4, "returned messages must be uncompacted");
+        let persisted = persisted.lock().unwrap();
+        let assistants = persisted
+            .iter()
+            .filter(|ev| matches!(ev, SessionEvent::Assistant { .. }))
+            .count();
+        assert_eq!(assistants, 2, "persisted assistant events uncompacted");
     }
 
     /// A `before_tool_call` handler that blocks the `bash` tool.
@@ -902,6 +1183,7 @@ mod tests {
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
+                    index: None,
                     id: "t1".into(),
                     name: Some("bash".into()),
                     args_delta: "{\"command\":\"rm -rf /\"}".into(),
@@ -910,6 +1192,7 @@ mod tests {
             ])),
             hooks: Some(std::sync::Arc::new(api)),
             persist: None,
+            transform_context: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -964,6 +1247,7 @@ mod tests {
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
+                    index: None,
                     id: "t1".into(),
                     name: Some("echo".into()),
                     args_delta: "{\"secret\":1}".into(),
@@ -972,6 +1256,7 @@ mod tests {
             ])),
             hooks: Some(std::sync::Arc::new(api)),
             persist: None,
+            transform_context: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -1017,6 +1302,7 @@ mod tests {
         };
         let config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("boom".into()),
                 args_delta: "{}".into(),
@@ -1066,6 +1352,7 @@ mod tests {
         };
         let config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("echo".into()),
                 args_delta: "{\"command\":".into(),
@@ -1103,6 +1390,7 @@ mod tests {
         // report "tool not found" as a tool_result and continue.
         let config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("ghost".into()),
                 args_delta: "{}".into(),
@@ -1175,6 +1463,7 @@ mod tests {
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
             persist: None,
+            transform_context: None,
             retry: crate::RetryPolicy::off(),
         };
         let context = AgentContext {
@@ -1231,11 +1520,13 @@ mod tests {
         };
         let mut config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("set_abort".into()),
                 args_delta: "{}".into(),
             },
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t2".into(),
                 name: Some("echo".into()),
                 args_delta: "{}".into(),
@@ -1399,11 +1690,13 @@ mod tests {
         };
         let mut config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("echo".into()),
                 args_delta: "{}".into(),
             },
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t2".into(),
                 name: Some("echo".into()),
                 args_delta: "{}".into(),
@@ -1537,6 +1830,7 @@ mod tests {
         let mut config = test_config(vec![
             StreamChunk::TextDelta("checking".into()),
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("echo".into()),
                 args_delta: "{}".into(),
@@ -1637,6 +1931,7 @@ mod tests {
         };
         let mut config = test_config(vec![
             StreamChunk::ToolCallDelta {
+                index: None,
                 id: "t1".into(),
                 name: Some("bash".into()),
                 args_delta: "{\"command\":\"rm -rf /\"}".into(),

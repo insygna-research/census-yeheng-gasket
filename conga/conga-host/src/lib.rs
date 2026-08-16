@@ -200,8 +200,9 @@ impl Host {
     /// happened, instead of rolling back to a pre-turn transcript.
     /// Flow: persist(TurnStart) → persist(User) → history =
     /// derive_messages(load_events) → repair dangling tool calls →
-    /// budget.compact(&history) (in-memory only; the log stays append-only
-    /// full) → prepare_turn → run_agent_loop → persist(TurnEnd{reason}) →
+    /// prepare_turn → run_agent_loop (budget.compact runs inside the loop's
+    /// `transform_context` seam before EVERY LLM call — a wire view only;
+    /// the log stays append-only full) → persist(TurnEnd{reason}) →
     /// [`TurnSummary`].
     ///
     /// `on_event` receives every [`AgentEvent`](conga::AgentEvent)
@@ -236,7 +237,10 @@ impl Host {
             .await?;
 
         // Restore the token budget from the log tail (the last persisted
-        // assistant usage), then shrink the derived working copy in memory.
+        // assistant usage). Compaction itself runs through the loop's
+        // `transform_context` seam — BEFORE EVERY LLM CALL, not once at
+        // turn start — so the wire view stays under budget even as the
+        // accumulator grows mid-turn. The log on disk is never rewritten.
         let mut budget = self.budget.clone();
         if let Some(input_tokens) = events.iter().rev().find_map(|ev| match ev {
             SessionEvent::Assistant { usage, .. } => usage.as_ref().map(|u| u.input_tokens),
@@ -247,11 +251,10 @@ impl Host {
         let mut history = derive_messages(&events);
         // The log keeps partial facts by design (abort/crash mid-batch);
         // the provider protocol does not tolerate them. Synthesize error
-        // results for tool calls that never got one before compacting.
+        // results for tool calls that never got one before feeding the loop.
         repair_unanswered_tool_calls(&mut history);
-        let history = budget.compact(&history);
 
-        let (mut context, config) = self.cfg.prepare_turn(
+        let (mut context, mut config) = self.cfg.prepare_turn(
             TurnInputs {
                 system_prompt: &self.system_prompt,
                 history: &history,
@@ -265,6 +268,9 @@ impl Host {
             self.max_turns,
             Some(self.session.persist_fn()),
         );
+        config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
+            Ok(budget.compact(msgs))
+        }));
         // Inject the subagent spawner if the host has one configured.
         if let Some(sp) = &self.spawner {
             context.spawner = Some(Arc::clone(sp));

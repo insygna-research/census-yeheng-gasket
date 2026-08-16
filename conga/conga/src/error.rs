@@ -23,6 +23,8 @@ pub enum AgentError {
     InvalidSessionId(String),
     #[error("a turn is already running on this host")]
     TurnInProgress,
+    #[error("context transform failed: {0}")]
+    ContextTransform(String),
 }
 
 /// Error returned by a tool's `execute` closure.

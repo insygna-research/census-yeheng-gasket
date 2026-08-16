@@ -318,6 +318,7 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
 
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
+            let index = tc.get("index").and_then(|i| i.as_u64()).map(|i| i as u32);
             let id = tc
                 .get("id")
                 .and_then(|i| i.as_str())
@@ -335,6 +336,7 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
                 .to_string();
             if !id.is_empty() || name.is_some() || !args_delta.is_empty() {
                 chunks.push(StreamChunk::ToolCallDelta {
+                    index,
                     id,
                     name,
                     args_delta,
@@ -442,14 +444,63 @@ mod tests {
             assert_eq!(chunks.len(), 1);
             match &chunks[0] {
                 StreamChunk::ToolCallDelta {
+                    index,
                     id,
                     name,
                     args_delta,
                 } => {
+                    assert_eq!(*index, None);
                     assert_eq!(id, "t1");
                     assert_eq!(name.as_deref(), Some("echo"));
                     assert_eq!(args_delta, "{\"x\":");
                 }
+                _ => panic!("wrong variant"),
+            }
+        }
+
+        #[test]
+        fn parses_tool_call_index_from_interleaved_deltas() {
+            // OpenAI-compat keys parallel tool-call deltas by `index`; the
+            // first appearance carries id+name, continuations carry only
+            // argument fragments. Dropping `index` made interleaved
+            // fragments indistinguishable from sequential ones.
+            let open0 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t0","function":{"name":"a","arguments":"{\"x\":"}}]}}]}"#;
+            let open1 = r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"t1","function":{"name":"b","arguments":"{\"y\":"}}]}}]}"#;
+            let cont0 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#;
+            let no_index = r#"{"choices":[{"delta":{"tool_calls":[{"id":"t2","function":{"name":"c","arguments":"{}"}}]}}]}"#;
+
+            match &parse_openai_chunk(open0)[0] {
+                StreamChunk::ToolCallDelta { index, id, .. } => {
+                    assert_eq!(*index, Some(0));
+                    assert_eq!(id, "t0");
+                }
+                _ => panic!("wrong variant"),
+            }
+            match &parse_openai_chunk(open1)[0] {
+                StreamChunk::ToolCallDelta { index, id, .. } => {
+                    assert_eq!(*index, Some(1));
+                    assert_eq!(id, "t1");
+                }
+                _ => panic!("wrong variant"),
+            }
+            match &parse_openai_chunk(cont0)[0] {
+                StreamChunk::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    args_delta,
+                } => {
+                    assert_eq!(*index, Some(0));
+                    assert_eq!(id, "");
+                    assert!(name.is_none());
+                    assert_eq!(args_delta, "1}");
+                }
+                _ => panic!("wrong variant"),
+            }
+            // Deltas without any index field (some OpenAI-compat servers)
+            // must degrade to None, not fabricate a key.
+            match &parse_openai_chunk(no_index)[0] {
+                StreamChunk::ToolCallDelta { index, .. } => assert_eq!(*index, None),
                 _ => panic!("wrong variant"),
             }
         }

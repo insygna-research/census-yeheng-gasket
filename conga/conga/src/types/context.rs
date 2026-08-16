@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::error::AgentError;
-use crate::types::message::ModelId;
+use crate::types::message::{AgentMessage, ModelId};
 use crate::types::session_event::SessionEvent;
 use crate::types::tool::ToolDefinition;
 
@@ -66,6 +66,14 @@ pub struct AgentLoopConfig {
     /// run (fail loud - storage failures are never silently swallowed).
     #[allow(clippy::type_complexity)]
     pub persist: Option<Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync>>,
+    /// Optional transform applied to the message list before EVERY LLM
+    /// call — the seam host compaction (or redaction, auditing) hooks
+    /// into. Pure wire view: the loop's accumulator, returned messages,
+    /// and persisted events always keep the full uncompacted history.
+    /// `Err` fails the run loud (never silently swallowed).
+    #[allow(clippy::type_complexity)]
+    pub transform_context:
+        Option<Arc<dyn Fn(&[AgentMessage]) -> Result<Vec<AgentMessage>, AgentError> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for AgentLoopConfig {
@@ -212,6 +220,11 @@ pub enum ThinkingLevel {
 pub enum StreamChunk {
     TextDelta(String),
     ToolCallDelta {
+        /// OpenAI-compat stream key for parallel tool calls
+        /// (`tool_calls[].index`): first appearance opens a call,
+        /// continuations repeat the index without id/name. `None` when the
+        /// provider keys by id (Anthropic) or omits the field.
+        index: Option<u32>,
         id: String,
         name: Option<String>,
         args_delta: String,
