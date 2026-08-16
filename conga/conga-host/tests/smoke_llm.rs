@@ -33,7 +33,7 @@ async fn end_to_end_basic_chat() {
             Arc::new(|_, _| Box::pin(async { false })),
         )),
         "You are a test assistant. Follow instructions exactly.".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_max_turns(3);
 
@@ -75,7 +75,7 @@ async fn end_to_end_tool_call() {
             Arc::new(|_, _| Box::pin(async { false })),
         )),
         "You are a test assistant. You MUST use tools when asked to.".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_max_turns(3);
 

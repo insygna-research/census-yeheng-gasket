@@ -67,8 +67,10 @@ pub fn event_to_ws(
 /// `subagent_*` protocol. Returns `None` for events that have no wire
 /// representation (the internal `Usage` accounting event). Transports
 /// serialize the value themselves (WS: text frame; Tauri: event payload).
-pub fn subagent_event_to_ws(event: &conga::SubagentEvent) -> Option<serde_json::Value> {
-    use conga::SubagentEvent;
+pub fn subagent_event_to_ws(
+    event: &crate::subagent_types::SubagentEvent,
+) -> Option<serde_json::Value> {
+    use crate::subagent_types::SubagentEvent;
     let json = match event {
         SubagentEvent::AllStarted { count } => serde_json::json!({
             "type": "subagent_all_started", "count": count
@@ -119,7 +121,8 @@ pub fn subagent_event_to_ws(event: &conga::SubagentEvent) -> Option<serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conga::{ContentBlock, SubagentEvent, ToolResultMessage};
+    use crate::subagent_types::SubagentEvent;
+    use conga::{ContentBlock, ToolResultMessage};
     use serde_json::Value;
 
     #[test]

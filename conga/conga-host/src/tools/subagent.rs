@@ -1,10 +1,16 @@
 //! `spawn_subagents` tool — fan out parallel sub-agent loops.
+//!
+//! The spawner is injected via [`crate::set_spawn_spawner`] (called by
+//! `Host::with_spawner`), not through the core `ToolContext` — the core
+//! stays free of host concerns. Without an injected spawner the tool
+//! reports subagents as unavailable (same behavior as the pre-move
+//! `NoopSubagentSpawner` fallback).
 
 use std::sync::Arc;
 
-use crate::subagent::{SubagentSpawn, SubagentSpawner};
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use crate::subagent_types::{SubagentSpawn, SubagentSpawner};
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
@@ -29,14 +35,14 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
 
     let tasks = ctx.args["tasks"]
         .as_array()
-        .ok_or_else(|| crate::error::ToolError::Message("tasks array is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("tasks array is required".into()))?;
 
     let mut spawns: Vec<SubagentSpawn> = tasks
         .iter()
@@ -58,9 +64,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let dropped = spawns.len().saturating_sub(5);
     spawns.truncate(5);
 
-    let spawner: Arc<dyn SubagentSpawner> = match &ctx.ctx.spawner {
-        Some(s) => Arc::clone(s),
-        None => Arc::new(crate::subagent::NoopSubagentSpawner),
+    let spawner: Arc<dyn SubagentSpawner> = match crate::spawn_spawner_slot() {
+        Some(s) => s,
+        None => Arc::new(crate::subagent_types::NoopSubagentSpawner),
     };
 
     let results = spawner.spawn(spawns).await;
@@ -102,8 +108,8 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::subagent::{SubagentResult, SubagentSpawner};
-    use crate::types::tool::ToolContext;
+    use crate::subagent_types::{SubagentResult, SubagentSpawner};
+    use conga::types::tool::ToolContext;
 
     /// Records how many tasks it received; returns one canned result each.
     struct CountingSpawner(Arc<AtomicUsize>);
@@ -131,11 +137,23 @@ mod tests {
             })
         }
     }
+    /// Install a spawner into the process-wide slot and return a guard that
+    /// restores it to `None` on drop, so tests cannot leak into each other.
+    fn with_slot(spawner: Option<Arc<dyn SubagentSpawner>>) -> impl Drop {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                *crate::SPAWN_SPAWNER.write() = None;
+            }
+        }
+        match spawner {
+            Some(s) => crate::set_spawn_spawner(s),
+            None => *crate::SPAWN_SPAWNER.write() = None,
+        }
+        Guard
+    }
 
-    fn ctx_with(
-        spawner: Option<Arc<dyn SubagentSpawner>>,
-        tasks: serde_json::Value,
-    ) -> ToolCallCtx {
+    fn ctx_with(tasks: serde_json::Value) -> ToolCallCtx {
         ToolCallCtx {
             tool_call_id: "t1".into(),
             args: serde_json::json!({ "tasks": tasks }),
@@ -145,11 +163,9 @@ mod tests {
                 env: HashMap::new(),
                 session_id: "s1".into(),
                 state_dir: std::env::temp_dir(),
-                spawner,
             },
         }
     }
-
     fn seven_tasks() -> serde_json::Value {
         serde_json::json!([
             { "task": "a" },
@@ -168,9 +184,8 @@ mod tests {
     async fn truncates_over_limit_tasks_and_reports() {
         let count = Arc::new(AtomicUsize::new(0));
         let spawner = Arc::new(CountingSpawner(Arc::clone(&count)));
-        let r = execute(ctx_with(Some(spawner), seven_tasks()))
-            .await
-            .unwrap();
+        let _slot = with_slot(Some(spawner));
+        let r = execute(ctx_with(seven_tasks())).await.unwrap();
 
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -193,7 +208,8 @@ mod tests {
     /// task comes back as an explicit error, never a silent no-op.
     #[tokio::test]
     async fn no_spawner_reports_unavailable() {
-        let r = execute(ctx_with(None, seven_tasks())).await.unwrap();
+        let _slot = with_slot(None);
+        let r = execute(ctx_with(seven_tasks())).await.unwrap();
 
         assert_eq!(r.details["subagent_count"], 5);
         assert_eq!(r.details["errors"], 5);

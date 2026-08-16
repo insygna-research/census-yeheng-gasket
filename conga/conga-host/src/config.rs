@@ -100,7 +100,6 @@ impl HostConfig {
             cwd,
             env,
             session_id: session_id.to_string(),
-            spawner: None,
         }
     }
 

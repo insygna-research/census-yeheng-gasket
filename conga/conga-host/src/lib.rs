@@ -19,11 +19,14 @@ pub mod hooks;
 pub mod mcp;
 pub mod permission;
 pub mod printer;
+pub mod proxy;
 pub mod session;
 #[cfg(feature = "session-index")]
 pub mod session_index;
 pub mod skills;
 pub mod subagent;
+pub mod subagent_types;
+pub mod tools;
 pub mod wire;
 
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
@@ -34,9 +37,14 @@ pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
+pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use session::{SessionInfo, SessionManager};
 pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
+pub use subagent_types::{
+    NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
+};
+pub use tools::built_in_tools;
 
 /// Project directory: the sandbox root for tool paths and the base for
 /// `<dir>/.conga/skills` project skills. `CONGA_PROJECT_DIR` overrides the
@@ -85,15 +93,29 @@ pub struct Host {
     /// assistant usage from its tail, so token-aware compaction survives
     /// restarts by construction.
     budget: ContextBudget,
-    /// Subagent spawner — built lazily; injected into AgentContext so the
-    /// `spawn_subagents` tool can use it.
-    spawner: Option<Arc<dyn conga::SubagentSpawner>>,
     /// Turn serialization slot: run_turn acquires it on entry and releases
     /// it on completion or drop. The event log's format contract assumes a
     /// single writer per session, and one Host drives one session — so a
     /// second concurrent turn is rejected outright instead of interleaving
     /// two event streams into one log.
     turn_in_flight: AtomicBool,
+}
+
+/// Process-wide spawner slot feeding the `spawn_subagents` tool. The core
+/// `ToolContext` no longer carries a spawner (host concern), so the tool
+/// resolves it here at execution time. Registration order is irrelevant:
+/// `Host::with_spawner` may run after `built_in_tools()`.
+static SPAWN_SPAWNER: parking_lot::RwLock<Option<Arc<dyn SubagentSpawner>>> =
+    parking_lot::RwLock::new(None);
+
+/// Install the spawner used by the `spawn_subagents` tool (idempotent overwrite).
+pub fn set_spawn_spawner(spawner: Arc<dyn SubagentSpawner>) {
+    *SPAWN_SPAWNER.write() = Some(spawner);
+}
+
+/// The currently installed spawner, if any.
+pub fn spawn_spawner_slot() -> Option<Arc<dyn SubagentSpawner>> {
+    SPAWN_SPAWNER.read().clone()
 }
 
 impl Host {
@@ -122,7 +144,6 @@ impl Host {
             stream_fn: cfg.provider_stream_fn(),
             max_turns: cfg.tunables.max_turns,
             budget: ContextBudget::from_env(),
-            spawner: None,
             cfg,
             turn_in_flight: AtomicBool::new(false),
             session,
@@ -162,8 +183,8 @@ impl Host {
     /// Inject a subagent spawner. Without this, the `spawn_subagents` tool
     /// returns an "unavailable" error. CLI/gateway pass a `HostSubagentSpawner`
     /// built from the host's config.
-    pub fn with_spawner(mut self, spawner: Arc<dyn conga::SubagentSpawner>) -> Self {
-        self.spawner = Some(spawner);
+    pub fn with_spawner(self, spawner: Arc<dyn crate::subagent_types::SubagentSpawner>) -> Self {
+        set_spawn_spawner(spawner);
         self
     }
 
@@ -254,7 +275,7 @@ impl Host {
         // results for tool calls that never got one before feeding the loop.
         repair_unanswered_tool_calls(&mut history);
 
-        let (mut context, mut config) = self.cfg.prepare_turn(
+        let (context, mut config) = self.cfg.prepare_turn(
             TurnInputs {
                 system_prompt: &self.system_prompt,
                 history: &history,
@@ -271,10 +292,6 @@ impl Host {
         config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
             Ok(budget.compact(msgs))
         }));
-        // Inject the subagent spawner if the host has one configured.
-        if let Some(sp) = &self.spawner {
-            context.spawner = Some(Arc::clone(sp));
-        }
 
         let outcome = conga::run_agent_loop(vec![user], context, config, |ev| {
             on_event(ev);

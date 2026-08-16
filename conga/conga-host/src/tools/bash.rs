@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 /// Default command timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -27,13 +27,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
     let command = ctx.args["command"]
         .as_str()
-        .ok_or_else(|| crate::error::ToolError::Message("command is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("command is required".into()))?;
     let timeout = ctx.args["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_SECS);
 
     let mut cmd = if cfg!(target_os = "windows") {
@@ -96,7 +96,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::tool::ToolContext;
+    use conga::types::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
 
     async fn run(args: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
@@ -110,7 +110,6 @@ mod tests {
                 env: std::env::vars().collect(),
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
-                spawner: None,
             },
         })
         .await
@@ -167,7 +166,6 @@ mod tests {
                 env,
                 session_id: "s".into(),
                 state_dir: tmp.path().to_path_buf(),
-                spawner: None,
             },
         })
         .await
@@ -240,7 +238,6 @@ mod tests {
                 env,
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
-                spawner: None,
             },
         })
         .await

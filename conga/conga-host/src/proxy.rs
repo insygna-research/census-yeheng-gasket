@@ -95,6 +95,16 @@ fn apply_proxy_url(
 
 #[cfg(test)]
 pub(crate) mod test_util {
+    pub(crate) fn fake_env(
+        pairs: &[(&str, &str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
     /// Serializes tests that touch the global override. Shared across this
     /// crate's test modules (proxy.rs, tools/fetch.rs) so parallel test
     /// threads/tasks cannot observe each other's override. A tokio mutex so
@@ -108,7 +118,7 @@ pub(crate) mod test_util {
 mod tests {
     use super::*;
 
-    use crate::test_util::fake_env;
+    use super::test_util::fake_env;
 
     #[test]
     fn validation_accepts_supported_schemes() {

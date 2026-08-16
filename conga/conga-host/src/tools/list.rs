@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 /// Cap the number of entries returned so tool output stays bounded.
 const MAX_ENTRIES: usize = 2000;
@@ -38,7 +38,7 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
@@ -119,7 +119,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::tool::ToolContext;
+    use conga::types::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
 
     async fn run(args: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
@@ -133,7 +133,6 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
-                spawner: None,
             },
         })
         .await

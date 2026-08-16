@@ -445,7 +445,7 @@ impl McpBridge {
 /// override > `CONGA_TOOL_PROXY`), then the legacy LLM-proxy env chain for
 /// backward compatibility. Direct connection when none is set.
 fn pick_mcp_proxy(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Option<String> {
-    if let Some(p) = conga::tool_proxy() {
+    if let Some(p) = crate::proxy::tool_proxy() {
         return Some(p);
     }
     ["CONGA_LLM_PROXY", "HTTPS_PROXY", "https_proxy"]
@@ -1127,7 +1127,6 @@ for line in sys.stdin:
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         }
     }
@@ -1212,7 +1211,7 @@ mod proxy_tests {
     #[test]
     fn tool_proxy_wins_over_legacy_env() {
         let _g = LOCK.lock().unwrap();
-        conga::set_tool_proxy(Some("socks5://tool:1080")).unwrap();
+        crate::proxy::set_tool_proxy(Some("socks5://tool:1080")).unwrap();
         assert_eq!(
             pick_mcp_proxy(&fake_env(&[
                 ("CONGA_TOOL_PROXY", "socks5://tool:1080"),
@@ -1220,13 +1219,13 @@ mod proxy_tests {
             ])),
             Some("socks5://tool:1080".to_string())
         );
-        conga::set_tool_proxy(None).unwrap();
+        crate::proxy::set_tool_proxy(None).unwrap();
     }
 
     #[test]
     fn legacy_llm_proxy_still_works() {
         let _g = LOCK.lock().unwrap();
-        conga::set_tool_proxy(None).unwrap();
+        crate::proxy::set_tool_proxy(None).unwrap();
         assert_eq!(
             pick_mcp_proxy(&fake_env(&[("CONGA_LLM_PROXY", "http://llm:8080")])),
             Some("http://llm:8080".to_string())

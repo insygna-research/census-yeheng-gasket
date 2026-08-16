@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use conga::{built_in_tools, AgentEvent};
+use conga::AgentEvent;
 
 use conga_host::approval::{self, ApprovalRegistry, RegisterOutcome};
 use conga_host::event_map::event_to_ws;
@@ -33,7 +33,7 @@ use crate::wire::{ApprovalResponse, IncomingMessage};
 /// and approval requests could overtake the tool_start they belong to.
 enum WireEvent {
     Agent(conga::AgentEvent),
-    Subagent(conga::SubagentEvent),
+    Subagent(conga_host::SubagentEvent),
     Approval {
         request_id: String,
         tool_name: String,
@@ -178,7 +178,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         .map(|ev| serde_json::to_string(&ev).unwrap_or_default())
                 }
                 WireEvent::Subagent(ev) => {
-                    if let conga::SubagentEvent::Usage {
+                    if let conga_host::SubagentEvent::Usage {
                         input_tokens,
                         output_tokens,
                     } = ev
@@ -287,9 +287,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let extra_tools = load_external_tools().await;
     let mcp_tools = load_all_mcp().await;
     // Built-in tools built once; the sub-agent set is filtered from this
-    // same Vec (minus `spawn_subagents`), so built_in_tools() is never
+    // same Vec (minus `spawn_subagents`), so conga_host::built_in_tools() is never
     // called twice per connection.
-    let built_in = built_in_tools();
+    let built_in = conga_host::built_in_tools();
     let subagent_tools: Vec<_> = built_in
         .iter()
         .filter(|t| t.name != "spawn_subagents")
@@ -314,9 +314,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     // Subagent spawner: events forwarded to WS via the wire channel.
     {
         let spawner_signal = host.signal().clone();
-        let ws_emit: Arc<dyn Fn(conga::SubagentEvent) + Send + Sync> = {
+        let ws_emit: Arc<dyn Fn(conga_host::SubagentEvent) + Send + Sync> = {
             let wire = wire_tx.clone();
-            Arc::new(move |ev: conga::SubagentEvent| {
+            Arc::new(move |ev: conga_host::SubagentEvent| {
                 let _ = wire.send(WireEvent::Subagent(ev));
             })
         };

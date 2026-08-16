@@ -426,7 +426,6 @@ mod tests {
                 env,
                 session_id: session.into(),
                 state_dir: cwd.to_path_buf(),
-                spawner: None,
             },
         })
         .await
@@ -608,7 +607,7 @@ mod tests {
             return true; // already reaped
         };
         let mut s = sess.lock();
-        s.child.try_wait().map_or(false, |st| st.is_some())
+        s.child.try_wait().is_ok_and(|st| st.is_some())
             && s.reader_done.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -632,10 +631,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
             got = text(&r);
-            if got.contains("done") && got.contains("[exited code 0]") {
-                if !REGISTRY.read().contains_key(&format!("{s}/default")) {
-                    break;
-                }
+            if got.contains("done")
+                && got.contains("[exited code 0]")
+                && !REGISTRY.read().contains_key(&format!("{s}/default"))
+            {
+                break;
             }
         }
         assert!(got.contains("done"), "got: {got}");

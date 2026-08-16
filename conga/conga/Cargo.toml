@@ -24,9 +24,8 @@ thiserror = { workspace = true }
 # Logging & Tracing
 tracing = { workspace = true }
 
-# HTTP client (providers + fetch tool)
+# HTTP client (providers)
 reqwest = { workspace = true }
-url = { workspace = true, optional = true }
 
 # Async utilities
 futures-util = { workspace = true }
@@ -35,44 +34,7 @@ async-stream = "0.3"
 # Home/config dir lookup
 dirs = { workspace = true }
 
-# ---- built-in-tools-only deps (feature-gated; see [features]) ----
-# Gitignore-aware directory walking (list + grep tools). Bundles `walkdir` +
-# `globset`, so we no longer depend on `walkdir` directly.
-ignore = { version = "0.4", optional = true }
-
-# Glob matching (list tool)
-glob = { version = "0.3", optional = true }
-
-# Regex matching (grep tool)
-regex = { version = "1", optional = true }
-# HTML parsing for the fetch tool
-dom_query = { version = "0.28", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# Opt-in Landlock backend for the bash tool (CONGA_SANDBOX=1).
-landlock = { version = "0.4", optional = true }
-
-[features]
-default = []
-# The 8 built-in tools under `src/tools/` (read/write/edit/bash/grep/list/
-# fetch/spawn_subagents) plus their `built_in_tools()` re-export. The minimal
-# agent-loop core (loop/types/providers/storage/extension/guard/error/proxy/
-# subagent) builds without this feature and without the deps below.
-built-in-tools = ["dep:ignore", "dep:glob", "dep:regex", "dep:dom_query", "dep:url"]
-# Opt-in Linux sandbox backend; macOS (sandbox-exec) needs no dependency.
-sandbox-landlock = ["dep:landlock"]
-
-[[example]]
-name = "cli_host"
-required-features = ["built-in-tools"]
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 tempfile = "3"
-# Session IDs for example hosts (the library core stays uuid-free).
-uuid = { workspace = true }
-# .env loading for example hosts (the library itself stays process-env-only).
-dotenvy = "0.15"
-# Example host uses the real extension crate (same register shape as production).
-conga-ext = { path = "../conga-ext" }

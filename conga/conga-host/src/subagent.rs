@@ -12,10 +12,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::subagent_types::{SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner};
 use conga::{
     run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock,
-    ContentDelta, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner, ToolDefinition,
-    UserMessage,
+    ContentDelta, ToolDefinition, UserMessage,
 };
 
 /// Max turns for a sub-agent (lower than the parent's default 50).
@@ -132,7 +132,6 @@ impl SubagentSpawner for HostSubagentSpawner {
                     cwd: spawner.cwd.clone(),
                     env: (*spawner.env).clone(),
                     session_id: format!("subagent-{id}"),
-                    spawner: None,
                 };
 
                 // Clone the parent-derived template, then pin this spawner's
@@ -448,7 +447,7 @@ mod tests {
     ) -> HostSubagentSpawner {
         HostSubagentSpawner::new(
             "sys".into(),
-            conga::built_in_tools(),
+            crate::built_in_tools(),
             hooks,
             signal,
             std::env::current_dir().unwrap(),

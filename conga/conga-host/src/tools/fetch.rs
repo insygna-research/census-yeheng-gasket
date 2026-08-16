@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 /// Request timeout.
 const TIMEOUT_SECS: u64 = 30;
@@ -26,13 +26,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
     let url = ctx.args["url"]
         .as_str()
-        .ok_or_else(|| crate::error::ToolError::Message("url is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("url is required".into()))?;
 
     // Reject non-http(s) schemes early — defends against file:///etc/passwd etc.
     let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
@@ -53,13 +53,13 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .user_agent("conga-fetch/1.0")
         .build()
-        .map_err(|e| crate::error::ToolError::Message(format!("client build failed: {e}")))?;
+        .map_err(|e| conga::error::ToolError::Message(format!("client build failed: {e}")))?;
 
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| crate::error::ToolError::Message(format!("request failed: {e}")))?;
+        .map_err(|e| conga::error::ToolError::Message(format!("request failed: {e}")))?;
 
     let content_type = resp
         .headers()
@@ -76,7 +76,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
     let body = resp
         .text()
         .await
-        .map_err(|e| crate::error::ToolError::Message(format!("read body failed: {e}")))?;
+        .map_err(|e| conga::error::ToolError::Message(format!("read body failed: {e}")))?;
 
     let text = if content_type.contains("html") {
         html_to_text(&body)
@@ -299,12 +299,11 @@ mod tests {
             tool_call_id: "t3".into(),
             args: serde_json::json!({"url": "http://169.254.169.254/latest/meta-data/"}),
             signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ctx: crate::ToolContext {
+            ctx: conga::ToolContext {
                 cwd: ".".into(),
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         };
         let result = execute(ctx).await.unwrap();
@@ -323,12 +322,11 @@ mod tests {
             tool_call_id: "t4".into(),
             args: serde_json::json!({"url": "http://localhost:9/"}),
             signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ctx: crate::ToolContext {
+            ctx: conga::ToolContext {
                 cwd: ".".into(),
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         };
         let result = execute(ctx).await.unwrap();
@@ -340,12 +338,11 @@ mod tests {
             tool_call_id: "t1".into(),
             args: serde_json::json!({"url": "file:///etc/passwd"}),
             signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ctx: crate::ToolContext {
+            ctx: conga::ToolContext {
                 cwd: ".".into(),
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         };
         let result = execute(ctx).await.unwrap();
@@ -398,12 +395,11 @@ mod tests {
             tool_call_id: "t2".into(),
             args: serde_json::json!({"url": "http://example.test/"}),
             signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ctx: crate::ToolContext {
+            ctx: conga::ToolContext {
                 cwd: ".".into(),
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         };
         let result = execute(ctx).await.unwrap();

@@ -536,7 +536,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             Box::pin(async move {
                 // Built per call so the runtime tool proxy (desktop UI /
                 // CONGA_TOOL_PROXY) applies without re-registering.
-                let client = conga::apply_tool_proxy(Client::builder())
+                let client = conga_host::apply_tool_proxy(Client::builder())
                     .build()
                     .map_err(|e| ToolError::Message(format!("client build failed: {e}")))?;
                 let query = ctx.args["query"].as_str().unwrap_or_default();
@@ -812,7 +812,7 @@ mod tests {
         // Mutates process env deliberately: the provider is selected at
         // execute time. No other test in this crate reads env vars.
         std::env::set_var("CONGA_SEARCH_PROVIDER", "duckduckgo");
-        conga::set_tool_proxy(Some(&format!("http://{proxy_addr}"))).unwrap();
+        conga_host::set_tool_proxy(Some(&format!("http://{proxy_addr}"))).unwrap();
 
         let mut api = ExtensionApiImpl::new();
         super::register(&mut api);
@@ -828,13 +828,12 @@ mod tests {
                 env: std::collections::HashMap::new(),
                 session_id: "t".into(),
                 state_dir: ".".into(),
-                spawner: None,
             },
         };
         let result = (tool.execute)(ctx).await.unwrap();
 
         // Cleanup before assertions so a failed assert can't leak state.
-        conga::set_tool_proxy(None).unwrap();
+        conga_host::set_tool_proxy(None).unwrap();
         std::env::remove_var("CONGA_SEARCH_PROVIDER");
 
         assert!(result.is_error, "the TLS-less tunnel must fail: {result:?}");

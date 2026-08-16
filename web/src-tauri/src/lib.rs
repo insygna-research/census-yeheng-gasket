@@ -132,7 +132,7 @@ fn apply_proxy_from_config(config: &serde_json::Value) -> Result<(), String> {
     .and_then(|v| v.as_str())
     .map(str::trim)
     .filter(|s| !s.is_empty());
-  conga::set_tool_proxy(url).map_err(|e| format!("conga_proxy invalid: {e}"))
+  conga_host::set_tool_proxy(url).map_err(|e| format!("conga_proxy invalid: {e}"))
 }
 
 #[tauri::command]
@@ -173,7 +173,7 @@ fn validate_proxy(url: String) -> Result<(), String> {
   if url.is_empty() {
     return Ok(()); // clearing is always valid
   }
-  conga::validate_tool_proxy(url)
+  conga_host::validate_tool_proxy(url)
 }
 
 /// Delete the session's on-disk data wholesale (event log + meta sidecar).

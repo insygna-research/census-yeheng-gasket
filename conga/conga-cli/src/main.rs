@@ -33,7 +33,7 @@ fn assemble_tools(
     extra_tools: &[ToolDefinition],
     mcp_tools: &[ToolDefinition],
 ) -> Vec<ToolDefinition> {
-    let mut tools = conga::built_in_tools();
+    let mut tools = conga_host::built_in_tools();
     tools.extend(ext_tools.iter().cloned());
     tools.extend(extra_tools.iter().cloned());
     tools.extend(mcp_tools.iter().cloned());

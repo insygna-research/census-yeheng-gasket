@@ -7,6 +7,7 @@ description = "Optional in-process extension crates for conga (register via Exte
 
 [dependencies]
 conga = { workspace = true }
+conga-host = { path = "../conga-host" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }

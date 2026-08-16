@@ -36,11 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = AgentContext {
         system_prompt: "You are a helpful, concise assistant.".into(),
         messages: vec![],
-        tools: conga::built_in_tools(),
+        tools: conga_host::built_in_tools(),
         cwd,
         env: std::env::vars().collect(),
         session_id: uuid::Uuid::new_v4().to_string(),
-        spawner: None,
     };
 
     let user_msg = AgentMessage::User(UserMessage {

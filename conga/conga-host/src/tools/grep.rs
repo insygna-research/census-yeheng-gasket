@@ -1,7 +1,7 @@
 //! `grep` tool — content search with ripgrep, falling back to a built-in
 //! regex walker when `rg` isn't installed.
 //!
-//! Both paths walk the tree the same way as [`crate::tools::list`]:
+//! Both paths walk the tree the same way as [`conga::tools::list`]:
 //! `.gitignore`-aware and pruning [`ALWAYS_IGNORE`] dirs. Output mirrors rg's
 //! `path:lineno:line` format so the agent sees consistent results regardless of
 //! which engine ran.
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 /// Directories never searched (mirrors `list` tool).
 const ALWAYS_IGNORE: &[&str] = &[".git", "target", "node_modules"];
@@ -46,13 +46,13 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
     let pattern = ctx.args["pattern"]
         .as_str()
-        .ok_or_else(|| crate::error::ToolError::Message("pattern is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("pattern is required".into()))?;
     let path = ctx.args["path"].as_str().unwrap_or(".");
     let glob = ctx.args["glob"].as_str();
     let ci = ctx.args["case_insensitive"].as_bool().unwrap_or(false);
@@ -263,7 +263,7 @@ fn grep_builtin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::tool::ToolContext;
+    use conga::types::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
 
     async fn run(args: serde_json::Value, cwd: &Path) -> ToolResult {
@@ -277,7 +277,6 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: cwd.to_path_buf(),
-                spawner: None,
             },
         })
         .await

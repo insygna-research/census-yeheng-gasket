@@ -108,7 +108,7 @@ async fn mid_turn_failure_preserves_side_effect() {
         session,
         Arc::new(full_auto_policy()),
         "sys".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_stream_fn(Arc::new(fake));
 
@@ -175,7 +175,7 @@ async fn aborted_turn_persists_partial_facts() {
         session,
         Arc::new(full_auto_policy()),
         "sys".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_stream_fn(Arc::new(fake));
 
@@ -245,7 +245,7 @@ async fn success_path_log_equals_legacy_messages() {
         session,
         Arc::new(full_auto_policy()),
         "You are a helpful assistant.".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_stream_fn(Arc::new(fake));
 
@@ -340,7 +340,7 @@ async fn next_turn_request_answers_every_tool_call() {
         session,
         Arc::new(full_auto_policy()),
         "sys".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_stream_fn(fake.clone());
 
@@ -558,7 +558,7 @@ async fn run_turn_compacts_before_every_llm_call() {
         session,
         Arc::new(full_auto_policy()),
         "sys".into(),
-        conga::built_in_tools(),
+        conga_host::built_in_tools(),
     )
     .with_stream_fn(stream_fn)
     .with_budget(budget);

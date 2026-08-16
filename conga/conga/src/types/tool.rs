@@ -80,10 +80,6 @@ pub struct ToolContext {
     pub env: HashMap<String, String>,
     pub session_id: String,
     pub state_dir: PathBuf,
-    /// Subagent spawner injected by the host. `None` when no host is wired
-    /// (bare `agent_loop` tests); the `spawn_subagents` tool reports an error.
-    #[allow(clippy::type_complexity)]
-    pub spawner: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -93,7 +89,6 @@ impl std::fmt::Debug for ToolContext {
             .field("env", &self.env)
             .field("session_id", &self.session_id)
             .field("state_dir", &self.state_dir)
-            .field("spawner", &self.spawner.as_ref().map(|_| "set"))
             .finish()
     }
 }

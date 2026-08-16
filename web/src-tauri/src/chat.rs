@@ -19,7 +19,7 @@ use log::{info, warn};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use conga::{built_in_tools, AgentEvent};
+use conga::AgentEvent;
 use conga_host::approval::{self, ApprovalRegistry, RegisterOutcome};
 use conga_host::event_map::{event_to_ws, subagent_event_to_ws};
 use conga_host::permission::Approver;
@@ -45,7 +45,7 @@ struct ChatEventPayload {
 /// turn-boundary `done` can never overtake the last subagent event and an
 enum WireEvent {
   Agent(AgentEvent),
-  Subagent(conga::SubagentEvent),
+  Subagent(conga_host::SubagentEvent),
   Approval {
     request_id: String,
     tool_name: String,
@@ -172,7 +172,7 @@ fn spawn_emitter(
         WireEvent::Subagent(ev) => {
           // Sub-agent provider usage counts toward the session's token
           // totals (same as the gateway); it has no IPC message of its own.
-          if let conga::SubagentEvent::Usage {
+          if let conga_host::SubagentEvent::Usage {
             input_tokens,
             output_tokens,
           } = ev
@@ -330,7 +330,7 @@ async fn build_session(
     conga_ext::prod_register(&mut api);
     api.tools
   };
-  let built_in = built_in_tools();
+  let built_in = conga_host::built_in_tools();
   let subagent_tools: Vec<_> = built_in
     .iter()
     .filter(|t| t.name != "spawn_subagents")
@@ -349,9 +349,9 @@ async fn build_session(
   let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
   {
     let spawner_signal = host.signal().clone();
-    let emit: Arc<dyn Fn(conga::SubagentEvent) + Send + Sync> = {
+    let emit: Arc<dyn Fn(conga_host::SubagentEvent) + Send + Sync> = {
       let wire = wire_tx.clone();
-      Arc::new(move |ev: conga::SubagentEvent| {
+      Arc::new(move |ev: conga_host::SubagentEvent| {
         let _ = wire.send(WireEvent::Subagent(ev));
       })
     };

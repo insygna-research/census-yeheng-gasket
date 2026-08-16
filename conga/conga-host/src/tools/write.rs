@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
-use crate::ContentBlock;
+use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
+use conga::ContentBlock;
 
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
@@ -23,16 +23,16 @@ pub fn tool() -> ToolDefinition {
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError> {
+async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
     let path = ctx.args["path"]
         .as_str()
-        .ok_or_else(|| crate::error::ToolError::Message("path is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("path is required".into()))?;
     let content = ctx.args["content"]
         .as_str()
-        .ok_or_else(|| crate::error::ToolError::Message("content is required".into()))?;
+        .ok_or_else(|| conga::error::ToolError::Message("content is required".into()))?;
 
     let full = match super::resolve_within_cwd(&ctx.ctx.cwd, path) {
         Ok(p) => p,
@@ -64,7 +64,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, crate::error::ToolError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::tool::ToolContext;
+    use conga::types::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
 
     #[tokio::test]
@@ -80,7 +80,6 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: tmp.path().to_path_buf(),
-                spawner: None,
             },
         })
         .await
@@ -114,7 +113,6 @@ mod tests {
                 env: Default::default(),
                 session_id: "s".into(),
                 state_dir: tmp.path().to_path_buf(),
-                spawner: None,
             },
         })
         .await

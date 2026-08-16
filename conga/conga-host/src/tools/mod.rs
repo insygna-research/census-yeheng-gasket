@@ -12,7 +12,7 @@ pub mod write;
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::types::tool::ToolDefinition;
+use conga::types::tool::ToolDefinition;
 
 /// The 8 built-in tools, ready to drop into `AgentContext.tools`.
 pub fn built_in_tools() -> Vec<ToolDefinition> {
@@ -52,7 +52,7 @@ pub(crate) fn truncate_output(s: &str) -> String {
 /// in-context by a head preview + file path (the full output is preserved
 /// on disk at that path). Falls back to plain truncation if the disk write fails —
 /// a spill problem must never fail the tool.
-pub(crate) fn spill_or_truncate(ctx: &crate::types::tool::ToolCallCtx, s: &str) -> String {
+pub(crate) fn spill_or_truncate(ctx: &conga::types::tool::ToolCallCtx, s: &str) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {
         return s.to_string();
     }
@@ -131,7 +131,7 @@ pub(crate) fn resolve_within_cwd(cwd: &Path, requested: &str) -> Result<PathBuf,
 /// own config dir (`~/.conga` — spill files and tool state live there).
 /// Anything else absolute is rejected: the cwd sandbox stays intact.
 pub(crate) fn resolve_read_path(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
-    resolve_read_path_in(cwd, &crate::storage::config_dir(), requested)
+    resolve_read_path_in(cwd, &conga::storage::config_dir(), requested)
 }
 
 /// Testable core: `allowed_root` is injected (production uses the config dir).
@@ -228,17 +228,16 @@ mod tests {
         assert_eq!(truncate_output("small"), "small");
     }
 
-    fn spill_ctx(state_dir: &Path) -> crate::types::tool::ToolCallCtx {
-        crate::types::tool::ToolCallCtx {
+    fn spill_ctx(state_dir: &Path) -> conga::types::tool::ToolCallCtx {
+        conga::types::tool::ToolCallCtx {
             tool_call_id: "t".into(),
             args: serde_json::json!({}),
             signal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ctx: crate::ToolContext {
+            ctx: conga::ToolContext {
                 cwd: ".".into(),
                 env: std::collections::HashMap::new(),
                 session_id: "s".into(),
                 state_dir: state_dir.to_path_buf(),
-                spawner: None,
             },
         }
     }

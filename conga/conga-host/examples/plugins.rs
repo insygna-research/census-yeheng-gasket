@@ -28,7 +28,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwd: std::env::current_dir()?,
         env: std::env::vars().collect(),
         session_id: "demo".into(),
-        spawner: None,
     };
 
     let user_msg = AgentMessage::User(UserMessage {

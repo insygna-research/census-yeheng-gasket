@@ -20,9 +20,6 @@ pub struct AgentContext {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub session_id: String,
-    /// Subagent spawner. `None` in bare `agent_loop` tests; the host fills it.
-    #[allow(clippy::type_complexity)]
-    pub spawner: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -33,7 +30,6 @@ impl std::fmt::Debug for AgentContext {
             .field("tools_len", &self.tools.len())
             .field("cwd", &self.cwd)
             .field("session_id", &self.session_id)
-            .field("spawner", &self.spawner.as_ref().map(|_| "set"))
             .finish()
     }
 }
