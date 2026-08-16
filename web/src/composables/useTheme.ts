@@ -2,7 +2,7 @@ import { computed, ref, watch } from 'vue'
 import { readJSON, readString, storageKeys, writeJSON } from '@/lib/storage'
 
 const STORAGE_KEY = storageKeys.theme
-const LEGACY_KEY = 'gasket_theme'
+const LEGACY_KEY = 'conga_theme'
 
 export type ThemeMode = 'light' | 'dark'
 export type ThemeHue = 'zinc' | 'blue' | 'rose' | 'emerald' | 'amber' | 'violet'

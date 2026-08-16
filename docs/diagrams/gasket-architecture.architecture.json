@@ -2,11 +2,11 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "gasket 系统架构",
-    "output": "docs/diagrams/gasket-architecture.html",
+    "title": "conga 系统架构",
+    "output": "docs/diagrams/conga-architecture.html",
     "quality_profile": "showcase",
     "repository": {
-      "url": "https://github.com/YeHeng/gasket",
+      "url": "https://github.com/YeHeng/conga",
       "revision": "0a97189bf80b9b37b702c796a5c6de4eabbef708"
     },
     "viewBox": [2000, 800],
@@ -31,32 +31,32 @@
     {
       "id": "gateway",
       "type": "backend",
-      "label": "gasket-gateway",
+      "label": "conga-gateway",
       "sublabel": "WS 网关 + REST · :3000",
       "tag": "每连接一会话",
       "pos": [450, 140],
       "size": [260, 92],
-      "sources": [{ "path": "gasket/gasket-gateway/src/ws.rs", "label": "WS 连接处理" }]
+      "sources": [{ "path": "conga/conga-gateway/src/ws.rs", "label": "WS 连接处理" }]
     },
     {
       "id": "host",
       "type": "backend",
-      "label": "gasket-host",
+      "label": "conga-host",
       "sublabel": "会话 · 权限 · 压缩 · MCP",
       "tag": "Host::run_turn",
       "pos": [810, 140],
       "size": [300, 140],
-      "sources": [{ "path": "gasket/gasket-host/src/lib.rs", "line": 51, "label": "Host 编排器" }]
+      "sources": [{ "path": "conga/conga-host/src/lib.rs", "line": 51, "label": "Host 编排器" }]
     },
     {
       "id": "core",
       "type": "backend",
-      "label": "gasket-core",
+      "label": "conga",
       "sublabel": "agent_loop · tools · providers · storage",
       "tag": "无状态内核",
       "pos": [1300, 140],
       "size": [300, 140],
-      "sources": [{ "path": "gasket/gasket-core/src/agent_loop.rs", "label": "推理循环" }]
+      "sources": [{ "path": "conga/conga/src/agent_loop.rs", "label": "推理循环" }]
     },
     {
       "id": "llm",
@@ -66,17 +66,17 @@
       "tag": "SSE 流式",
       "pos": [1720, 140],
       "size": [220, 140],
-      "sources": [{ "path": "gasket/gasket-core/src/providers/mod.rs", "label": "StreamFn 实现" }]
+      "sources": [{ "path": "conga/conga/src/providers/mod.rs", "label": "StreamFn 实现" }]
     },
     {
       "id": "cli",
       "type": "frontend",
-      "label": "gasket-cli",
-      "sublabel": "终端 REPL(bin gasket)",
+      "label": "conga-cli",
+      "sublabel": "终端 REPL(bin conga)",
       "tag": "斜杠命令",
       "pos": [60, 420],
       "size": [240, 88],
-      "sources": [{ "path": "gasket/gasket-cli/src/main.rs", "label": "REPL 主循环" }]
+      "sources": [{ "path": "conga/conga-cli/src/main.rs", "label": "REPL 主循环" }]
     },
     {
       "id": "mcp",
@@ -86,31 +86,31 @@
       "tag": "mcp.json",
       "pos": [810, 420],
       "size": [240, 88],
-      "sources": [{ "path": "gasket/gasket-host/src/mcp.rs", "label": "McpBridge" }]
+      "sources": [{ "path": "conga/conga-host/src/mcp.rs", "label": "McpBridge" }]
     },
     {
       "id": "events",
       "type": "database",
       "label": "events.jsonl",
       "sublabel": "append-only 事件日志",
-      "tag": "~/.gasket/sessions",
+      "tag": "~/.conga/sessions",
       "pos": [1190, 420],
       "size": [240, 88],
-      "sources": [{ "path": "gasket/gasket-core/src/storage/mod.rs", "line": 323, "label": "EventStorage" }]
+      "sources": [{ "path": "conga/conga/src/storage/mod.rs", "line": 323, "label": "EventStorage" }]
     },
     {
       "id": "ext",
       "type": "backend",
-      "label": "gasket-ext",
+      "label": "conga-ext",
       "sublabel": "hello · todo · search · gate",
       "tag": "进程内扩展 · 可选",
       "pos": [1350, 640],
       "size": [240, 88],
-      "sources": [{ "path": "gasket/gasket-ext/src/lib.rs", "label": "register_all" }]
+      "sources": [{ "path": "conga/conga-ext/src/lib.rs", "label": "register_all" }]
     }
   ],
   "boundaries": [
-    { "kind": "region", "label": "本地会话状态 ~/.gasket", "wraps": ["events"] }
+    { "kind": "region", "label": "本地会话状态 ~/.conga", "wraps": ["events"] }
   ],
   "connections": [
     { "id": "fe-gw", "from": "web", "to": "gateway", "label": "WS /ws · REST /api", "variant": "emphasis" },
@@ -148,7 +148,7 @@
       "title": "安全与扩展",
       "items": [
         "三档权限模式 × 工具风险分级,before/after 双 Hook 拦截",
-        "gasket-ext 进程内注册工具与 Hook,无需改内核",
+        "conga-ext 进程内注册工具与 Hook,无需改内核",
         "MCP 服务器与 spawn_subagents 子 agent 编排扩展能力边界"
       ]
     }

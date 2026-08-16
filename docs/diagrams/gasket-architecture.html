@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="generator" content="archify 2.14.0">
-  <title>gasket 系统架构 Diagram</title>
+  <title>conga 系统架构 Diagram</title>
   <script>
     // Resolve the theme before first paint so light-preference users don't
     // see a dark flash. The toolbar script below re-applies with UI state.
@@ -4836,12 +4836,12 @@
     <div class="header">
       <div class="header-row">
         <div class="pulse-dot"></div>
-        <h1>gasket 系统架构</h1>
+        <h1>conga 系统架构</h1>
       </div>
     </div>
 
     <script id="archify-guided-views-data" type="application/json">[{"id":"main-path","label":"主请求路径","focus":["web","gateway","host","core","llm"],"note":"浏览器消息流经网关、宿主、内核,以 SSE 调用 LLM。"},{"id":"frontends","label":"三种前端形态","focus":["web","cli","gateway","host"],"note":"REPL、浏览器 WS、Tauri IPC 桌面,共用同一个 Host::run_turn。"},{"id":"event-log","label":"事件日志真相源","focus":["host","core","events"],"note":"append-only 事件日志逐事件落盘,历史每轮现派生。"},{"id":"extensions","label":"扩展与外部工具","focus":["ext","mcp","core","host"],"note":"进程内扩展注册工具与 Hook,MCP 服务器经宿主接入。"}]</script>
-    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/YeHeng/gasket","revision":"0a97189bf80b9b37b702c796a5c6de4eabbef708","shortRevision":"0a97189"},"referenceCount":9,"nodes":{"web":[{"path":"web/src-tauri/src/chat.rs","label":"桌面 IPC · 进程内 Host","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/web/src-tauri/src/chat.rs"}],"gateway":[{"path":"gasket/gasket-gateway/src/ws.rs","label":"WS 连接处理","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-gateway/src/ws.rs"}],"host":[{"path":"gasket/gasket-host/src/lib.rs","line":51,"label":"Host 编排器","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-host/src/lib.rs#L51"}],"core":[{"path":"gasket/gasket-core/src/agent_loop.rs","label":"推理循环","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-core/src/agent_loop.rs"}],"llm":[{"path":"gasket/gasket-core/src/providers/mod.rs","label":"StreamFn 实现","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-core/src/providers/mod.rs"}],"cli":[{"path":"gasket/gasket-cli/src/main.rs","label":"REPL 主循环","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-cli/src/main.rs"}],"mcp":[{"path":"gasket/gasket-host/src/mcp.rs","label":"McpBridge","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-host/src/mcp.rs"}],"events":[{"path":"gasket/gasket-core/src/storage/mod.rs","line":323,"label":"EventStorage","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-core/src/storage/mod.rs#L323"}],"ext":[{"path":"gasket/gasket-ext/src/lib.rs","label":"register_all","href":"https://github.com/YeHeng/gasket/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/gasket/gasket-ext/src/lib.rs"}]}}</script>
+    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/YeHeng/conga","revision":"0a97189bf80b9b37b702c796a5c6de4eabbef708","shortRevision":"0a97189"},"referenceCount":9,"nodes":{"web":[{"path":"web/src-tauri/src/chat.rs","label":"桌面 IPC · 进程内 Host","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/web/src-tauri/src/chat.rs"}],"gateway":[{"path":"conga/conga-gateway/src/ws.rs","label":"WS 连接处理","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga-gateway/src/ws.rs"}],"host":[{"path":"conga/conga-host/src/lib.rs","line":51,"label":"Host 编排器","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga-host/src/lib.rs#L51"}],"core":[{"path":"conga/conga/src/agent_loop.rs","label":"推理循环","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga/src/agent_loop.rs"}],"llm":[{"path":"conga/conga/src/providers/mod.rs","label":"StreamFn 实现","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga/src/providers/mod.rs"}],"cli":[{"path":"conga/conga-cli/src/main.rs","label":"REPL 主循环","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga-cli/src/main.rs"}],"mcp":[{"path":"conga/conga-host/src/mcp.rs","label":"McpBridge","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga-host/src/mcp.rs"}],"events":[{"path":"conga/conga/src/storage/mod.rs","line":323,"label":"EventStorage","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga/src/storage/mod.rs#L323"}],"ext":[{"path":"conga/conga-ext/src/lib.rs","label":"register_all","href":"https://github.com/YeHeng/conga/blob/0a97189bf80b9b37b702c796a5c6de4eabbef708/conga/conga-ext/src/lib.rs"}]}}</script>
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
       <div class="guided-view-copy">
@@ -4884,7 +4884,7 @@
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read">
       <svg viewBox="0 0 2000 800" role="img" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
-        <title id="archify-diagram-title">gasket 系统架构</title>
+        <title id="archify-diagram-title">conga 系统架构</title>
         <desc id="archify-diagram-description">A architecture diagram generated by Archify.</desc>
         <!-- Definitions -->
         <defs>
@@ -4910,7 +4910,7 @@
 
         <!-- Boundaries (behind everything) -->
         <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" x="1160" y="390" width="300" height="138" rx="12" class="c-region" stroke-width="1"/>
-        <text x="1168" y="408" class="t-cloud" font-size="9" font-weight="600">本地会话状态 ~/.gasket</text>
+        <text x="1168" y="408" class="t-cloud" font-size="9" font-weight="600">本地会话状态 ~/.conga</text>
 
         <!-- Connection paths (before components for correct z-order) -->
         <path data-edge-from="web" data-edge-to="gateway" data-edge-label="WS /ws · REST /api" data-edge-key="0" data-edge-id="fe-gw" data-composition-points="300,186;450,186" d="M 300 186 L 450 186" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
@@ -4940,38 +4940,38 @@
         <text data-detail="fine" x="180" y="224" class="t-frontend" font-size="7" text-anchor="middle">isTauri 双传输</text>
         </g>
 
-        <g id="node-gateway" data-node-id="gateway" data-node-label="gasket-gateway" tabindex="0" role="button" aria-label="Focus gasket-gateway, WS 网关 + REST · :3000, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="WS 网关 + REST · :3000" data-node-tag="每连接一会话" data-node-context="Architecture component">
-          <title>gasket-gateway · WS 网关 + REST · :3000 · Architecture component · 每连接一会话</title>
+        <g id="node-gateway" data-node-id="gateway" data-node-label="conga-gateway" tabindex="0" role="button" aria-label="Focus conga-gateway, WS 网关 + REST · :3000, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="WS 网关 + REST · :3000" data-node-tag="每连接一会话" data-node-context="Architecture component">
+          <title>conga-gateway · WS 网关 + REST · :3000 · Architecture component · 每连接一会话</title>
           <rect x="450" y="140" width="260" height="92" rx="6" class="c-mask"/>
           <rect x="450" y="140" width="260" height="92" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 146) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="580" y="184" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">gasket-gateway</text>
+          <text data-detail-anchor x="580" y="184" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">conga-gateway</text>
         <text data-detail="context" x="580" y="200" class="t-muted" font-size="9" text-anchor="middle">WS 网关 + REST · :3000</text>
         <text data-detail="fine" x="580" y="224" class="t-backend" font-size="7" text-anchor="middle">每连接一会话</text>
         </g>
 
-        <g id="node-host" data-node-id="host" data-node-label="gasket-host" tabindex="0" role="button" aria-label="Focus gasket-host, 会话 · 权限 · 压缩 · MCP, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="会话 · 权限 · 压缩 · MCP" data-node-tag="Host::run_turn" data-node-context="Architecture component">
-          <title>gasket-host · 会话 · 权限 · 压缩 · MCP · Architecture component · Host::run_turn</title>
+        <g id="node-host" data-node-id="host" data-node-label="conga-host" tabindex="0" role="button" aria-label="Focus conga-host, 会话 · 权限 · 压缩 · MCP, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="会话 · 权限 · 压缩 · MCP" data-node-tag="Host::run_turn" data-node-context="Architecture component">
+          <title>conga-host · 会话 · 权限 · 压缩 · MCP · Architecture component · Host::run_turn</title>
           <rect x="810" y="140" width="300" height="140" rx="6" class="c-mask"/>
           <rect x="810" y="140" width="300" height="140" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(816 146) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="960" y="208" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">gasket-host</text>
+          <text data-detail-anchor x="960" y="208" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">conga-host</text>
         <text data-detail="context" x="960" y="224" class="t-muted" font-size="9" text-anchor="middle">会话 · 权限 · 压缩 · MCP</text>
         <text data-detail="fine" x="960" y="272" class="t-backend" font-size="7" text-anchor="middle">Host::run_turn</text>
         </g>
 
-        <g id="node-core" data-node-id="core" data-node-label="gasket-core" tabindex="0" role="button" aria-label="Focus gasket-core, agent_loop · tools · providers · storage, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="agent_loop · tools · providers · storage" data-node-tag="无状态内核" data-node-context="Architecture component">
-          <title>gasket-core · agent_loop · tools · providers · storage · Architecture component · 无状态内核</title>
+        <g id="node-core" data-node-id="core" data-node-label="conga" tabindex="0" role="button" aria-label="Focus conga, agent_loop · tools · providers · storage, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="agent_loop · tools · providers · storage" data-node-tag="无状态内核" data-node-context="Architecture component">
+          <title>conga · agent_loop · tools · providers · storage · Architecture component · 无状态内核</title>
           <rect x="1300" y="140" width="300" height="140" rx="6" class="c-mask"/>
           <rect x="1300" y="140" width="300" height="140" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(1306 146) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="1450" y="208" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">gasket-core</text>
+          <text data-detail-anchor x="1450" y="208" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">conga</text>
         <text data-detail="context" x="1450" y="224" class="t-muted" font-size="9" text-anchor="middle">agent_loop · tools · providers · storage</text>
         <text data-detail="fine" x="1450" y="272" class="t-backend" font-size="7" text-anchor="middle">无状态内核</text>
         </g>
@@ -4989,8 +4989,8 @@
         <text data-detail="fine" x="1830" y="272" class="t-external" font-size="7" text-anchor="middle">SSE 流式</text>
         </g>
 
-        <g id="node-cli" data-node-id="cli" data-node-label="gasket-cli" tabindex="0" role="button" aria-label="Focus gasket-cli, 终端 REPL(bin gasket), Architecture component" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="终端 REPL(bin gasket)" data-node-tag="斜杠命令" data-node-context="Architecture component">
-          <title>gasket-cli · 终端 REPL(bin gasket) · Architecture component · 斜杠命令</title>
+        <g id="node-cli" data-node-id="cli" data-node-label="conga-cli" tabindex="0" role="button" aria-label="Focus conga-cli, 终端 REPL(bin conga), Architecture component" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="终端 REPL(bin conga)" data-node-tag="斜杠命令" data-node-context="Architecture component">
+          <title>conga-cli · 终端 REPL(bin conga) · Architecture component · 斜杠命令</title>
           <rect x="60" y="420" width="240" height="88" rx="6" class="c-mask"/>
           <rect x="60" y="420" width="240" height="88" rx="6" class="c-frontend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(66 426) scale(0.6875)">
@@ -4999,8 +4999,8 @@
             <circle cx="4.1" cy="4.8" r=".7" class="sigil-fill"/>
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
-          <text data-detail-anchor x="180" y="462" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">gasket-cli</text>
-        <text data-detail="context" x="180" y="478" class="t-muted" font-size="9" text-anchor="middle">终端 REPL(bin gasket)</text>
+          <text data-detail-anchor x="180" y="462" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">conga-cli</text>
+        <text data-detail="context" x="180" y="478" class="t-muted" font-size="9" text-anchor="middle">终端 REPL(bin conga)</text>
         <text data-detail="fine" x="180" y="500" class="t-frontend" font-size="7" text-anchor="middle">斜杠命令</text>
         </g>
 
@@ -5017,8 +5017,8 @@
         <text data-detail="fine" x="930" y="500" class="t-external" font-size="7" text-anchor="middle">mcp.json</text>
         </g>
 
-        <g id="node-events" data-node-id="events" data-node-label="events.jsonl" tabindex="0" role="button" aria-label="Focus events.jsonl, append-only 事件日志, 本地会话状态 ~/.gasket" aria-pressed="false" data-node-kind="database" data-node-sublabel="append-only 事件日志" data-node-tag="~/.gasket/sessions" data-node-context="本地会话状态 ~/.gasket">
-          <title>events.jsonl · append-only 事件日志 · 本地会话状态 ~/.gasket · ~/.gasket/sessions</title>
+        <g id="node-events" data-node-id="events" data-node-label="events.jsonl" tabindex="0" role="button" aria-label="Focus events.jsonl, append-only 事件日志, 本地会话状态 ~/.conga" aria-pressed="false" data-node-kind="database" data-node-sublabel="append-only 事件日志" data-node-tag="~/.conga/sessions" data-node-context="本地会话状态 ~/.conga">
+          <title>events.jsonl · append-only 事件日志 · 本地会话状态 ~/.conga · ~/.conga/sessions</title>
           <rect x="1190" y="420" width="240" height="88" rx="6" class="c-mask"/>
           <rect x="1190" y="420" width="240" height="88" rx="6" class="c-database" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(1196 426) scale(0.6875)">
@@ -5027,17 +5027,17 @@
           </g>
           <text data-detail-anchor x="1310" y="462" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">events.jsonl</text>
         <text data-detail="context" x="1310" y="478" class="t-muted" font-size="9" text-anchor="middle">append-only 事件日志</text>
-        <text data-detail="fine" x="1310" y="500" class="t-database" font-size="7" text-anchor="middle">~/.gasket/sessions</text>
+        <text data-detail="fine" x="1310" y="500" class="t-database" font-size="7" text-anchor="middle">~/.conga/sessions</text>
         </g>
 
-        <g id="node-ext" data-node-id="ext" data-node-label="gasket-ext" tabindex="0" role="button" aria-label="Focus gasket-ext, hello · todo · search · gate, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="hello · todo · search · gate" data-node-tag="进程内扩展 · 可选" data-node-context="Architecture component">
-          <title>gasket-ext · hello · todo · search · gate · Architecture component · 进程内扩展 · 可选</title>
+        <g id="node-ext" data-node-id="ext" data-node-label="conga-ext" tabindex="0" role="button" aria-label="Focus conga-ext, hello · todo · search · gate, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="hello · todo · search · gate" data-node-tag="进程内扩展 · 可选" data-node-context="Architecture component">
+          <title>conga-ext · hello · todo · search · gate · Architecture component · 进程内扩展 · 可选</title>
           <rect x="1350" y="640" width="240" height="88" rx="6" class="c-mask"/>
           <rect x="1350" y="640" width="240" height="88" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(1356 646) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="1470" y="682" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">gasket-ext</text>
+          <text data-detail-anchor x="1470" y="682" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">conga-ext</text>
         <text data-detail="context" x="1470" y="698" class="t-muted" font-size="9" text-anchor="middle">hello · todo · search · gate</text>
         <text data-detail="fine" x="1470" y="720" class="t-backend" font-size="7" text-anchor="middle">进程内扩展 · 可选</text>
         </g>
@@ -5318,7 +5318,7 @@
         </div>
         <ul>
           <li>&bull; 三档权限模式 × 工具风险分级,before/after 双 Hook 拦截</li>
-          <li>&bull; gasket-ext 进程内注册工具与 Hook,无需改内核</li>
+          <li>&bull; conga-ext 进程内注册工具与 Hook,无需改内核</li>
           <li>&bull; MCP 服务器与 spawn_subagents 子 agent 编排扩展能力边界</li>
         </ul>
       </div>

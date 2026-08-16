@@ -4,7 +4,7 @@ import type { Message, ToolCall } from '@/types';
 
 /**
  * Session storage access layer.
- * The backend's on-disk store (`~/.gasket/sessions`, owned by the Rust
+ * The backend's on-disk store (`~/.conga/sessions`, owned by the Rust
  * side — Tauri commands in-app, gateway HTTP in the browser) is the single
  * source of truth: list, names, transcripts, and deletes all go through
  * it. Nothing session-shaped is persisted client-side.
@@ -73,7 +73,7 @@ export async function deleteSession(chatId: string): Promise<boolean> {
 }
 
 // ── Message mapping ─────────────────────────────────────────
-// Gateway shape (gasket-core AgentMessage, serde tag = "role"):
+// Gateway shape (conga AgentMessage, serde tag = "role"):
 //   user:        { role, content: ContentBlock[], timestamp }
 //   assistant:   { role, content: ContentBlock[], model, stop_reason, usage, timestamp }
 //   tool_result: { role, tool_call_id, tool_name, content, is_error, timestamp }
@@ -181,7 +181,7 @@ export async function fetchSessionMessages(chatId: string): Promise<Message[] | 
 
 /** Cross-session full-text search hit — the gateway REST route and the
  * desktop Tauri command return the same shape (single engine, single
- * SessionHit definition in gasket-host). */
+ * SessionHit definition in conga-host). */
 export interface SessionHit {
   session_id: string;
   /** Display name from the session's meta sidecar; null when unnamed. */

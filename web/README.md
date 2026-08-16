@@ -1,4 +1,4 @@
-# Gasket Desktop
+# Conga Desktop
 
 A Tauri + Vue 3 + TypeScript desktop application.
 

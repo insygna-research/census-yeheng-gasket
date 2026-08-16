@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/turn-state-machine.lifecycle.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/turn-state-machine.lifecycle.html",
     "sha256": "384999df9f50aab14b29d4794b929b3c56193c7d96947918f232bd914b4fdbfe",
     "bytes": 639872
   },

@@ -5,7 +5,7 @@
   "status": "pass",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/gasket-architecture.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/conga-architecture.html",
     "sha256": "b4f7566646e732b552f8a871f8a4259e688546df1a3ff496e7cefcaea0996384",
     "bytes": 642912
   },
@@ -89,7 +89,7 @@
         "overflowY": false,
         "ok": true,
         "resolvedTheme": "light",
-        "file": "gasket-architecture.visual-check.1440x900.light.png"
+        "file": "conga-architecture.visual-check.1440x900.light.png"
       },
       {
         "width": 1440,
@@ -103,7 +103,7 @@
         "overflowY": false,
         "ok": true,
         "resolvedTheme": "dark",
-        "file": "gasket-architecture.visual-check.1440x900.dark.png"
+        "file": "conga-architecture.visual-check.1440x900.dark.png"
       },
       {
         "width": 2048,
@@ -117,7 +117,7 @@
         "overflowY": false,
         "ok": true,
         "resolvedTheme": "light",
-        "file": "gasket-architecture.visual-check.2048x1320.light.png"
+        "file": "conga-architecture.visual-check.2048x1320.light.png"
       },
       {
         "width": 2048,
@@ -131,13 +131,13 @@
         "overflowY": false,
         "ok": true,
         "resolvedTheme": "dark",
-        "file": "gasket-architecture.visual-check.2048x1320.dark.png"
+        "file": "conga-architecture.visual-check.2048x1320.dark.png"
       }
     ],
-    "contactSheet": "gasket-architecture.visual-check.html"
+    "contactSheet": "conga-architecture.visual-check.html"
   },
   "sidecars": {
-    "receipt": "gasket-architecture.visual-check.json",
-    "contactSheet": "gasket-architecture.visual-check.html"
+    "receipt": "conga-architecture.visual-check.json",
+    "contactSheet": "conga-architecture.visual-check.html"
   }
 }

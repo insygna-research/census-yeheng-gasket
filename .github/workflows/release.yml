@@ -35,24 +35,24 @@ jobs:
           targets: ${{ matrix.target }}
       
       - name: Build
-        run: cd gasket && cargo build --release --target ${{ matrix.target }} --all-features
+        run: cd conga && cargo build --release --target ${{ matrix.target }} --all-features
       
       - name: Package (Linux/macOS)
         if: matrix.archive == 'tar.gz'
         run: |
-          cd gasket/target/${{ matrix.target }}/release
-          tar -czvf gasket-${{ matrix.target }}.tar.gz gasket
+          cd conga/target/${{ matrix.target }}/release
+          tar -czvf conga-${{ matrix.target }}.tar.gz conga
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         run: |
-          cd gasket/target/${{ matrix.target }}/release
-          7z a gasket-${{ matrix.target }}.zip gasket.exe
+          cd conga/target/${{ matrix.target }}/release
+          7z a conga-${{ matrix.target }}.zip conga.exe
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
-          files: gasket/target/${{ matrix.target }}/release/gasket-${{ matrix.target }}.${{ matrix.archive }}
+          files: conga/target/${{ matrix.target }}/release/conga-${{ matrix.target }}.${{ matrix.archive }}
 
   desktop:
     name: Desktop (${{ matrix.platform }})
@@ -99,7 +99,7 @@ jobs:
       - name: Upload Desktop Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gasket-desktop-${{ matrix.platform }}
+          name: conga-desktop-${{ matrix.platform }}
           if-no-files-found: error
           path: |
             web/src-tauri/target/aarch64-apple-darwin/release/bundle/**/*.dmg

@@ -1,0 +1,25 @@
+[package]
+name = "conga-ext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional in-process extension crates for conga (register via ExtensionApi)"
+
+[dependencies]
+conga = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tracing = { workspace = true }
+urlencoding = "2.1"
+dom_query = "0.28"
+portable-pty = { version = "0.8", optional = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+terminal = ["dep:portable-pty"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

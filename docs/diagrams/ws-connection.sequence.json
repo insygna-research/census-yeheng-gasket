@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "sequence",
   "meta": {
-    "title": "gasket WebSocket 连接时序",
+    "title": "conga WebSocket 连接时序",
     "output": "docs/diagrams/ws-connection.sequence.html",
     "quality_profile": "showcase",
     "viewBox": [1500, 1120],

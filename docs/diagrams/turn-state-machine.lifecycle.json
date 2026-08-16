@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "lifecycle",
   "meta": {
-    "title": "gasket Agent 轮次状态机",
+    "title": "conga Agent 轮次状态机",
     "output": "docs/diagrams/turn-state-machine.lifecycle.html",
     "quality_profile": "showcase",
     "viewBox": [1000, 720],

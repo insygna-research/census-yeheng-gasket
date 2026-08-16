@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Gasket",
+  "productName": "Conga",
   "version": "2.0.0",
-  "identifier": "com.gasket.desktop",
+  "identifier": "com.conga.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Gasket",
+        "title": "Conga",
         "width": 960,
         "height": 640,
         "minWidth": 720,

@@ -1,15 +1,15 @@
 # =============================================================================
-# gasket Dockerfile - Multi-stage build (Rust gateway + Vue frontend)
+# conga Dockerfile - Multi-stage build (Rust gateway + Vue frontend)
 # =============================================================================
-# Produces a single image running `gasket-gateway` on port 3000, serving the
+# Produces a single image running `conga-gateway` on port 3000, serving the
 # built Vue frontend from /app/web/dist.
 #
 # Usage:
-#   docker build -t gasket .
+#   docker build -t conga .
 #   docker run -d -p 3000:3000 \
-#     -e GASKET_LLM_BASE_URL=... -e GASKET_LLM_KEY=... \
-#     -e GASKET_LLM_MODEL=... -e GASKET_LLM_API=openai \
-#     gasket
+#     -e CONGA_LLM_BASE_URL=... -e CONGA_LLM_KEY=... \
+#     -e CONGA_LLM_MODEL=... -e CONGA_LLM_API=openai \
+#     conga
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -32,57 +32,57 @@ COPY web/ ./
 RUN pnpm build
 
 # -----------------------------------------------------------------------------
-# Stage 2: Rust builder (gasket-gateway binary)
+# Stage 2: Rust builder (conga-gateway binary)
 # -----------------------------------------------------------------------------
 FROM rust:1.82-bookworm AS rust-builder
 
 WORKDIR /build
 
 # Copy workspace root files for dependency caching
-COPY gasket/Cargo.toml gasket/Cargo.lock ./
+COPY conga/Cargo.toml conga/Cargo.lock ./
 
 # Copy all workspace member Cargo.toml files
-COPY gasket/gasket-core/Cargo.toml ./gasket-core/
-COPY gasket/gasket-host/Cargo.toml ./gasket-host/
-COPY gasket/gasket-cli/Cargo.toml ./gasket-cli/
-COPY gasket/gasket-ext/Cargo.toml ./gasket-ext/
-COPY gasket/gasket-gateway/Cargo.toml ./gasket-gateway/
+COPY conga/conga/Cargo.toml ./conga/
+COPY conga/conga-host/Cargo.toml ./conga-host/
+COPY conga/conga-cli/Cargo.toml ./conga-cli/
+COPY conga/conga-ext/Cargo.toml ./conga-ext/
+COPY conga/conga-gateway/Cargo.toml ./conga-gateway/
 
 # Create dummy source files so cargo can build dependencies layer
 RUN mkdir -p \
-        gasket-core/src \
-        gasket-host/src \
-        gasket-cli/src \
-        gasket-ext/src \
-        gasket-gateway/src && \
-    echo "pub fn dummy() {}" > gasket-core/src/lib.rs && \
-    echo "pub fn dummy() {}" > gasket-host/src/lib.rs && \
-    echo "fn main() {}" > gasket-cli/src/main.rs && \
-    echo "pub fn dummy() {}" > gasket-ext/src/lib.rs && \
-    echo "fn main() {}" > gasket-gateway/src/main.rs && \
-    cargo build --release --bin gasket-gateway --all-features && \
+        conga/src \
+        conga-host/src \
+        conga-cli/src \
+        conga-ext/src \
+        conga-gateway/src && \
+    echo "pub fn dummy() {}" > conga/src/lib.rs && \
+    echo "pub fn dummy() {}" > conga-host/src/lib.rs && \
+    echo "fn main() {}" > conga-cli/src/main.rs && \
+    echo "pub fn dummy() {}" > conga-ext/src/lib.rs && \
+    echo "fn main() {}" > conga-gateway/src/main.rs && \
+    cargo build --release --bin conga-gateway --all-features && \
     rm -rf \
-        gasket-core/src \
-        gasket-host/src \
-        gasket-cli/src \
-        gasket-ext/src \
-        gasket-gateway/src
+        conga/src \
+        conga-host/src \
+        conga-cli/src \
+        conga-ext/src \
+        conga-gateway/src
 
 # Copy actual source code
-COPY gasket/gasket-core/src ./gasket-core/src
-COPY gasket/gasket-host/src ./gasket-host/src
-COPY gasket/gasket-cli/src ./gasket-cli/src
-COPY gasket/gasket-ext/src ./gasket-ext/src
-COPY gasket/gasket-gateway/src ./gasket-gateway/src
+COPY conga/conga/src ./conga/src
+COPY conga/conga-host/src ./conga-host/src
+COPY conga/conga-cli/src ./conga-cli/src
+COPY conga/conga-ext/src ./conga-ext/src
+COPY conga/conga-gateway/src ./conga-gateway/src
 
 # Touch source files to invalidate cargo cache and rebuild
 RUN touch \
-        gasket-core/src/lib.rs \
-        gasket-host/src/lib.rs \
-        gasket-cli/src/main.rs \
-        gasket-ext/src/lib.rs \
-        gasket-gateway/src/main.rs && \
-    cargo build --release --bin gasket-gateway --all-features
+        conga/src/lib.rs \
+        conga-host/src/lib.rs \
+        conga-cli/src/main.rs \
+        conga-ext/src/lib.rs \
+        conga-gateway/src/main.rs && \
+    cargo build --release --bin conga-gateway --all-features
 
 # -----------------------------------------------------------------------------
 # Stage 3: Runtime
@@ -99,19 +99,19 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Copy the gateway binary
-COPY --from=rust-builder /build/target/release/gasket-gateway /usr/local/bin/gasket-gateway
+COPY --from=rust-builder /build/target/release/conga-gateway /usr/local/bin/conga-gateway
 
 # Copy the built frontend
 COPY --from=web-builder /web/dist /app/web/dist
 
 # Create config directory
-RUN mkdir -p /root/.gasket
+RUN mkdir -p /root/.conga
 
 # Gateway default port
 EXPOSE 3000
 
 # Point the gateway at the bundled frontend
-ENV GASKET_GATEWAY_STATIC_DIR=/app/web/dist
+ENV CONGA_GATEWAY_STATIC_DIR=/app/web/dist
 
-ENTRYPOINT ["gasket-gateway"]
+ENTRYPOINT ["conga-gateway"]
 CMD []

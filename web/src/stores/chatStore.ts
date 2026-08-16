@@ -11,7 +11,7 @@ export const makeId = (prefix?: string) => {
 };
 
 export const useChatStore = defineStore('chat', () => {
-  // The backend's session store (~/.gasket/sessions via list_sessions) is
+  // The backend's session store (~/.conga/sessions via list_sessions) is
   // the single source of truth for the chat list; nothing is persisted
   // client-side. The list starts empty and fills from syncFromBackend()
   // (called on mount); message bodies hydrate lazily per chat from
@@ -29,7 +29,7 @@ export const useChatStore = defineStore('chat', () => {
       id: makeId('chat'),
       name: 'New Chat',
       messages: [
-        { id: makeId(), role: 'system', content: 'Connected to gasket Gateway', timestamp: Date.now() }
+        { id: makeId(), role: 'system', content: 'Connected to conga Gateway', timestamp: Date.now() }
       ],
       updatedAt: Date.now()
     };

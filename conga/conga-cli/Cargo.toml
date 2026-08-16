@@ -1,0 +1,23 @@
+[package]
+name = "conga-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conga"
+path = "src/main.rs"
+
+[dependencies]
+conga-host = { workspace = true }
+conga = { workspace = true }
+conga-ext = { workspace = true, optional = true }
+reedline = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Link optional in-process extensions (hello / todo / permission_gate),
+# plus the terminal PTY tool (forwarded feature).
+ext = ["dep:conga-ext", "conga-ext?/terminal"]
