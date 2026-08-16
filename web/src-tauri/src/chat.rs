@@ -417,12 +417,12 @@ pub async fn send_message(
   Ok(())
 }
 
-/// Cooperative abort: set the Host's shared cancel flag (read at safe points
-/// by the agent loop) and unlock any pending approval wait.
+/// Cooperative abort: cancel the Host's shared cancel signal (read at safe
+/// points by the agent loop) and unlock any pending approval wait.
 #[tauri::command]
 pub fn cancel_turn(state: State<'_, ChatState>, session_id: String) -> Result<(), String> {
   if let Some(session) = state.sessions.get(&session_id) {
-    session.host.signal().store(true, Ordering::Relaxed);
+    session.host.signal().cancel();
     let _ = session.cancel_tx.send(true);
     info!("session {session_id}: cancel");
   }
