@@ -27,7 +27,11 @@ pub struct SessionInfo {
 pub struct SessionManager {
     root: PathBuf,
     storage: EventStorage,
-    current_id: String,
+    /// Current-session cursor. Interior-mutable on purpose: rotating to a
+    /// fresh id (`clear`) is a cursor move, not a host mutation — transports
+    /// that hold the `Host` behind an `Arc` (the desktop app) must be able
+    /// to `/clear` without `&mut` access.
+    current_id: Arc<parking_lot::Mutex<String>>,
 }
 
 impl Default for SessionManager {
@@ -36,26 +40,27 @@ impl Default for SessionManager {
     }
 }
 
-/// Count model-visible messages in one transcript's raw contents. The event
-/// log carries `TurnStart`/`TurnEnd` marker rows that [`derive_messages`]
-/// projects away, so only `User`/`Assistant`/`ToolResult` rows count; a
-/// legacy `messages.jsonl` (pre-migration) holds one message per non-empty
-/// line. A torn/unparseable event row is not a message and is skipped.
+/// Count model-visible messages in one transcript's raw contents, mirroring
+/// [`derive_messages`]: only `User`/`Assistant`/`ToolResult` rows count, and
+/// everything up to the last `Cleared` marker is not counted (the cleared
+/// prefix is history on disk, not conversation). A legacy `messages.jsonl`
+/// (pre-migration) holds one message per non-empty line. A torn/unparseable
+/// event row is not a message and is skipped.
 fn count_messages(raw: &str, is_events: bool) -> usize {
     raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .filter(|line| {
+        .fold(0usize, |count, line| {
             if !is_events {
-                return true;
+                return count + 1;
             }
-            matches!(
-                serde_json::from_str::<SessionEvent>(line),
+            match serde_json::from_str::<SessionEvent>(line) {
                 Ok(SessionEvent::User(_))
-                    | Ok(SessionEvent::Assistant { .. })
-                    | Ok(SessionEvent::ToolResult(_))
-            )
+                | Ok(SessionEvent::Assistant { .. })
+                | Ok(SessionEvent::ToolResult(_)) => count + 1,
+                Ok(SessionEvent::Cleared) => 0,
+                _ => count,
+            }
         })
-        .count()
 }
 
 impl SessionManager {
@@ -68,12 +73,14 @@ impl SessionManager {
         Self {
             root: root.clone(),
             storage: EventStorage::new(root),
-            current_id: uuid::Uuid::new_v4().to_string(),
+            current_id: Arc::new(parking_lot::Mutex::new(
+                uuid::Uuid::new_v4().to_string(),
+            )),
         }
     }
 
-    pub fn current_id(&self) -> &str {
-        &self.current_id
+    pub fn current_id(&self) -> String {
+        self.current_id.lock().clone()
     }
 
     /// 打开或迁移:events.jsonl 存在 → load;否则 messages.jsonl 存在 →
@@ -120,7 +127,8 @@ impl SessionManager {
 
     /// Append one event to the current session's log.
     pub async fn append_event(&self, ev: &SessionEvent) -> Result<(), AgentError> {
-        self.storage.append_event(&self.current_id, ev).await
+        let sid = self.current_id.lock().clone();
+        self.storage.append_event(&sid, ev).await
     }
 
     /// The agent loop's sync `persist` callback, backed by the store's
@@ -132,22 +140,26 @@ impl SessionManager {
     #[allow(clippy::type_complexity)]
     pub fn persist_fn(&self) -> Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync> {
         let storage = self.storage.clone();
-        let sid = self.current_id.clone();
+        let sid = self.current_id.lock().clone();
         Arc::new(move |ev| storage.append_event_sync(&sid, ev))
     }
 
     /// Load (migrating if needed) a session and adopt it as the current one.
     /// Returns the derived model-visible history. Corruption fails closed.
-    pub async fn resume(&mut self, id: &str) -> Result<Vec<AgentMessage>, crate::HostError> {
+    /// Load (migrating if needed) a session and adopt it as the current one.
+    /// Returns the derived model-visible history. Corruption fails closed.
+    /// `&self`: the cursor is interior-mutable, so hosts can resume through
+    /// a shared `&SessionManager` (no `&mut` gymnastics).
+    pub async fn resume(&self, id: &str) -> Result<Vec<AgentMessage>, crate::HostError> {
         let events = self
             .open_or_migrate(id)
             .await
             .map_err(|e| crate::HostError::Session(e.to_string()))?;
-        self.current_id = id.to_string();
+        *self.current_id.lock() = id.to_string();
         Ok(derive_messages(&events))
     }
 
-    pub async fn resume_last(&mut self) -> Result<Vec<AgentMessage>, crate::HostError> {
+    pub async fn resume_last(&self) -> Result<Vec<AgentMessage>, crate::HostError> {
         let id = self
             .list()
             .await?
@@ -210,8 +222,17 @@ impl SessionManager {
         Ok(out)
     }
 
-    pub fn clear(&mut self) {
-        self.current_id = uuid::Uuid::new_v4().to_string();
+    /// Mark the conversation cleared — the unified `/clear` semantics for
+    /// every transport: append a [`SessionEvent::Cleared`] fact to the
+    /// CURRENT session's log. The session id does NOT rotate (live
+    /// connections, REST readers, and the FTS index keep addressing the same
+    /// chat); [`derive_messages`](conga::derive_messages) projects away the
+    /// pre-clear prefix; the log on disk stays append-only. Fail loud: a
+    /// failed write returns `Err` so the caller can tell the user the clear
+    /// did NOT take (a silent failure would resurrect the old history on
+    /// the next turn).
+    pub async fn mark_cleared(&self) -> Result<(), AgentError> {
+        self.append_event(&SessionEvent::Cleared).await
     }
 }
 
@@ -241,13 +262,13 @@ mod tests {
     #[tokio::test]
     async fn resume_loads_and_sets_current() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
         let id = "fixed-id".to_string();
-        sm.current_id = id.clone();
+        *sm.current_id.lock() = id.clone();
         sm.append_event(&user_event("a")).await.unwrap();
         sm.append_event(&user_event("b")).await.unwrap();
 
-        let mut sm2 = SessionManager::with_root(tmp.path().to_path_buf());
+        let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = sm2.resume(&id).await.unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(sm2.current_id(), id);
@@ -256,16 +277,16 @@ mod tests {
     #[tokio::test]
     async fn resume_last_picks_most_recent() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut a = SessionManager::with_root(tmp.path().to_path_buf());
-        a.current_id = "old".into();
+        let a = SessionManager::with_root(tmp.path().to_path_buf());
+        *a.current_id.lock() = "old".into();
         a.append_event(&user_event("old")).await.unwrap();
         // 让 new 的 mtime 晚于 old
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut b = SessionManager::with_root(tmp.path().to_path_buf());
-        b.current_id = "new".into();
+        let b = SessionManager::with_root(tmp.path().to_path_buf());
+        *b.current_id.lock() = "new".into();
         b.append_event(&user_event("new")).await.unwrap();
 
-        let mut pick = SessionManager::with_root(tmp.path().to_path_buf());
+        let pick = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = pick.resume_last().await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(pick.current_id(), "new");
@@ -276,20 +297,20 @@ mod tests {
         // Regression: dir mtime freezes at first write, so a session that gets
         // a *second* append after another session was created must still win.
         let tmp = tempfile::tempdir().unwrap();
-        let mut a = SessionManager::with_root(tmp.path().to_path_buf());
-        a.current_id = "a".into();
+        let a = SessionManager::with_root(tmp.path().to_path_buf());
+        *a.current_id.lock() = "a".into();
         a.append_event(&user_event("a1")).await.unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut b = SessionManager::with_root(tmp.path().to_path_buf());
-        b.current_id = "b".into();
+        let b = SessionManager::with_root(tmp.path().to_path_buf());
+        *b.current_id.lock() = "b".into();
         b.append_event(&user_event("b1")).await.unwrap();
 
         // a receives a later event -> a is the most recently active session.
         std::thread::sleep(std::time::Duration::from_millis(20));
         a.append_event(&user_event("a2")).await.unwrap();
 
-        let mut pick = SessionManager::with_root(tmp.path().to_path_buf());
+        let pick = SessionManager::with_root(tmp.path().to_path_buf());
         let msgs = pick.resume_last().await.unwrap();
         assert_eq!(pick.current_id(), "a");
         assert_eq!(msgs.len(), 2);
@@ -335,12 +356,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_starts_new_session() {
+    async fn clear_marks_the_log_and_survives_restart() {
+        // /clear is a FACT in the log, not a rotation: the id stays, derive
+        // truncates, a fresh process sees the same cleared view, and the
+        // pre-clear rows are still on disk (append-only).
         let tmp = tempfile::tempdir().unwrap();
-        let mut sm = SessionManager::with_root(tmp.path().to_path_buf());
-        let id1 = sm.current_id().to_string();
-        sm.clear();
-        assert_ne!(sm.current_id(), id1);
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = sm.current_id().to_string();
+        sm.append_event(&user_event("before clear")).await.unwrap();
+        sm.mark_cleared().await.unwrap();
+        sm.append_event(&user_event("after clear")).await.unwrap();
+
+        // Same id (no ghost sessions).
+        assert_eq!(sm.current_id(), id);
+
+        // A fresh process resume derives only the post-clear prefix.
+        let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
+        let msgs = sm2.resume(&id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], AgentMessage::User(u)
+            if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "after clear")));
+
+        // The log on disk kept the pre-clear rows (append-only intact).
+        let events = sm2.open_or_migrate(&id).await.unwrap();
+        assert!(events.contains(&SessionEvent::Cleared));
+        assert!(events.iter().any(|ev| matches!(ev,
+            SessionEvent::User(m) if matches!(m, AgentMessage::User(u)
+                if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "before clear")))));
+
+        // list() mirrors derive: 1 model-visible message after the clear.
+        let info = sm2.list().await.unwrap().into_iter().find(|i| i.id == id).unwrap();
+        assert_eq!(info.msg_count, 1);
     }
 
     #[tokio::test]
@@ -348,8 +394,8 @@ mod tests {
         // The loop's sync persist callback must land events in the log —
         // including when called from a plain (non-async) caller.
         let tmp = tempfile::tempdir().unwrap();
-        let mut sm = SessionManager::with_root(tmp.path().to_path_buf());
-        sm.current_id = "persisted".into();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        *sm.current_id.lock() = "persisted".into();
         let persist = sm.persist_fn();
         persist(&user_event("via-callback")).unwrap();
 

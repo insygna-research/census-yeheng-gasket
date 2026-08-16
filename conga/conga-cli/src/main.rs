@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(Mode::AutoEdit);
     let resume_arg = std::env::args().find_map(|a| a.strip_prefix("--resume=").map(String::from));
 
-    let mut session = SessionManager::new();
+    let session = SessionManager::new();
     if let Some(r) = resume_arg {
         let res = if r == "last" {
             session.resume_last().await
@@ -175,8 +175,13 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
     match parts.next() {
         Some("exit") | Some("quit") => std::process::exit(0),
         Some("clear") => {
-            host.session_mut().clear();
-            println!("(new session)");
+            // Unified semantics: append a Cleared fact to the log (id stays,
+            // derive truncates, disk stays append-only). A failed write is
+            // reported — a silent failure would resurrect the old history.
+            match host.clear_session().await {
+                Ok(()) => println!("(cleared)"),
+                Err(e) => println!("(clear failed: {e})"),
+            }
         }
         Some("mode") => match parts.next().and_then(Mode::parse) {
             Some(m) => {
@@ -188,9 +193,9 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
         Some("resume") => {
             let arg = parts.next().unwrap_or("last");
             let r = if arg == "last" {
-                host.session_mut().resume_last().await
+                host.session().resume_last().await
             } else {
-                host.session_mut().resume(arg).await
+                host.session().resume(arg).await
             };
             match r {
                 Ok(m) => {

@@ -602,3 +602,67 @@ async fn run_turn_compacts_before_every_llm_call() {
         .count();
     assert_eq!(assistants, 3, "log keeps every assistant, uncompacted");
 }
+
+/// The unified `/clear`: `clear_session` appends a `Cleared` fact to the
+/// SAME session's log (no id rotation → no ghost sessions). The next turn's
+/// derived history starts empty, a fresh process sees the same cleared
+/// view, and the pre-clear rows stay on disk (append-only intact).
+#[tokio::test]
+async fn clear_session_marks_log_and_next_turn_starts_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let sid = session.current_id().to_string();
+    let fake = FakeStream::new(vec![
+        // Turn 1: a plain text answer.
+        vec![StreamChunk::TextDelta("old answer".into()), StreamChunk::Done],
+        // Turn 2 (post-clear): a fresh answer.
+        vec![StreamChunk::TextDelta("fresh answer".into()), StreamChunk::Done],
+    ]);
+    let host = Host::new(
+        test_cfg(true),
+        session,
+        Arc::new(full_auto_policy()),
+        "sys".into(),
+        vec![],
+    )
+    .with_stream_fn(Arc::new(fake));
+
+    host.run_turn("old question", |_| {}).await.unwrap();
+
+    // /clear: a fact in the log, same session id.
+    host.clear_session().await.unwrap();
+    assert_eq!(host.session().current_id(), sid);
+
+    host.run_turn("fresh question", |_| {}).await.unwrap();
+
+    // Derived history: exactly the post-clear turn (user + assistant).
+    let reopen = SessionManager::with_root(tmp.path().to_path_buf());
+    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    assert!(events.contains(&SessionEvent::Cleared));
+    let msgs = derive_messages(&events);
+    assert_eq!(msgs.len(), 2, "only the post-clear turn, got {msgs:?}");
+    let texts: Vec<String> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            AgentMessage::Assistant(a) => match &a.content[0] {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(texts.contains(&"fresh question".to_string()), "{texts:?}");
+    assert!(texts.contains(&"fresh answer".to_string()), "{texts:?}");
+    assert!(
+        !texts.iter().any(|t| t == "old question" || t == "old answer"),
+        "pre-clear content must not leak into the derived view: {texts:?}"
+    );
+
+    // Append-only intact: the pre-clear rows are still on disk.
+    let raw = std::fs::read_to_string(tmp.path().join(&sid).join("events.jsonl")).unwrap();
+    assert!(raw.contains("old question"), "log keeps pre-clear rows");
+}

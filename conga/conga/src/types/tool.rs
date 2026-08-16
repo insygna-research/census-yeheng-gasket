@@ -14,6 +14,12 @@ use crate::types::message::{ContentBlock, ToolResultMessage};
 /// prompts, or blocks based on the active permission mode. Lives on
 /// [`ToolDefinition`] so the agent loop can forward it to hooks without a
 /// hardcoded name table.
+///
+/// Grading rule: a tool that can execute arbitrary code or commands is
+/// **always `High`** — no exceptions, no "but it's sandboxed". `bash` and
+/// the PTY `terminal` tool must never diverge: a lower grade on either is
+/// a privilege-escalation hole (the model will learn to prefer the tool
+/// that skips the approver).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RiskLevel {
     Low,

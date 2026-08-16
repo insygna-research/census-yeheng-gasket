@@ -3,50 +3,29 @@
 //! The session-management API lives here as Tauri commands so the desktop
 //! app is self-contained: it reads/writes the on-disk session store
 //! (`~/.conga/sessions`) directly through conga/conga-host instead of
-//! depending on a separately running gateway process. The `chat` module goes
-//! one step further and hosts the agent loop itself: per-session Hosts stream
-//! turn events over Tauri IPC (`chat-event`), replacing the gateway's
+//! depending on a separately running gateway process. The `chat` module
+//! goes one step further and hosts the agent loop itself: per-session Hosts
+//! stream turn events over Tauri IPC (`chat-event`), replacing the gateway's
 //! WebSocket transport inside the desktop shell. The gateway remains the
 //! transport for plain-browser (dev) usage.
+//!
+//! Session commands are thin wrappers over `conga_host::session_api` — the
+//! SAME implementations the gateway's REST handlers call. One validation
+//! rule, one DTO shape, one fail-loud policy.
 
-use conga::{EventStorage, SessionMeta};
+use conga_host::session_api::{self, SessionListItem};
 
 mod chat;
 
-fn session_store() -> EventStorage {
-  EventStorage::new(conga::JsonlStorage::default_root().base_dir_clone())
-}
-
-#[derive(serde::Serialize)]
-struct SessionInfoDto {
-  id: String,
-  msg_count: usize,
-  name: Option<String>,
-  /// Milliseconds since UNIX epoch; 0 when the file has no mtime.
-  mtime: u64,
+fn session_store_root() -> std::path::PathBuf {
+  conga::JsonlStorage::default_root().base_dir_clone()
 }
 
 #[tauri::command]
-async fn list_sessions() -> Result<Vec<SessionInfoDto>, String> {
-  let mgr = conga_host::SessionManager::new();
-  let mut sessions = mgr.list().await.map_err(|e| e.to_string())?;
-  // Newest first.
-  sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
-  Ok(
-    sessions
-      .into_iter()
-      .map(|s| SessionInfoDto {
-        id: s.id,
-        msg_count: s.msg_count,
-        name: s.name,
-        mtime: s
-          .mtime
-          .duration_since(std::time::UNIX_EPOCH)
-          .map(|d| d.as_millis() as u64)
-          .unwrap_or(0),
-      })
-      .collect(),
-  )
+async fn list_sessions() -> Result<Vec<SessionListItem>, String> {
+  session_api::list_sessions(&session_store_root())
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Backend-truth transcript for a session. `Ok(None)` means the session has
@@ -54,62 +33,52 @@ async fn list_sessions() -> Result<Vec<SessionInfoDto>, String> {
 /// state in that case. Corruption fails loud with `Err`.
 #[tauri::command]
 async fn get_session_messages(id: String) -> Result<Option<Vec<serde_json::Value>>, String> {
-  let storage = session_store();
-  if !storage.has_events(&id) && !storage.messages_path(&id).exists() {
-    return Ok(None);
-  }
-  let mgr = conga_host::SessionManager::new();
-  let events = mgr.open_or_migrate(&id).await.map_err(|e| e.to_string())?;
-  let messages = conga::derive_messages(&events);
-  serde_json::to_value(messages)
-    .map(|v| v.as_array().cloned())
+  session_api::session_messages(&session_store_root(), &id)
+    .await
     .map_err(|e| e.to_string())
+    .and_then(|messages| {
+      messages
+        .map(|m| {
+          serde_json::to_value(m)
+            .map(|v| v.as_array().cloned().unwrap_or_default())
+            .map_err(|e| e.to_string())
+        })
+        .transpose()
+    })
 }
 
 /// Persist the session's display name (meta.json sidecar). Creates the
 /// session directory if needed, so a chat can be named before its first
-/// turn lands on disk.
+/// turn lands on disk. Validation is shared with the gateway.
 #[tauri::command]
 async fn rename_session(id: String, name: String) -> Result<(), String> {
-  if !conga::is_valid_session_id(&id) {
-    return Err("invalid session id".into());
-  }
-  let trimmed = name.trim();
-  if trimmed.is_empty() || trimmed.chars().count() > 200 {
-    return Err("name must be 1..=200 chars".into());
-  }
-  session_store()
-    .write_meta(
-      &id,
-      &SessionMeta {
-        name: Some(trimmed.to_string()),
-      },
-    )
+  session_api::rename_session(&session_store_root(), &id, &name)
     .await
     .map_err(|e| e.to_string())
 }
 
-
 /// Cross-session full-text search (FTS5 sidecar at `~/.conga/index.db`).
-/// Stateless per call: open the connection, run the high-water incremental
-/// reindex check, run the query, return hits. No registry, no cached
-/// state — resource state belongs to the host, not process globals.
+/// Same engine as the gateway's REST route (conga_host::session_api):
+/// incremental high-water reindex check + query, on a blocking thread.
 #[tauri::command]
 async fn search_sessions(
   query: String,
 ) -> Result<Vec<conga_host::session_index::SessionHit>, String> {
-  let q = query.trim().to_string();
-  if q.is_empty() {
-    return Err("query must be non-empty".into());
-  }
-  let root = conga::JsonlStorage::default_root().base_dir_clone();
+  let root = session_store_root();
   let db = conga::storage::config_dir().join("index.db");
   tokio::task::spawn_blocking(move || {
-    conga_host::session_index::reindex(&root, &db).map_err(|e| e.to_string())?;
-    conga_host::session_index::search(&root, &db, &q, 20).map_err(|e| e.to_string())
+    session_api::search_sessions(&root, &db, &query, 20).map_err(|e| e.to_string())
   })
   .await
   .map_err(|e| format!("engine task join failed: {e}"))?
+}
+
+/// Delete the session's on-disk data wholesale (event log + meta sidecar).
+#[tauri::command]
+async fn delete_session(id: String) -> Result<bool, String> {
+  session_api::delete_session(&session_store_root(), &id)
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// `~/.conga/app_config.json` — the desktop shell's durable mirror of the
@@ -176,16 +145,6 @@ fn validate_proxy(url: String) -> Result<(), String> {
   conga_host::validate_tool_proxy(url)
 }
 
-/// Delete the session's on-disk data wholesale (event log + meta sidecar).
-/// Returns false when the session never existed.
-#[tauri::command]
-async fn delete_session(id: String) -> Result<bool, String> {
-  session_store()
-    .remove_session(&id)
-    .await
-    .map_err(|e| e.to_string())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let _ = dotenvy::dotenv();
@@ -239,8 +198,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-
   struct NoopLogger;
 
   impl log::Log for NoopLogger {

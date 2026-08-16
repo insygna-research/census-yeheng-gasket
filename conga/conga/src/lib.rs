@@ -29,7 +29,8 @@ pub use types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
 };
 pub use types::session_event::{
-    derive_messages, repair_unanswered_tool_calls, CancelCause, SessionEvent, TurnEndReason,
+    derive_messages, live_range_start, repair_unanswered_tool_calls, CancelCause, SessionEvent,
+    TurnEndReason,
 };
 pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,

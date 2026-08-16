@@ -15,6 +15,17 @@ export interface SubagentToolCall {
 }
 
 /**
+ * One ordered entry in a subagent's run. Thinking blocks and tool calls are
+ * recorded in arrival order (thinking → tool → thinking → tool …), so the UI
+ * can render the actual sequence instead of grouping by kind.
+ * Tool entries reference SubagentToolCall.id — the call itself lives in
+ * SubagentState.toolCalls and is resolved at render time.
+ */
+export type SubagentTimelineEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool'; toolId: string };
+
+/**
  * Subagent execution state
  * Used for real-time tracking of parallel subagent tasks
  */
@@ -27,8 +38,10 @@ export interface SubagentState {
   task: string;
   /** Execution status */
   status: 'running' | 'completed' | 'error';
-  /** Incremental thinking/reasoning content */
-  thinking?: string;
+  /** Ordered run timeline: thinking blocks and tool calls interleaved in
+   * arrival order. Thinking/reasoning text lives here (consecutive chunks
+   * merge into one block); there is no separate aggregated thinking field. */
+  timeline: SubagentTimelineEntry[];
   /** Incremental output content */
   content?: string;
   /** Tool calls made by this subagent */
@@ -173,20 +186,12 @@ export interface ContextStats {
   cumulative_out: number;
 }
 
-export interface WatermarkInfo {
-  watermark: number;
-  max_sequence: number;
-  uncompacted_count: number;
-  compacted_percent: number;
-}
-
 export interface Chat {
   id: string;
   name: string;
   messages: Message[];
   updatedAt: number;
   contextStats?: ContextStats;
-  watermarkInfo?: WatermarkInfo;
 }
 
 // ── Approval Types ──────────────────────────────────────────

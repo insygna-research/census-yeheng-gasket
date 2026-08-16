@@ -15,6 +15,8 @@ use std::path::{Component, Path, PathBuf};
 use conga::types::tool::ToolDefinition;
 
 /// The 8 built-in tools, ready to drop into `AgentContext.tools`.
+/// `spawn_subagents` is built WITHOUT a spawner here; hosts wire their own
+/// via `Host::with_spawner`, which replaces the tool in their list.
 pub fn built_in_tools() -> Vec<ToolDefinition> {
     vec![
         read::tool(),
@@ -24,7 +26,7 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
         list::tool(),
         grep::tool(),
         fetch::tool(),
-        subagent::tool(),
+        subagent::tool(None),
     ]
 }
 

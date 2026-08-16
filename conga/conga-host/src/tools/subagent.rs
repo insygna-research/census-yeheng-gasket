@@ -1,10 +1,10 @@
 //! `spawn_subagents` tool — fan out parallel sub-agent loops.
 //!
-//! The spawner is injected via [`crate::set_spawn_spawner`] (called by
-//! `Host::with_spawner`), not through the core `ToolContext` — the core
-//! stays free of host concerns. Without an injected spawner the tool
-//! reports subagents as unavailable (same behavior as the pre-move
-//! `NoopSubagentSpawner` fallback).
+//! The spawner is captured in the execute closure at construction
+//! ([`tool`]): each `ToolDefinition` owns its spawner, so hosts that build
+//! separate tool lists (one per gateway connection) are isolated with zero
+//! shared state. Built without a spawner (`built_in_tools()`), the tool
+//! reports subagents as unavailable.
 
 use std::sync::Arc;
 
@@ -12,7 +12,8 @@ use crate::subagent_types::{SubagentSpawn, SubagentSpawner};
 use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use conga::ContentBlock;
 
-pub fn tool() -> ToolDefinition {
+pub fn tool(spawner: Option<Arc<dyn SubagentSpawner>>) -> ToolDefinition {
+    let spawner = spawner.unwrap_or_else(|| Arc::new(crate::subagent_types::NoopSubagentSpawner));
     ToolDefinition {
         name: "spawn_subagents".into(),
         label: "Spawn Subagents".into(),
@@ -31,11 +32,14 @@ pub fn tool() -> ToolDefinition {
             "required": ["tasks"]
         }),
         risk: RiskLevel::Medium,
-        execute: Arc::new(|ctx| Box::pin(execute(ctx))),
+        execute: Arc::new(move |ctx| Box::pin(execute(Arc::clone(&spawner), ctx))),
     }
 }
 
-async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError> {
+async fn execute(
+    spawner: Arc<dyn SubagentSpawner>,
+    ctx: ToolCallCtx,
+) -> Result<ToolResult, conga::error::ToolError> {
     if ctx.aborted() {
         return Ok(ToolResult::error("aborted".to_string()));
     }
@@ -52,6 +56,9 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
             })
         })
         .collect();
+    // Malformed entries (no string `task`) are counted and reported below —
+    // same no-silent-drops contract as the maxItems truncation.
+    let invalid = tasks.len() - spawns.len();
 
     if spawns.is_empty() {
         return Ok(ToolResult::error(
@@ -63,11 +70,6 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     // Dropped tasks are reported so the model isn't silently truncated.
     let dropped = spawns.len().saturating_sub(5);
     spawns.truncate(5);
-
-    let spawner: Arc<dyn SubagentSpawner> = match crate::spawn_spawner_slot() {
-        Some(s) => s,
-        None => Arc::new(crate::subagent_types::NoopSubagentSpawner),
-    };
 
     let results = spawner.spawn(spawns).await;
 
@@ -87,6 +89,11 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
             "\n\n(Note: {dropped} additional task(s) beyond the max of 5 were dropped.)"
         ));
     }
+    if invalid > 0 {
+        summary.push_str(&format!(
+            "\n\n(Note: {invalid} task(s) without a valid 'task' string were skipped.)"
+        ));
+    }
 
     Ok(ToolResult {
         content: vec![ContentBlock::text(summary)],
@@ -95,6 +102,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
             "completed": results.iter().filter(|r| r.error.is_none()).count(),
             "errors": results.iter().filter(|r| r.error.is_some()).count(),
             "dropped": dropped,
+            "invalid": invalid,
         }),
         is_error: false,
     })
@@ -111,19 +119,20 @@ mod tests {
     use crate::subagent_types::{SubagentResult, SubagentSpawner};
     use conga::types::tool::ToolContext;
 
-    /// Serializes tests that touch the process-wide spawner slot (same
-    /// pattern as proxy's LOCK): parallel installs would cross-contaminate.
-    static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Records how many tasks it received; returns one canned result each.
-    struct CountingSpawner(Arc<AtomicUsize>);
+    /// Records how many tasks it received; each result's summary carries
+    /// the spawner's own marker (to tell spawners apart in tests).
+    struct CountingSpawner {
+        count: Arc<AtomicUsize>,
+        marker: &'static str,
+    }
 
     impl SubagentSpawner for CountingSpawner {
         fn spawn(
             &self,
             tasks: Vec<SubagentSpawn>,
         ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
-            let count = Arc::clone(&self.0);
+            let count = Arc::clone(&self.count);
+            let marker = self.marker;
             Box::pin(async move {
                 count.fetch_add(tasks.len(), Ordering::SeqCst);
                 tasks
@@ -133,31 +142,13 @@ mod tests {
                         id: format!("r-{i}"),
                         task: t.task,
                         index: i + 1,
-                        summary: "ok".into(),
+                        summary: marker.into(),
                         tool_count: 0,
                         error: None,
                     })
                     .collect()
             })
         }
-    }
-    /// Install a spawner into the process-wide slot. The returned guard
-    /// holds BOTH the serializing lock (so parallel tests cannot
-    /// cross-contaminate the slot) and restores the slot to `None` on drop.
-    fn with_slot(spawner: Option<Arc<dyn SubagentSpawner>>) -> impl Drop {
-        let _lock = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        struct Guard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                *crate::SPAWN_SPAWNER.write() = None;
-                // The lock guard drops here too, releasing serialization.
-            }
-        }
-        match spawner {
-            Some(s) => crate::set_spawn_spawner(s),
-            None => *crate::SPAWN_SPAWNER.write() = None,
-        }
-        Guard(_lock)
     }
 
     fn ctx_with(tasks: serde_json::Value) -> ToolCallCtx {
@@ -184,15 +175,26 @@ mod tests {
             { "task": "g" },
         ])
     }
+    fn result_text(r: &ToolResult) -> &str {
+        r.content
+            .first()
+            .and_then(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
 
     /// The schema's maxItems (5) is enforced regardless of what the LLM
     /// sent, and the truncation is reported instead of being silent.
     #[tokio::test]
     async fn truncates_over_limit_tasks_and_reports() {
         let count = Arc::new(AtomicUsize::new(0));
-        let spawner = Arc::new(CountingSpawner(Arc::clone(&count)));
-        let _slot = with_slot(Some(spawner));
-        let r = execute(ctx_with(seven_tasks())).await.unwrap();
+        let spawner = Arc::new(CountingSpawner {
+            count: Arc::clone(&count),
+            marker: "ok",
+        });
+        let r = execute(spawner, ctx_with(seven_tasks())).await.unwrap();
 
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -201,32 +203,73 @@ mod tests {
         );
         assert_eq!(r.details["subagent_count"], 5);
         assert_eq!(r.details["dropped"], 2);
-        let text = r.content.first().and_then(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        });
         assert!(
-            text.unwrap_or_default().contains("dropped"),
+            result_text(&r).contains("dropped"),
             "dropped count must be visible to the model"
         );
     }
 
     /// No spawner wired (bare agent_loop / CLI without subagents): every
-    /// task comes back as an explicit error, never a silent no-op.
+    /// task comes back as an explicit error, never a silent no-op. Goes
+    /// through `tool(None)`'s closure to lock the public Noop wiring.
     #[tokio::test]
     async fn no_spawner_reports_unavailable() {
-        let _slot = with_slot(None);
-        let r = execute(ctx_with(seven_tasks())).await.unwrap();
+        let t = tool(None);
+        let r = (t.execute)(ctx_with(seven_tasks())).await.unwrap();
 
         assert_eq!(r.details["subagent_count"], 5);
         assert_eq!(r.details["errors"], 5);
-        let text = r.content.first().and_then(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        });
         assert!(
-            text.unwrap_or_default().contains("not available"),
+            result_text(&r).contains("not available"),
             "unavailable spawner must be surfaced as errors"
         );
+    }
+
+    /// Malformed entries (no string `task`) are counted and reported, not
+    /// silently dropped — same contract as the maxItems truncation.
+    #[tokio::test]
+    async fn malformed_tasks_are_reported() {
+        let spawner = Arc::new(CountingSpawner {
+            count: Arc::new(AtomicUsize::new(0)),
+            marker: "ok",
+        });
+        let r = execute(
+            spawner,
+            ctx_with(serde_json::json!([{ "task": "a" }, { "nope": 1 }, { "task": "b" }])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r.details["subagent_count"], 2);
+        assert_eq!(r.details["invalid"], 1);
+        assert!(
+            result_text(&r).contains("skipped"),
+            "invalid task count must be visible to the model"
+        );
+    }
+
+    /// Each tool owns the spawner captured at construction: two tools in
+    /// the same process never see each other's spawner. (Regression for
+    /// the former process-wide spawner slot, where the last install won.)
+    #[tokio::test]
+    async fn spawners_are_captured_per_tool() {
+        let (c1, c2) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let t1 = tool(Some(Arc::new(CountingSpawner {
+            count: Arc::clone(&c1),
+            marker: "from-one",
+        })));
+        let t2 = tool(Some(Arc::new(CountingSpawner {
+            count: Arc::clone(&c2),
+            marker: "from-two",
+        })));
+
+        let tasks = serde_json::json!([{ "task": "x" }]);
+        let r1 = (t1.execute)(ctx_with(tasks.clone())).await.unwrap();
+        let r2 = (t2.execute)(ctx_with(tasks)).await.unwrap();
+
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 1);
+        assert!(result_text(&r1).contains("from-one"));
+        assert!(result_text(&r2).contains("from-two"));
     }
 }

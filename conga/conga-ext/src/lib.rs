@@ -47,4 +47,21 @@ mod tests {
         };
         assert_eq!(names, expected);
     }
+
+    /// Security regression: `terminal` runs arbitrary commands on a PTY —
+    /// strictly more powerful than `bash` (persistent, stdin-writable). It
+    /// must be `High` like `bash`, or AutoEdit-mode hosts auto-approve a
+    /// privilege-escalation path around the bash approver.
+    #[cfg(feature = "terminal")]
+    #[test]
+    fn terminal_tool_is_high_risk() {
+        let mut api = conga::ExtensionApiImpl::new();
+        register_all(&mut api);
+        let terminal = api
+            .tools
+            .iter()
+            .find(|t| t.name == "terminal")
+            .expect("terminal tool registered");
+        assert_eq!(terminal.risk, conga::RiskLevel::High);
+    }
 }

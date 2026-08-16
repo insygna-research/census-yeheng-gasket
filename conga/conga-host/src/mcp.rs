@@ -9,8 +9,18 @@
 //! Configuration: `~/.conga/mcp.json` (or `$CONGA_MCP_CONFIG`), Claude-Desktop
 //! style `{"mcpServers": {name: {command, args, env}}}`. Parallel to
 //! [`crate::external_tool::ExternalToolBridge`]; both produce `Vec<ToolDefinition>`.
+//!
+//! ## Serialization constraint (both transports)
+//!
+//! Calls to ONE server are fully serialized (stdio: one connection-level
+//! mutex held across request+response; HTTP: a per-client id mutex). This
+//! is a deliberate simplification — MCP servers are frequently
+//! single-threaded subprocesses — NOT an accident. Parallel fan-out across
+//! *different* servers is unaffected.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -407,35 +417,19 @@ impl McpBridge {
             .map_err(|e| McpError::Protocol(format!("tools/call parse error: {e}")))
     }
 
+    /// Wrap one MCP tool as a conga [`ToolDefinition`] — via the shared
+    /// [`mcp_tool_definition`] wrapper (same naming/risk/dispatch as the
+    /// HTTP transport).
     fn tool_definition(self: &Arc<Self>, t: McpTool) -> ToolDefinition {
         let bridge = Arc::clone(self);
-        let original_name = t.name.clone();
-        let prefixed_name = format!("mcp__{}__{}", self.server_name, t.name);
-        let label = format!("{}/{}", self.server_name, t.title.unwrap_or(t.name));
-        ToolDefinition {
-            name: prefixed_name,
-            label,
-            description: t.description,
-            parameters: t.input_schema,
-            risk: RiskLevel::High,
-            execute: Arc::new(move |ctx| {
+        mcp_tool_definition(
+            &self.server_name,
+            t,
+            Arc::new(move |name, args| {
                 let bridge = Arc::clone(&bridge);
-                let original_name = original_name.clone();
-                Box::pin(async move {
-                    if ctx.aborted() {
-                        return Ok(ToolResult::error("aborted"));
-                    }
-                    match bridge.call(&original_name, &ctx.args).await {
-                        Ok(resp) => Ok(ToolResult {
-                            content: content_to_blocks(&resp.content),
-                            details: serde_json::Value::Null,
-                            is_error: resp.is_error,
-                        }),
-                        Err(e) => Err(ToolError::Message(e.to_string())),
-                    }
-                })
+                Box::pin(async move { bridge.call(&name, &args).await })
             }),
-        }
+        )
     }
 }
 
@@ -665,35 +659,66 @@ impl McpHttpClient {
             .map_err(|e| McpError::Protocol(format!("tools/call parse error: {e}")))
     }
 
+    /// Wrap one MCP tool as a conga [`ToolDefinition`] — via the shared
+    /// [`mcp_tool_definition`] wrapper (same naming/risk/dispatch as the
+    /// stdio transport).
     fn tool_definition(self: &Arc<Self>, t: McpTool) -> ToolDefinition {
         let client = Arc::clone(self);
-        let original_name = t.name.clone();
-        let prefixed_name = format!("mcp__{}__{}", self.server_name, t.name);
-        let label = format!("{}/{}", self.server_name, t.title.unwrap_or(t.name));
-        ToolDefinition {
-            name: prefixed_name,
-            label,
-            description: t.description,
-            parameters: t.input_schema,
-            risk: RiskLevel::High,
-            execute: Arc::new(move |ctx| {
+        mcp_tool_definition(
+            &self.server_name,
+            t,
+            Arc::new(move |name, args| {
                 let client = Arc::clone(&client);
-                let original_name = original_name.clone();
-                Box::pin(async move {
-                    if ctx.aborted() {
-                        return Ok(ToolResult::error("aborted"));
-                    }
-                    match client.call(&original_name, &ctx.args).await {
-                        Ok(resp) => Ok(ToolResult {
-                            content: content_to_blocks(&resp.content),
-                            details: serde_json::Value::Null,
-                            is_error: resp.is_error,
-                        }),
-                        Err(e) => Err(ToolError::Message(e.to_string())),
-                    }
-                })
+                Box::pin(async move { client.call(&name, &args).await })
             }),
-        }
+        )
+    }
+}
+
+// ── Shared tool wrapper (both transports) ─────────────────────
+
+/// One `tools/call` dispatch, transport-agnostic: `(original_name, args)`
+/// → the server's `CallResult`.
+type McpCallFn = Arc<
+    dyn Fn(
+            String,
+            serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<CallResult, McpError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap one MCP tool as a conga [`ToolDefinition`], shared by the stdio and
+/// HTTP transports: name prefixed `mcp__<server>__<tool>` (server tool
+/// names can collide with built-ins or each other), risk High (an external
+/// server is unvetted code), execution dispatched through `call`.
+fn mcp_tool_definition(server_name: &str, t: McpTool, call: McpCallFn) -> ToolDefinition {
+    let original_name = t.name.clone();
+    let prefixed_name = format!("mcp__{server_name}__{}", t.name);
+    let label = format!("{}/{}", server_name, t.title.unwrap_or(t.name));
+    ToolDefinition {
+        name: prefixed_name,
+        label,
+        description: t.description,
+        parameters: t.input_schema,
+        risk: RiskLevel::High,
+        execute: Arc::new(move |ctx| {
+            let call = Arc::clone(&call);
+            let original_name = original_name.clone();
+            Box::pin(async move {
+                if ctx.aborted() {
+                    return Ok(ToolResult::error("aborted"));
+                }
+                match call(original_name, ctx.args).await {
+                    Ok(resp) => Ok(ToolResult {
+                        content: content_to_blocks(&resp.content),
+                        details: serde_json::Value::Null,
+                        is_error: resp.is_error,
+                    }),
+                    Err(e) => Err(ToolError::Message(e.to_string())),
+                }
+            })
+        }),
     }
 }
 

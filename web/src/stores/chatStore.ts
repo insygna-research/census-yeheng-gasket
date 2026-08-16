@@ -197,11 +197,6 @@ export const useChatStore = defineStore('chat', () => {
     if (chat) chat.contextStats = stats;
   };
 
-  const setWatermarkInfo = (chatId: string, info: any) => {
-    const chat = getChat(chatId);
-    if (chat) chat.watermarkInfo = info;
-  };
-
   const setTurnSummary = (chatId: string, messageId: string, summary: TurnSummary) => {
     const chat = getChat(chatId);
     if (!chat) return;
@@ -328,7 +323,6 @@ export const useChatStore = defineStore('chat', () => {
     clearChatMessages,
     setMessages,
     setContextStats,
-    setWatermarkInfo,
     setTurnSummary,
     abortToolCalls,
     abortSubagents,

@@ -138,7 +138,6 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
         :session-status="session.sessionStatus"
         :show-reconnect-button="session.showReconnectButton"
         :context-stats="session.contextStats"
-        :watermark-info="session.watermarkInfo"
         :usage-color="session.usageColor"
         :is-compacting="session.isCompacting"
         @reconnect="session.manualReconnect"

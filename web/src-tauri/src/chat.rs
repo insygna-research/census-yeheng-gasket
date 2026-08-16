@@ -20,13 +20,9 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use conga::AgentEvent;
-use conga_host::approval::{self, ApprovalRegistry, RegisterOutcome};
 use conga_host::event_map::{event_to_ws, subagent_event_to_ws};
-use conga_host::permission::Approver;
 use conga_host::wire::OutgoingEvent;
-use conga_host::{
-  load_all_mcp, ConfigLoader, Host, HostSubagentSpawner, Mode, PermissionPolicy, SessionManager,
-};
+use conga_host::SessionAssembly;
 
 /// Tauri event channel carrying every chat event. Payload: [`ChatEventPayload`].
 pub const CHAT_EVENT: &str = "chat-event";
@@ -64,9 +60,11 @@ enum WireEvent {
 /// Per-session state: the Host (which owns the on-disk event log via its
 /// SessionManager) plus the cross-command knobs (cancel, approvals). The
 /// transcript itself is never mirrored in memory — the event log is the
-/// single source of truth.
+/// single source of truth. `host`/`registry`/`cancel_tx` come from the
+/// shared [`SessionAssembly`] — identical wiring to the gateway's WS
+/// connection, so behavior cannot drift between transports.
 struct ChatSession {
-  host: Host,
+  host: conga_host::Host,
   /// Turn serialization: mirrors the gateway's one-turn-per-connection
   /// behavior (a second message while a turn runs gets a `busy` reply).
   /// Host::run_turn's own TurnInProgress rejection is the backstop.
@@ -74,9 +72,9 @@ struct ChatSession {
   /// Unlocks pending approval waits on cancel. Fresh `subscribe()` receivers
   /// per approval avoid the cancel-latch poisoning (see approval.rs tests).
   cancel_tx: tokio::sync::watch::Sender<bool>,
-  /// Shared with the approver closure baked into the Host's policy -
+  /// Shared with the approver closure baked into the Host's policy —
   /// `approval_response` must fill in decisions on THIS registry.
-  registry: Arc<Mutex<ApprovalRegistry>>,
+  registry: Arc<Mutex<conga_host::approval::ApprovalRegistry>>,
   wire_tx: UnboundedSender<WireEvent>,
   /// Cumulative provider-reported input tokens across turns (fed by
   /// `AfterProviderResponse` events in the emitter). Mirrors the gateway's
@@ -229,154 +227,63 @@ fn spawn_emitter(
   });
 }
 
-/// Assemble a session's Host exactly as the gateway does per WS connection:
-/// same config loader, same system prompt, same mode env knob, same tool set
-/// (built-in + external + MCP), same sub-agent wiring. Do not invent new
-/// config here — the desktop app reads the same `~/.conga` setup.
+/// Assemble a session's Host via the SHARED assembly (conga_host::assembly)
+/// — the exact same config load, fail-loud resume, skills, permission mode,
+/// approver, tool set (built-in + external + MCP), and sub-agent wiring the
+/// gateway uses per WS connection. The desktop adds its in-process extension
+/// tools (web_search) as `extra_tools`. Do not invent new config here — the
+/// desktop app reads the same `~/.conga` setup.
 async fn build_session(
   app: &AppHandle,
   store_root: &std::path::Path,
   session_id: &str,
 ) -> Result<Arc<ChatSession>, String> {
-  let host_cfg = ConfigLoader::load().map_err(|e| format!("Config error: {e}"))?;
-
-  // Fail-loud resume, identical to the gateway: corruption is an error,
-  // never adopt-and-restart over a damaged transcript.
-  let mut session_mgr = SessionManager::with_root(store_root.to_path_buf());
-  session_mgr
-    .resume(session_id)
-    .await
-    .map_err(|e| format!("Session error: {e}"))?;
-
-  // Skills (and the Host's tool sandbox) follow the project dir, not the
-  // process cwd — the desktop app is launched outside the project it serves.
-  let cwd = conga_host::project_dir();
-  let system_prompt = conga_host::append_skills("You are a helpful, concise assistant.", &cwd);
-  // Intentionally the gateway's env knob: one mode setting shared by both
-  // transports.
-  let mode = std::env::var("CONGA_GATEWAY_MODE")
-    .ok()
-    .and_then(|s| Mode::parse(&s))
-    .unwrap_or(Mode::AutoEdit);
-
-  let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
-  let registry = Arc::new(Mutex::new(ApprovalRegistry::new()));
   let (wire_tx, wire_rx) = tokio::sync::mpsc::unbounded_channel::<WireEvent>();
 
-  let approver: Approver = {
-    let registry = registry.clone();
-    let cancel_tx = cancel_tx.clone();
+  let approval_emit: conga_host::ApprovalEmit = {
     let wire = wire_tx.clone();
-    // 显式标注 Approver：闭包返回的 Box::pin(async …) 需要按
-    // `Pin<Box<dyn Future + Send>>` 非大小化（同 gateway 的批注）。
-    Arc::new(move |tool_name: &str, args: &serde_json::Value| {
-      let registry = registry.clone();
-      let cancel_tx = cancel_tx.clone();
-      let wire = wire.clone();
-      Box::pin(async move {
-        let outcome = { registry.lock().unwrap().register(tool_name) };
-        let (request_id, rx) = match outcome {
-          RegisterOutcome::Remembered(v) => return v,
-          RegisterOutcome::Pending { request_id, rx } => (request_id, rx),
-        };
-        // Approval requests go through the same ordered channel as every
-        // other wire event, so a request can never overtake the tool_start
-        // event of the call it belongs to.
+    Arc::new(
+      move |request_id: String, tool_name: String, args: serde_json::Value| {
+        // Approval requests ride the same ordered channel as every other
+        // wire event, so a request can never overtake the tool_start of
+        // the call it belongs to.
         let _ = wire.send(WireEvent::Approval {
-          request_id: request_id.clone(),
-          tool_name: tool_name.to_string(),
-          args: args.clone(),
+          request_id,
+          tool_name,
+          args,
         });
-        let timeout_s = std::env::var("CONGA_APPROVAL_TIMEOUT_S")
-          .ok()
-          .and_then(|v| v.parse().ok())
-          .unwrap_or(300u64);
-        // subscribe() 把当前值标记为已见：只有将来的 send 才命中 changed()，
-        // 本连接的第一次 cancel 不会毒化后续所有审批。
-        approval::wait_for_decision(
-          rx,
-          cancel_tx.subscribe(),
-          std::time::Duration::from_secs(timeout_s),
-        )
-        .await
-      })
+      },
+    )
+  };
+  let subagent_emit: conga_host::SubagentEmit = {
+    let wire = wire_tx.clone();
+    Arc::new(move |ev: conga_host::SubagentEvent| {
+      let _ = wire.send(WireEvent::Subagent(ev));
     })
   };
-  let policy = Arc::new(PermissionPolicy::new(mode, approver));
 
-  // Tool assembly mirrors the gateway: built-in + external + MCP for the
-  // parent; built-in minus `spawn_subagents` for sub-agents.
-  let extra_tools = {
-    let cmds = conga_host::commands_from_env();
-    if cmds.is_empty() {
-      Vec::new()
-    } else {
-      match conga_host::load_external_tools(&cmds).await {
-        Ok(t) => t,
-        Err(e) => {
-          warn!("session {session_id}: external tools load failed: {e}");
-          Vec::new()
-        }
-      }
-    }
-  };
-  let mcp_tools = load_all_mcp().await;
   // Production extensions from conga-ext (currently web_search only) —
-  // the non-demo composition root; the CLI's register_all adds the
-  // hello/todo/permission_gate demos on top. Its HTTP client honors the
-  // runtime tool proxy (conga::set_tool_proxy).
+  // the non-demo composition root. Its HTTP client honors the runtime
+  // tool proxy (conga::set_tool_proxy).
   let search_tools = {
     let mut api = conga::ExtensionApiImpl::new();
     conga_ext::prod_register(&mut api);
     api.tools
   };
-  let built_in = conga_host::built_in_tools();
-  let subagent_tools: Vec<_> = built_in
-    .iter()
-    .filter(|t| t.name != "spawn_subagents")
-    .cloned()
-    .collect();
-  let tools = {
-    let mut t = built_in;
-    t.extend(extra_tools.iter().cloned());
-    t.extend(mcp_tools.iter().cloned());
-    t.extend(search_tools);
-    t
-  };
 
-  let spawner_cfg = host_cfg.clone();
-  let spawner_policy = Arc::clone(&policy);
-  let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
-  {
-    let spawner_signal = host.signal().clone();
-    let emit: Arc<dyn Fn(conga_host::SubagentEvent) + Send + Sync> = {
-      let wire = wire_tx.clone();
-      Arc::new(move |ev: conga_host::SubagentEvent| {
-        let _ = wire.send(WireEvent::Subagent(ev));
-      })
-    };
-    let spawner_stream_fn = spawner_cfg.provider_stream_fn();
-    let spawner_hooks: Arc<dyn conga::HookChain> =
-      Arc::new(conga_host::HookStack::new(vec![spawner_policy]));
-    let loop_config = spawner_cfg.build_loop_config(
-      spawner_cfg.tunables.max_turns,
-      Some(spawner_signal.clone()),
-      None,
-      spawner_stream_fn,
-    );
-    let spawner = Arc::new(
-      HostSubagentSpawner::new(
-        "You are a focused sub-agent. Complete your assigned task concisely.".into(),
-        subagent_tools,
-        spawner_hooks,
-        spawner_signal,
-        conga_host::project_dir(),
-        loop_config,
-      )
-      .with_ws_emit(emit),
-    );
-    host = host.with_spawner(spawner);
-  }
+  let SessionAssembly {
+    host,
+    registry,
+    cancel_tx,
+  } = SessionAssembly::build(
+    store_root,
+    session_id,
+    search_tools,
+    approval_emit,
+    subagent_emit,
+  )
+  .await
+  .map_err(|e| e.to_string())?;
 
   let session = Arc::new(ChatSession {
     host,
@@ -446,16 +353,21 @@ pub async fn send_message(
     let mut parts = cmd.split_whitespace();
     let reply = match parts.next() {
       Some("clear") => {
-        // The gateway rotates the Host's SessionManager to a fresh id
-        // (session_mut().clear()), but the desktop app's Host sits behind
-        // an Arc<ChatSession> with no &mut access. Instead: reset the
-        // accumulated usage counters and let the frontend clear its local
-        // message list on receipt. The on-disk log keeps its session id; new
-        // turns append to it (the event log is append-only anyway).
-        session.usage_in.store(0, Ordering::Relaxed);
-        session.usage_out.store(0, Ordering::Relaxed);
-        session.last_input_tokens.store(0, Ordering::Relaxed);
-        OutgoingEvent::content("(session cleared)".to_string())
+        // SAME semantics as the gateway's /clear (and the CLI's): append a
+        // `SessionEvent::Cleared` fact to this session's log. The id does
+        // NOT rotate, so this IPC session, REST-style readers, and the FTS
+        // index keep addressing the same chat. derive_messages truncates on
+        // the next turn; a failed write is reported instead of silently
+        // resurrecting the old history.
+        match session.host.clear_session().await {
+          Ok(()) => {
+            session.usage_in.store(0, Ordering::Relaxed);
+            session.usage_out.store(0, Ordering::Relaxed);
+            session.last_input_tokens.store(0, Ordering::Relaxed);
+            OutgoingEvent::content("(session cleared)".to_string())
+          }
+          Err(e) => OutgoingEvent::error(format!("clear failed: {e}")),
+        }
       }
       Some("help") => OutgoingEvent::content("commands: /clear  /help".to_string()),
       Some(other) => OutgoingEvent::error(format!("unknown command /{other}")),
@@ -539,10 +451,11 @@ pub fn approval_response(
 }
 
 /// Context occupancy for the desktop app. Mirrors the gateway's
-/// `GET /api/sessions/:id/context` endpoint: reads the session's accumulated
-/// usage counters and computes a saturation percentage against
-/// `CONGA_CONTEXT_WINDOW` (default 128k). Returns the same JSON shape the
-/// frontend expects: `{ context_stats, watermark_info }`.
+/// `GET /api/sessions/:id/context` endpoint — both build the payload with
+/// the SAME `conga_host::wire::context_stats` (one JSON shape, one
+/// `CONGA_CONTEXT_WINDOW` knob): reads the session's accumulated usage
+/// counters and computes a saturation percentage (default window 128k).
+/// Payload shape: `{ context_stats }`.
 #[tauri::command]
 pub fn get_context(
   state: State<'_, ChatState>,
@@ -556,21 +469,6 @@ pub fn get_context(
     ),
     None => (0u64, 0u64, 0u64),
   };
-  let window = std::env::var("CONGA_CONTEXT_WINDOW")
-    .ok()
-    .and_then(|s| s.parse::<u64>().ok())
-    .unwrap_or(128_000);
-  let usage_percent = if window > 0 {
-    (last_input_tokens as f64 / window as f64) * 100.0
-  } else {
-    0.0
-  };
-  let stats = serde_json::json!({
-    "current_tokens": last_input_tokens,
-    "usage_percent": usage_percent,
-    "is_compressing": false,
-    "cumulative_in": usage_in,
-    "cumulative_out": usage_out,
-  });
-  Ok(serde_json::json!({ "context_stats": stats, "watermark_info": null }))
+  let stats = conga_host::wire::context_stats(last_input_tokens, usage_in, usage_out);
+  Ok(serde_json::json!({ "context_stats": stats }))
 }

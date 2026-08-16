@@ -13,7 +13,7 @@ import { computed, ref } from 'vue';
 import { Cpu, Globe, Loader2, Moon, MoreVertical, Palette, RotateCcw, Sun, Trash2, Check } from 'lucide-vue-next';
 import NetworkProxyDialog from './NetworkProxyDialog.vue';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
-import type { ContextStats, WatermarkInfo } from '../types';
+import type { ContextStats } from '../types';
 
 const props = defineProps<{
   chatTitle: string;
@@ -21,7 +21,6 @@ const props = defineProps<{
   sessionStatus: string;
   showReconnectButton: boolean;
   contextStats?: ContextStats;
-  watermarkInfo?: WatermarkInfo;
   usageColor: string;
   isCompacting: boolean;
 }>();
@@ -112,9 +111,6 @@ const showProxyDialog = ref(false);
         </DropdownMenuTrigger>
         <DropdownMenuPortal>
           <DropdownMenuContent align="end" :side-offset="6" :class="menuContentClass">
-            <DropdownMenuLabel v-if="watermarkInfo" class="px-3 py-1.5 text-[11px] th-text-dim font-normal normal-case tracking-normal">
-              Watermark: {{ watermarkInfo.watermark }}/{{ watermarkInfo.max_sequence }}
-            </DropdownMenuLabel>
             <DropdownMenuItem v-if="contextStats" :disabled="isCompacting" :class="menuItemClass" @select="emit('compact')">
               <Loader2 v-if="isCompacting" class="w-3.5 h-3.5 mr-2 animate-spin th-text-dim" />
               <Cpu v-else class="w-3.5 h-3.5 mr-2 th-text-dim" />

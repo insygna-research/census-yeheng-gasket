@@ -85,6 +85,33 @@ const timeline = computed((): TimelineItem[] => {
 /** Per-tool-call expanded state map. */
 const toolExpandedMap = ref<Record<string, boolean>>({});
 
+// ── Subagent nesting ────────────────────────────────────────
+// Subagents are launched by the `spawn_subagents` tool; each child agent is
+// rendered indented beneath the tool call that started it (matched by
+// startTime so sequential batches group under their own call).
+const spawnTools = computed(() =>
+  (props.message.toolCalls || []).filter(t => t.name === 'spawn_subagents')
+);
+
+function subagentsForTool(tool: ToolCall): SubagentState[] {
+  if (!props.subagents) return [];
+  const start = tool.startTime || 0;
+  const laterStarts = spawnTools.value
+    .map(t => t.startTime || 0)
+    .filter(ts => ts > start);
+  const end = laterStarts.length ? Math.min(...laterStarts) : Infinity;
+  return props.subagents.filter(s => s.startTime >= start && s.startTime < end);
+}
+
+/** Subagents not attributable to any spawn_subagents call (e.g. restored
+ * history without tool timestamps) still render at the bottom. */
+const orphanSubagents = computed(() => {
+  if (!props.subagents) return [];
+  if (spawnTools.value.length === 0) return props.subagents;
+  const firstStart = Math.min(...spawnTools.value.map(t => t.startTime || 0));
+  return props.subagents.filter(s => s.startTime < firstStart);
+});
+
 function isToolExpanded(tool: ToolCall): boolean {
   // Default to expanded for running tools, collapsed for completed/error
   if (tool.id in toolExpandedMap.value) {
@@ -128,6 +155,16 @@ function iconForStatus(status: ToolCall['status']) {
     case 'error':
       return XCircle;
   }
+}
+
+/** Friendly display names for wire-level tool names. spawn_subagents shows
+ * the number of child agents attributed to the call once they start. */
+function toolDisplayName(tool: ToolCall): string {
+  if (tool.name === 'spawn_subagents') {
+    const count = subagentsForTool(tool).length;
+    return count > 0 ? `Parallel Subagents ×${count}` : 'Parallel Subagents';
+  }
+  return tool.name;
 }
 </script>
 
@@ -184,18 +221,18 @@ function iconForStatus(status: ToolCall['status']) {
     >
       <template v-for="(item, idx) in timeline" :key="idx">
         <!-- Thinking chunk -->
-        <div v-if="item.type === 'thinking'" class="flex gap-2">
-          <Sparkles class="w-3 h-3 text-primary shrink-0 mt-0.5" />
+        <div v-if="item.type === 'thinking'" class="flex gap-2 items-start rounded-xl bg-primary/5 border border-primary/10 px-3 py-2">
+          <Sparkles class="w-3 h-3 text-primary/70 shrink-0 mt-0.5" />
           <div class="th-text-secondary whitespace-pre-wrap leading-relaxed flex-1 min-w-0 break-words">
             {{ item.content }}
           </div>
         </div>
 
         <!-- Tool call -->
+        <div v-else-if="item.type === 'tool_call'">
         <Collapsible
-          v-else-if="item.type === 'tool_call'"
           :open="isToolExpanded(item.tool)"
-          class="rounded-lg border overflow-hidden transition-colors"
+          class="rounded-xl border overflow-hidden transition-colors"
           :class="statusClasses(item.tool.status)"
         >
           <!-- Tool header (always visible, clickable) -->
@@ -209,7 +246,7 @@ function iconForStatus(status: ToolCall['status']) {
                 }"
               />
               <span class="font-medium truncate flex-1">
-                {{ item.tool.name }}
+                {{ toolDisplayName(item.tool) }}
               </span>
               <span
                 class="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
@@ -267,21 +304,33 @@ function iconForStatus(status: ToolCall['status']) {
             </div>
           </CollapsibleContent>
         </Collapsible>
+
+        <!-- Child agents spawned by this call, rendered as a tree below it -->
+        <div
+          v-if="item.tool.name === 'spawn_subagents' && subagentsForTool(item.tool).length > 0"
+          class="ml-3 mt-1"
+        >
+          <SubagentThoughtsPanel
+            :subagents="subagentsForTool(item.tool)"
+            :phase="subagentPhase || 'completed'"
+          />
+        </div>
+        </div>
       </template>
 
       <!-- Fallback: if no timeline but has old-format thinking -->
-      <div v-if="timeline.length === 0 && hasThinking" class="flex gap-2">
-        <Sparkles class="w-3 h-3 text-primary shrink-0 mt-0.5" />
+      <div v-if="timeline.length === 0 && hasThinking" class="flex gap-2 items-start rounded-xl bg-primary/5 border border-primary/10 px-3 py-2">
+        <Sparkles class="w-3 h-3 text-primary/70 shrink-0 mt-0.5" />
         <div class="th-text-secondary whitespace-pre-wrap leading-relaxed flex-1 min-w-0 break-words">
           {{ message.thinking }}
         </div>
       </div>
 
       <!-- subagent_* 协议已实现：当 spawn_subagents 工具被调用时，网关转发子 agent 事件，以下渲染 -->
-      <!-- Subagent results -->
+      <!-- Subagent results (fallback: no matching spawn_subagents call in the timeline) -->
       <SubagentThoughtsPanel
-        v-if="subagents && subagents.length > 0"
-        :subagents="subagents"
+        v-if="orphanSubagents.length > 0"
+        :subagents="orphanSubagents"
         :phase="subagentPhase || 'completed'"
       />
     </div>

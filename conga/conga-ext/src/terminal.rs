@@ -112,7 +112,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             },
             "required": ["action"]
         }),
-        risk: RiskLevel::Medium,
+        risk: RiskLevel::High,
         execute: Arc::new(|ctx| Box::pin(execute(ctx))),
     });
 }

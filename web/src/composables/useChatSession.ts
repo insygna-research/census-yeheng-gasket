@@ -3,7 +3,7 @@ import { useChatStore, makeId } from '@/stores/chatStore';
 import { useIMWebSocket } from '@/hooks/useIMWebSocket';
 import { useTauriChat } from '@/hooks/useTauriChat';
 import { isTauri } from '@/lib/platform';
-import { backendBaseUrl, fetchSessionMessages, sessionKey } from '@/lib/backend';
+import { backendBaseUrl, fetchSessionMessages } from '@/lib/backend';
 import { parseWsMessage } from '@/types';
 import type { ApprovalRequest, ContextStats, Message, SubagentState, WsMessage } from '@/types';
 import { notifyTurnComplete } from '@/lib/notifications';
@@ -33,7 +33,6 @@ export function useChatSession(chatId: { value: string }) {
   let errorBannerTimer: ReturnType<typeof setTimeout> | null = null;
 
   const contextStats = computed(() => chatStore.activeChat?.contextStats);
-  const watermarkInfo = computed(() => chatStore.activeChat?.watermarkInfo);
 
   const usageColor = computed(() => {
     const pct = contextStats.value?.usage_percent || 0;
@@ -66,6 +65,7 @@ export function useChatSession(chatId: { value: string }) {
       index: msg.index,
       task: msg.task,
       status: 'running',
+      timeline: [],
       toolCalls: [],
       toolCount: 0,
       startTime: Date.now(),
@@ -74,17 +74,23 @@ export function useChatSession(chatId: { value: string }) {
       subagentPhase.value = 'running';
     }
 
-    // Client-side timeout: if backend never sends completed/error, force-finish the task
+    // Client-side timeout: if backend never sends completed/error, force-finish the task.
+    // Re-lookup by ids inside the callback — never capture the Message object:
+    // the timer fires minutes later, and correctness must not depend on the
+    // store mutating that exact object in place.
+    const chatIdNow = chatId.value;
+    const botIdNow = botMsg.id;
     if (subagentTimers.value[msg.id]) clearTimeout(subagentTimers.value[msg.id]);
     subagentTimers.value[msg.id] = setTimeout(() => {
-      const s = getBotSubagent(botMsg, msg.id);
+      const bot = chatStore.getChat(chatIdNow)?.messages.find(m => m.id === botIdNow);
+      const s = bot?.subagents?.find(sa => sa.id === msg.id);
       if (s && s.status === 'running') {
-        chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
+        chatStore.updateSubagent(chatIdNow, botIdNow, msg.id, {
           status: 'error',
           error: 'Timed out',
           endTime: Date.now(),
         });
-        checkAndFinalizeSubagents(botMsg);
+        if (bot) checkAndFinalizeSubagents(bot);
       }
       delete subagentTimers.value[msg.id];
     }, SUBAGENT_TIMEOUT_MS);
@@ -93,7 +99,17 @@ export function useChatSession(chatId: { value: string }) {
   const handleSubagentThinking = (msg: Extract<WsMessage, { type: 'subagent_thinking' }>, botMsg: Message) => {
     const s = getBotSubagent(botMsg, msg.id);
     if (s) {
-      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { thinking: (s.thinking || '') + msg.content });
+      // Consecutive thinking chunks merge into the current block; a tool
+      // call in between starts a new block, so the timeline preserves the
+      // real arrival order (think → tool → think → tool …).
+      const timeline = [...s.timeline];
+      const last = timeline[timeline.length - 1];
+      if (last && last.kind === 'thinking') {
+        timeline[timeline.length - 1] = { ...last, text: last.text + msg.content };
+      } else {
+        timeline.push({ kind: 'thinking', text: msg.content });
+      }
+      chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, { timeline });
     }
   };
 
@@ -118,6 +134,7 @@ export function useChatSession(chatId: { value: string }) {
       chatStore.updateSubagent(chatId.value, botMsg.id, msg.id, {
         toolCalls: [...s.toolCalls, toolCall],
         toolCount: s.toolCount + 1,
+        timeline: [...s.timeline, { kind: 'tool', toolId: toolCall.id }],
       });
     }
   };
@@ -258,10 +275,14 @@ export function useChatSession(chatId: { value: string }) {
           });
         }
         fetchContext();
-        notifyTurnComplete(
-          chatStore.getChat(chatId.value)?.name || 'Conga',
-          botMsg.content
-        );
+        // Notify only for replies with actual content — a slash-command
+        // echo ("(session cleared)") is not worth a system notification.
+        if (botMsg.content.trim()) {
+          notifyTurnComplete(
+            chatStore.getChat(chatId.value)?.name || 'Conga',
+            botMsg.content
+          );
+        }
         break;
       case 'busy':
         // 发送时回合已在进行（竞态/打断）：只提示，不动会话状态——
@@ -368,21 +389,18 @@ export function useChatSession(chatId: { value: string }) {
     try {
       if (isTauri) {
         // Tauri: invoke the in-process get_context command (mirrors the
-        // gateway's GET /api/sessions/:id/context). Returns the same
-        // { context_stats, watermark_info } JSON shape.
-        const data = await invoke<{ context_stats?: ContextStats; watermark_info?: unknown }>('get_context', { sessionId: chatId.value });
+        // gateway's GET /api/sessions/:id/context). Same
+        // { context_stats } JSON shape.
+        const data = await invoke<{ context_stats?: ContextStats }>('get_context', { sessionId: chatId.value });
         if (data?.context_stats) {
           chatStore.setContextStats(chatId.value, data.context_stats);
         }
         return;
       }
-      const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context`);
+      const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId.value)}/context`);
       const data = await res.json();
       if (res.ok && data.context_stats) {
         chatStore.setContextStats(chatId.value, data.context_stats);
-      }
-      if (res.ok && data.watermark_info) {
-        chatStore.setWatermarkInfo(chatId.value, data.watermark_info);
       }
     } catch (e) {
       console.error('Fetch context failed:', e);
@@ -430,13 +448,10 @@ export function useChatSession(chatId: { value: string }) {
         await fetchContext();
         return;
       }
-      const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId.value)}/context/compact`, { method: 'POST' });
+      const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId.value)}/context/compact`, { method: 'POST' });
       const data = await res.json();
       if (res.ok && data.context_stats) {
         chatStore.setContextStats(chatId.value, data.context_stats);
-      }
-      if (res.ok && data.watermark_info) {
-        chatStore.setWatermarkInfo(chatId.value, data.watermark_info);
       }
     } catch (e) {
       console.error('Force compact failed:', e);
@@ -496,21 +511,22 @@ export function useChatSession(chatId: { value: string }) {
     currentBotMessageId.value = null;
 
     isSending.value = true;
-    try {
-      const payload = JSON.stringify({
-        type: 'message',
-        content: text,
-        trace_id: makeId('trace'),
-      });
-      send(payload);
+    const payload = JSON.stringify({
+      type: 'message',
+      content: text,
+      trace_id: makeId('trace'),
+    });
+    // `send` reports failure by return value (both transports), never by
+    // throwing — drive the message status from it.
+    if (send(payload)) {
       chatStore.updateMessageStatus(chatId.value, msgId, 'sent');
       // Refresh context after sending since backend may have updated token usage
       fetchContext();
       return true;
-    } catch (e) {
-      chatStore.updateMessageStatus(chatId.value, msgId, 'error');
-      return false;
     }
+    isSending.value = false;
+    chatStore.updateMessageStatus(chatId.value, msgId, 'error');
+    return false;
   };
 
   const retryMessage = (msgId: string, content: string) => {
@@ -518,15 +534,14 @@ export function useChatSession(chatId: { value: string }) {
     chatStore.updateMessageStatus(chatId.value, msgId, 'sending');
     // Retried turn gets its own bot message; do not append to a stale one.
     currentBotMessageId.value = null;
-    try {
-      const payload = JSON.stringify({
-        type: 'message',
-        content,
-        trace_id: makeId('trace'),
-      });
-      send(payload);
+    const payload = JSON.stringify({
+      type: 'message',
+      content,
+      trace_id: makeId('trace'),
+    });
+    if (send(payload)) {
       chatStore.updateMessageStatus(chatId.value, msgId, 'sent');
-    } catch (e) {
+    } else {
       chatStore.updateMessageStatus(chatId.value, msgId, 'error');
     }
   };
@@ -542,7 +557,6 @@ export function useChatSession(chatId: { value: string }) {
     showReconnectButton,
     // Context
     contextStats,
-    watermarkInfo,
     usageColor,
     // Subagents
     subagentPhase,

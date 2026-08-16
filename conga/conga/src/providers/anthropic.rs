@@ -1,24 +1,22 @@
 //! Anthropic native messages API provider.
 //!
-//! Uses the same SSE transport as
-//! [`crate::providers::openai_compat`] but a different body/event shape:
-//! `system` is a top-level field, tools use `input_schema`, and stream deltas
-//! arrive as `content_block_delta` events with `text_delta` / `input_json_delta`.
+//! Uses the same SSE download transport as
+//! [`crate::providers::openai_compat`] (see [`crate::providers::sse::download_sse`]);
+//! only the body shape and chunk parsing differ: `system` is a top-level
+//! field, tools use `input_schema`, and stream deltas arrive as
+//! `content_block_delta` events with `text_delta` / `input_json_delta`.
 
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use serde_json::json;
 
 use super::collect_text;
 use crate::types::context::{ModelSpec, StreamChunk, StreamFn};
 use crate::types::message::{AgentMessage, ContentBlock};
 use crate::types::tool::ToolDefinition;
-
-/// Abort-poll cadence while a provider body download is in flight.
-const ABORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Anthropic native messages provider.
 #[derive(Clone)]
@@ -81,8 +79,6 @@ impl StreamFn for AnthropicProvider {
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let body = build_request_body(model, messages, system_prompt, tools);
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
-        let client = self.client.clone();
-        let api_key = self.api_key.clone();
 
         tracing::debug!(url = %url, model = %model.id, "anthropic request");
         tracing::debug!(
@@ -90,89 +86,19 @@ impl StreamFn for AnthropicProvider {
             "anthropic request body"
         );
 
-        Box::pin(async_stream::stream! {
-            let resp = match client
-                .post(&url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(error = %e, "anthropic request failed");
-                    yield StreamChunk::Error(e.to_string());
-                    return;
-                }
-            };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                tracing::warn!(status = %status, "anthropic non-2xx response");
-                yield StreamChunk::Error(format!("HTTP {status}: {text}"));
-                return;
-            }
-
-            // True streaming: parse SSE frames incrementally off the wire as
-            // bytes arrive (first token reaches the user at first-token time,
-            // not whole-response time) and race the download against the
-            // abort signal so Ctrl-C stops it mid-flight.
-            let mut byte_stream = resp.bytes_stream();
-            let mut splitter = crate::providers::sse::SseFrameSplitter::new();
-            let mut frames: Vec<String> = Vec::new();
-            let mut finished = false;
-            while !finished {
-                // Emit eagerly: every frame parsed so far goes out before the
-                // next network read, keeping the pipeline live.
-                for frame in frames.drain(..) {
-                    for payload in crate::providers::sse::parse_sse_frame(&frame) {
-                        match payload {
-                            None => {
-                                yield StreamChunk::Done;
-                                return;
-                            }
-                            Some(json_str) => {
-                                for chunk in parse_anthropic_chunk(&json_str) {
-                                    yield chunk;
-                                }
-                            }
-                        }
-                    }
-                }
-                let chunk = match signal.as_ref() {
-                    Some(flag) => {
-                        // AtomicBool has no async notification; poll at a
-                        // short cadence so a set flag unwinds within ~50ms.
-                        tokio::select! {
-                            biased;
-                            _ = tokio::time::sleep(ABORT_POLL_INTERVAL) => {
-                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                    tracing::debug!("anthropic stream aborted mid-download");
-                                    return;
-                                }
-                                continue;
-                            }
-                            c = byte_stream.next() => c,
-                        }
-                    }
-                    None => byte_stream.next().await,
-                };
-                match chunk {
-                    Some(Ok(bytes)) => frames.extend(splitter.push(&bytes)),
-                    Some(Err(e)) => {
-                        yield StreamChunk::Error(e.to_string());
-                        return;
-                    }
-                    None => {
-                        frames.extend(splitter.finish());
-                        finished = true;
-                    }
-                }
-            }
-            yield StreamChunk::Done;
-        })
+        let api_key = self.api_key.clone();
+        crate::providers::sse::download_sse(
+            "anthropic",
+            self.client.clone(),
+            url,
+            move |req| {
+                req.header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+            },
+            body,
+            signal,
+            parse_anthropic_chunk,
+        )
     }
 }
 

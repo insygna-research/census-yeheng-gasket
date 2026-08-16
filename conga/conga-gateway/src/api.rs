@@ -1,4 +1,7 @@
-//! REST API handlers and helpers (slash commands, context stats, compaction).
+//! REST API handlers. Thin transport over [`conga_host::session_api`] —
+//! validation rules, DTO shapes, and fail-loud policies live in conga-host,
+//! shared with the desktop app's Tauri commands. This file only maps
+//! `SessionApiError` to HTTP statuses and extracts axum inputs.
 
 use std::sync::Arc;
 
@@ -7,31 +10,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::warn;
 
-use conga::ToolDefinition;
+use conga_host::SessionApiError;
 
 use crate::state::AppState;
-
-// ── External tools ─────────────────────────────────────────────
-use conga_host::SessionManager;
-
-pub(crate) async fn load_external_tools() -> Vec<ToolDefinition> {
-    let cmds = conga_host::commands_from_env();
-    if cmds.is_empty() {
-        return Vec::new();
-    }
-    match conga_host::load_external_tools(&cmds).await {
-        Ok(t) => {
-            info!("loaded {} external tool(s)", t.len());
-            t
-        }
-        Err(e) => {
-            warn!("external tools load failed: {e}");
-            Vec::new()
-        }
-    }
-}
 
 // ── REST API ───────────────────────────────────────────────────
 
@@ -53,51 +36,34 @@ pub(crate) async fn get_commands() -> Json<Value> {
     ]))
 }
 
-/// The frontend keys sessions as `websocket:{id}` while the WS connection
-/// registers under bare `{id}` - strip the prefix before looking up.
-pub(crate) fn session_key(key: &str) -> &str {
-    key.strip_prefix("websocket:").unwrap_or(key)
+/// Map a session-API failure to its HTTP status + error body.
+fn err_response(e: &SessionApiError) -> Response {
+    let status = match e {
+        SessionApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        SessionApiError::NotFound(_) => StatusCode::NOT_FOUND,
+        SessionApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({ "error": e.to_string() }))).into_response()
 }
 
-/// Context occupancy for the frontend. `last_input_tokens` is the current
-/// window occupancy (most recent provider-reported input-token count) and
-/// drives the saturation percentage against `CONGA_CONTEXT_WINDOW` (default
-/// 128k). `cumulative_in`/`cumulative_out` are the real accumulated API spend
-/// across the session. The percentage is a display heuristic; the token counts
-/// themselves are real API usage.
-pub(crate) fn context_stats(last_input_tokens: u64, usage_in: u64, usage_out: u64) -> Value {
-    let window = std::env::var("CONGA_CONTEXT_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(128_000);
-    let usage_percent = if window > 0 {
-        (last_input_tokens as f64 / window as f64) * 100.0
-    } else {
-        0.0
-    };
-    json!({
-        "current_tokens": last_input_tokens,
-        "usage_percent": usage_percent,
-        "is_compressing": false,
-        "cumulative_in": usage_in,
-        "cumulative_out": usage_out,
-    })
+/// Context occupancy for the frontend (see `conga_host::wire::context_stats`
+/// for the shape). Reads the live connection's counters when present.
+async fn stats_of(state: &AppState, key: &str) -> Value {
+    match state.sessions.get(key) {
+        Some(s) => {
+            let s = s.lock().await;
+            conga_host::wire::context_stats(s.last_input_tokens, s.usage_in, s.usage_out)
+        }
+        None => conga_host::wire::context_stats(0, 0, 0),
+    }
 }
 
 pub(crate) async fn get_context(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<Value> {
-    let stats = match state.sessions.get(session_key(&key)) {
-        Some(s) => {
-            let s = s.lock().await;
-            context_stats(s.last_input_tokens, s.usage_in, s.usage_out)
-        }
-        None => context_stats(0, 0, 0),
-    };
-    // No watermark/compaction mechanism exists in this architecture - null so
-    // the frontend hides the watermark chip instead of rendering undefined.
-    Json(json!({ "context_stats": stats, "watermark_info": null }))
+    let stats = stats_of(&state, &key).await;
+    Json(json!({ "context_stats": stats }))
 }
 
 /// Compaction is now internal to `run_turn`: every turn the host re-derives
@@ -108,66 +74,37 @@ pub(crate) async fn compact_context(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<Value> {
-    let stats = match state.sessions.get(session_key(&key)) {
-        Some(s) => {
-            let s = s.lock().await;
-            context_stats(s.last_input_tokens, s.usage_in, s.usage_out)
-        }
-        None => context_stats(0, 0, 0),
-    };
-    Json(json!({ "context_stats": stats, "watermark_info": null }))
+    let stats = stats_of(&state, &key).await;
+    Json(json!({ "context_stats": stats }))
 }
 
-/// Backend-truth transcript for a session (D3): `derive_messages` over the
-/// on-disk event log, migrating a legacy `messages.jsonl` once. Reads disk,
-/// not the live connection, so it also serves sessions created by the CLI
-/// or other devices. Unknown key → 404; a corrupt log → 500 (fail loud,
+/// Backend-truth transcript for a session: `derive_messages` over the
+/// on-disk event log. Unknown key → 404; a corrupt log → 500 (fail loud,
 /// never silently adopt).
 pub(crate) async fn get_messages(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Response {
-    let key = session_key(&key);
-    let storage = conga::EventStorage::new(state.store_root.clone());
-    if !storage.has_events(key) && !storage.messages_path(key).exists() {
-        return (
+    match conga_host::session_messages(&state.store_root, &key).await {
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown session: {key}") })),
         )
-            .into_response();
-    }
-    let mgr = SessionManager::with_root(state.store_root.clone());
-    match mgr.open_or_migrate(key).await {
-        Ok(events) => Json(conga::derive_messages(&events)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
             .into_response(),
+        Ok(Some(messages)) => Json(messages).into_response(),
+        Err(e) => {
+            warn!("get_messages {key}: {e}");
+            err_response(&e)
+        }
     }
 }
 
-/// List all sessions on disk (id, msg_count, mtime, name). Does NOT depend on
-/// active WS connections — reads the JSONL store directly. Used by the
+/// List all sessions on disk (id, msg_count, mtime, name). Does NOT depend
+/// on active WS connections — reads the JSONL store directly. Used by the
 /// frontend to discover sessions created by the CLI or other devices.
 pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let mgr = SessionManager::with_root(state.store_root.clone());
-    match mgr.list().await {
-        Ok(mut sessions) => {
-            // Newest first.
-            sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
-            Json(json!({
-                "sessions": sessions.iter().map(|s| json!({
-                    "id": s.id,
-                    "msg_count": s.msg_count,
-                    "name": s.name,
-                    "mtime": s.mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                })).collect::<Vec<_>>()
-            }))
-        }
+    match conga_host::list_sessions(&state.store_root).await {
+        Ok(sessions) => Json(json!({ "sessions": sessions })),
         Err(e) => {
             warn!("list_sessions error: {e}");
             Json(json!({ "sessions": [], "error": e.to_string() }))
@@ -181,108 +118,45 @@ pub(crate) struct SearchParams {
     limit: Option<usize>,
 }
 
-/// Full-text search across all sessions' event logs. The first request per
-/// process builds/updates the FTS5 sidecar index (reindex-on-demand, then
-/// latched); a store/index failure is a 500 (fail loud, same policy as
-/// `get_messages`). No hits is a legitimate empty list — not a 404.
-/// The engine itself lives in `conga_host::session_index` (feature
-/// `session-index`); the gateway is only transport.
+/// Full-text search across all sessions' event logs. The engine (and the
+/// incremental reindex check) lives in `conga_host::session_api` /
+/// `conga_host::session_index`; the gateway is only transport. No hits is a
+/// legitimate empty list — not a 404.
 pub(crate) async fn search_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<SearchParams>,
 ) -> Response {
-    let q = params.q.trim().to_string();
-    if q.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "q must be non-empty" })),
-        )
-            .into_response();
-    }
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let root = state.store_root.clone();
     let db = state.index_db.clone();
-    let init = state
-        .search_ready
-        .get_or_init(|| async {
-            tokio::task::spawn_blocking(move || conga_host::session_index::reindex(&root, &db))
-                .await
-                .map_err(|e| anyhow::anyhow!("engine task join failed: {e}"))?
-                .map(|_| ())
-        })
-        .await;
-    if let Err(e) = init {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("index build failed: {e}") })),
-        )
-            .into_response();
-    }
-    let root = state.store_root.clone();
-    let db = state.index_db.clone();
-    let hits = match tokio::task::spawn_blocking(move || {
-        conga_host::session_index::search(&root, &db, &q, limit)
+    let q = params.q;
+    match tokio::task::spawn_blocking(move || {
+        conga_host::session_api::search_sessions(&root, &db, &q, limit)
     })
     .await
     {
-        Ok(Ok(hits)) => hits,
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("engine task join failed: {e}") })),
-            )
-                .into_response();
-        }
-    };
-    Json(json!({ "hits": hits })).into_response()
+        Ok(Ok(hits)) => Json(json!({ "hits": hits })).into_response(),
+        Ok(Err(e)) => err_response(&e),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("engine task join failed: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// Rename a session: persist the display name in the session's `meta.json`
-/// sidecar. Creates the session directory if needed, so a chat can be named
-/// before its first turn lands on disk. 400 on an unsafe id or bad name.
+/// sidecar. Validation (id whitelist, name 1..=200 chars) is shared with
+/// the desktop app in `conga_host::session_api`.
 pub(crate) async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let key = session_key(&key);
-    if !conga::is_valid_session_id(key) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid session id" })),
-        )
-            .into_response();
-    }
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if name.is_empty() || name.chars().count() > 200 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "name must be 1..=200 chars" })),
-        )
-            .into_response();
-    }
-    let storage = conga::EventStorage::new(state.store_root.clone());
-    let meta = conga::SessionMeta {
-        name: Some(name.to_string()),
-    };
-    match storage.write_meta(key, &meta).await {
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    match conga_host::rename_session(&state.store_root, &key, name).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => err_response(&e),
     }
 }
 
@@ -293,34 +167,21 @@ pub(crate) async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Response {
-    let key = session_key(&key);
-    if !conga::is_valid_session_id(key) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid session id" })),
-        )
-            .into_response();
-    }
-    if state.sessions.contains_key(key) {
+    if state.sessions.contains_key(&key) {
         return (
             StatusCode::CONFLICT,
             Json(json!({ "error": "session has an active connection" })),
         )
             .into_response();
     }
-    let storage = conga::EventStorage::new(state.store_root.clone());
-    match storage.remove_session(key).await {
+    match conga_host::delete_session(&state.store_root, &key).await {
         Ok(true) => Json(json!({ "ok": true })).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown session: {key}") })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => err_response(&e),
     }
 }
 
@@ -331,8 +192,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::{delete, get, put};
     use axum::Router;
-    use conga::types::message::{ContentBlock, UserMessage};
     use conga::{AgentMessage, EventStorage, SessionEvent};
+    use conga::types::message::{ContentBlock, UserMessage};
     use dashmap::DashMap;
     use tower::util::ServiceExt;
 
@@ -348,7 +209,6 @@ mod tests {
             sessions: DashMap::new(),
             store_root: root.clone(),
             index_db: root.join("index.db"),
-            search_ready: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -381,9 +241,8 @@ mod tests {
             .unwrap();
 
         let app = api_router(test_state(tmp.path().to_path_buf()));
-        // Frontend-style prefixed key exercises the prefix stripping.
         let res = app
-            .oneshot(get_uri("/api/sessions/websocket:sess-1/messages"))
+            .oneshot(get_uri("/api/sessions/sess-1/messages"))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);

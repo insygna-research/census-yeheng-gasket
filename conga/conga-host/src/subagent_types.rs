@@ -1,7 +1,8 @@
 //! Subagent orchestration types: event protocol + spawner trait.
 //!
-//! The host injects a `SubagentSpawner` into `ToolContext`. The
-//! `spawn_subagents` tool calls it to fan out parallel sub-agent loops.
+//! The `spawn_subagents` tool captures a `SubagentSpawner` in its execute
+//! closure at construction. It calls the spawner to fan out parallel
+//! sub-agent loops.
 //! Events are emitted as `SubagentEvent`: nine variants map 1:1 to the
 //! frontend's `subagent_*` WS protocol; [`SubagentEvent::Usage`] is internal
 //! accounting (session token counters) with no WS representation.

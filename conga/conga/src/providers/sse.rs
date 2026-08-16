@@ -1,11 +1,125 @@
-//! Server-Sent Events line splitter.
+//! Server-Sent Events transport: incremental frame splitter + the shared
+//! streaming download loop used by every SSE provider.
 //!
 //! Shared by [`crate::providers::openai_compat`] and
 //! [`crate::providers::anthropic`]. Both providers emit `data: {json}\n\n`
-//! frames; this module turns a collected response body into payload strings.
-//!
-//! Handles the SSE spec essentials: `data:` prefix stripping, multi-line
-//! `data:` accumulation, `[DONE]` sentinel, and `event:`/`id:` lines (ignored).
+//! frames; the splitter turns a live byte stream into frames, and
+//! [`download_sse`] owns the whole download loop (true streaming, abort
+//! racing, eager emission) so the two providers only differ in request
+//! body shape and chunk parsing.
+
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{Stream, StreamExt};
+
+use crate::types::context::StreamChunk;
+
+/// Abort-poll cadence while a provider body download is in flight.
+const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The shared SSE download loop for provider requests.
+///
+/// POSTs `body` to `url` (`decorate` adds transport-specific auth headers),
+/// then parses SSE frames incrementally off the wire as bytes arrive (first
+/// token reaches the user at first-token time, not whole-response time)
+/// and races the download against the abort signal so Ctrl-C stops it
+/// mid-flight. Each payload JSON is mapped through `parse_chunk`. `label`
+/// names the provider in errors/logs.
+///
+/// Behavior contract (pinned by the providers' streaming tests):
+/// - non-2xx or send failure → one `Error` chunk;
+/// - `data: [DONE]` → `Done` and end of stream;
+/// - abort while downloading → the stream simply ends (the loop's accumulator
+///   marks the message Aborted).
+pub(crate) fn download_sse<F, P>(
+    label: &'static str,
+    client: reqwest::Client,
+    url: String,
+    decorate: F,
+    body: serde_json::Value,
+    signal: Option<Arc<AtomicBool>>,
+    parse_chunk: P,
+) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>>
+where
+    F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + 'static,
+    P: Fn(&str) -> Vec<StreamChunk> + Send + 'static,
+{
+    Box::pin(async_stream::stream! {
+        let resp = match decorate(client.post(&url).json(&body)).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "{label} request failed");
+                yield StreamChunk::Error(e.to_string());
+                return;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, "{label} non-2xx response");
+            yield StreamChunk::Error(format!("HTTP {status}: {text}"));
+            return;
+        }
+
+        let mut byte_stream = resp.bytes_stream();
+        let mut splitter = SseFrameSplitter::new();
+        let mut frames: Vec<String> = Vec::new();
+        let mut finished = false;
+        while !finished {
+            // Emit eagerly: every frame parsed so far goes out before the
+            // next network read, keeping the pipeline live.
+            for frame in frames.drain(..) {
+                for payload in parse_sse_frame(&frame) {
+                    match payload {
+                        None => {
+                            yield StreamChunk::Done;
+                            return;
+                        }
+                        Some(json_str) => {
+                            for chunk in parse_chunk(&json_str) {
+                                yield chunk;
+                            }
+                        }
+                    }
+                }
+            }
+            let chunk = match signal.as_ref() {
+                Some(flag) => {
+                    // AtomicBool has no async notification; poll at a
+                    // short cadence so a set flag unwinds within ~50ms.
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(ABORT_POLL_INTERVAL) => {
+                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                tracing::debug!("{label} stream aborted mid-download");
+                                return;
+                            }
+                            continue;
+                        }
+                        c = byte_stream.next() => c,
+                    }
+                }
+                None => byte_stream.next().await,
+            };
+            match chunk {
+                Some(Ok(bytes)) => frames.extend(splitter.push(&bytes)),
+                Some(Err(e)) => {
+                    yield StreamChunk::Error(e.to_string());
+                    return;
+                }
+                None => {
+                    frames.extend(splitter.finish());
+                    finished = true;
+                }
+            }
+        }
+        yield StreamChunk::Done;
+    })
+}
 
 /// Parse a complete SSE frame buffer into its `data:` payload lines.
 ///

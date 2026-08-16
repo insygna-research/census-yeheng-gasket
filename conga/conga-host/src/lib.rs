@@ -11,6 +11,7 @@ use conga::{
 };
 
 pub mod approval;
+pub mod assembly;
 pub mod compact;
 pub mod config;
 pub mod event_map;
@@ -23,12 +24,14 @@ pub mod proxy;
 pub mod session;
 #[cfg(feature = "session-index")]
 pub mod session_index;
+pub mod session_api;
 pub mod skills;
 pub mod subagent;
 pub mod subagent_types;
 pub mod tools;
 pub mod wire;
 
+pub use assembly::{resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use conga::RiskLevel;
@@ -39,6 +42,12 @@ pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use session::{SessionInfo, SessionManager};
+pub use session_api::{
+    delete_session, list_sessions, rename_session, session_messages, SessionApiError,
+    SessionListItem,
+};
+#[cfg(feature = "session-index")]
+pub use session_api::search_sessions;
 pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
 pub use subagent_types::{
@@ -99,23 +108,6 @@ pub struct Host {
     /// second concurrent turn is rejected outright instead of interleaving
     /// two event streams into one log.
     turn_in_flight: AtomicBool,
-}
-
-/// Process-wide spawner slot feeding the `spawn_subagents` tool. The core
-/// `ToolContext` no longer carries a spawner (host concern), so the tool
-/// resolves it here at execution time. Registration order is irrelevant:
-/// `Host::with_spawner` may run after `built_in_tools()`.
-static SPAWN_SPAWNER: parking_lot::RwLock<Option<Arc<dyn SubagentSpawner>>> =
-    parking_lot::RwLock::new(None);
-
-/// Install the spawner used by the `spawn_subagents` tool (idempotent overwrite).
-pub fn set_spawn_spawner(spawner: Arc<dyn SubagentSpawner>) {
-    *SPAWN_SPAWNER.write() = Some(spawner);
-}
-
-/// The currently installed spawner, if any.
-pub fn spawn_spawner_slot() -> Option<Arc<dyn SubagentSpawner>> {
-    SPAWN_SPAWNER.read().clone()
 }
 
 impl Host {
@@ -180,11 +172,22 @@ impl Host {
         self
     }
 
-    /// Inject a subagent spawner. Without this, the `spawn_subagents` tool
-    /// returns an "unavailable" error. CLI/gateway pass a `HostSubagentSpawner`
-    /// built from the host's config.
-    pub fn with_spawner(self, spawner: Arc<dyn crate::subagent_types::SubagentSpawner>) -> Self {
-        set_spawn_spawner(spawner);
+    /// Wire a subagent spawner into this host's `spawn_subagents` tool,
+    /// replacing the spawner-less default from [`built_in_tools`]. The
+    /// spawner lives in the tool's execute closure, so it is per-Host:
+    /// concurrent hosts (one per gateway connection) never see each
+    /// other's spawner. Hosts that excluded the tool from their list keep
+    /// it excluded — sub-agent tool sets filter `spawn_subagents` out, so
+    /// nesting stays disabled. Without this, the tool reports subagents as
+    /// unavailable; CLI/gateway pass a `HostSubagentSpawner` built from
+    /// the host's config.
+    pub fn with_spawner(
+        mut self,
+        spawner: Arc<dyn crate::subagent_types::SubagentSpawner>,
+    ) -> Self {
+        if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
+            *t = tools::subagent::tool(Some(spawner));
+        }
         self
     }
 
@@ -195,6 +198,18 @@ impl Host {
 
     pub fn session(&self) -> &SessionManager {
         &self.session
+    }
+
+    /// Clear the conversation — the unified `/clear` semantics for every
+    /// transport (CLI, gateway, desktop): append a `SessionEvent::Cleared`
+    /// fact to the CURRENT session's log. The session id does NOT rotate;
+    /// [`derive_messages`](conga::derive_messages) projects away the
+    /// pre-clear prefix on the next turn, while the log on disk stays
+    /// append-only (the pre-clear rows remain searchable/history). Fail
+    /// loud: when the marker cannot be persisted the caller must tell the
+    /// user the clear did NOT take.
+    pub async fn clear_session(&self) -> Result<(), AgentError> {
+        self.session.mark_cleared().await
     }
 
     pub fn session_mut(&mut self) -> &mut SessionManager {
@@ -244,7 +259,7 @@ impl Host {
         }
         let _turn_guard = TurnGuard(&self.turn_in_flight);
 
-        let sid = self.session.current_id().to_string();
+        let sid = self.session.current_id();
         // Open (migrating a legacy transcript once, if any), fail closed on
         // corruption, then frame the turn.
         let events = self.session.open_or_migrate(&sid).await?;
@@ -258,12 +273,13 @@ impl Host {
             .await?;
 
         // Restore the token budget from the log tail (the last persisted
-        // assistant usage). Compaction itself runs through the loop's
-        // `transform_context` seam — BEFORE EVERY LLM CALL, not once at
-        // turn start — so the wire view stays under budget even as the
-        // accumulator grows mid-turn. The log on disk is never rewritten.
+        // assistant usage) — scoped to the post-clear slice: a cleared
+        // conversation is empty, so a pre-clear usage snapshot would
+        // over-estimate and trigger compaction against history that no
+        // longer exists.
+        let live = conga::live_range_start(&events);
         let mut budget = self.budget.clone();
-        if let Some(input_tokens) = events.iter().rev().find_map(|ev| match ev {
+        if let Some(input_tokens) = events[live..].iter().rev().find_map(|ev| match ev {
             SessionEvent::Assistant { usage, .. } => usage.as_ref().map(|u| u.input_tokens),
             _ => None,
         }) {

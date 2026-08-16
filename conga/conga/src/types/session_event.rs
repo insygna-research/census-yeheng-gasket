@@ -27,6 +27,13 @@ pub enum SessionEvent {
     TurnEnd {
         reason: TurnEndReason,
     },
+    /// The user cleared the conversation. A FACT in the log, not a log
+    /// rotation: [`derive_messages`] projects away everything up to and
+    /// including the LAST `Cleared`, while the rows before it stay on disk
+    /// (append-only is never violated). Keeping the session id stable means
+    /// live connections, REST readers, and the session index all keep
+    /// addressing the same chat — no ghost sessions after `/clear`.
+    Cleared,
 }
 
 /// Why a turn ended.
@@ -63,18 +70,37 @@ impl SessionEvent {
     }
 }
 
-/// Pure projection: event log → model-visible messages. TurnStart/TurnEnd
-/// produce no messages. A torn tail left by a crash is projected as-is (the
-/// partial facts are kept intact).
+/// Pure projection: event log → model-visible messages. TurnStart/TurnEnd/
+/// Cleared produce no messages. Everything up to and including the LAST
+/// `Cleared` is dropped — that is the whole `/clear` semantics (the log
+/// itself is append-only and keeps the pre-clear rows). A torn tail left by
+/// a crash is projected as-is (the partial facts are kept intact).
 pub fn derive_messages(log: &[SessionEvent]) -> Vec<AgentMessage> {
-    log.iter()
+    let live_from = log
+        .iter()
+        .rposition(|ev| matches!(ev, SessionEvent::Cleared))
+        .map_or(0, |i| i + 1);
+    log[live_from..]
+        .iter()
         .filter_map(|ev| match ev {
             SessionEvent::User(msg)
             | SessionEvent::Assistant { message: msg, .. }
             | SessionEvent::ToolResult(msg) => Some(msg.clone()),
-            SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } => None,
+            SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } | SessionEvent::Cleared => {
+                None
+            }
         })
         .collect()
+}
+
+/// Index (0-based) of the first event a cleared log still projects from —
+/// i.e. just past the last [`SessionEvent::Cleared`], or 0 when the log was
+/// never cleared. Hosts use this to scope log-tail scans (e.g. the compaction
+/// budget restore) to the post-clear slice, matching [`derive_messages`].
+pub fn live_range_start(log: &[SessionEvent]) -> usize {
+    log.iter()
+        .rposition(|ev| matches!(ev, SessionEvent::Cleared))
+        .map_or(0, |i| i + 1)
 }
 
 /// Synthesize error `ToolResult`s for tool calls whose turn ended before a
@@ -149,7 +175,7 @@ pub fn repair_unanswered_tool_calls(messages: &mut Vec<AgentMessage>) {
 mod tests {
     use crate::types::message::AgentMessage;
     use crate::types::session_event::{
-        derive_messages, CancelCause, SessionEvent, TurnEndReason, Usage,
+        derive_messages, live_range_start, CancelCause, SessionEvent, TurnEndReason, Usage,
     };
 
     #[test]
@@ -183,6 +209,52 @@ mod tests {
             },
         ];
         assert_eq!(derive_messages(&log).len(), 2);
+    }
+
+    #[test]
+    fn derive_truncates_at_cleared() {
+        // /clear: everything up to and INCLUDING the marker is gone from the
+        // model's view; rows after it live on.
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("old question")),
+            SessionEvent::Assistant {
+                message: AgentMessage::assistant_text("old answer"),
+                usage: None,
+            },
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("fresh start")),
+        ];
+        let msgs = derive_messages(&log);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], AgentMessage::User(u)
+            if matches!(&u.content[0], crate::ContentBlock::Text { text } if text == "fresh start")));
+    }
+
+    #[test]
+    fn derive_last_cleared_wins() {
+        // Two clears: only the LAST marker matters.
+        let log = vec![
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("between clears")),
+            SessionEvent::Cleared,
+        ];
+        assert!(derive_messages(&log).is_empty());
+    }
+
+    #[test]
+    fn derive_cleared_only_log_is_empty() {
+        assert!(derive_messages(&[SessionEvent::Cleared]).is_empty());
+    }
+
+    #[test]
+    fn live_range_start_matches_derive() {
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("a")),
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("b")),
+        ];
+        assert_eq!(live_range_start(&log), 2);
+        assert_eq!(live_range_start(&log[..1]), 0, "never cleared -> 0");
     }
 
     #[test]

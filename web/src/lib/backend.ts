@@ -17,10 +17,6 @@ import type { Message, ToolCall } from '@/types';
 export const backendBaseUrl = (): string =>
   import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
-/** Session keys on the HTTP wire carry a `websocket:` prefix the gateway strips. */
-export const sessionKey = (chatId: string): string =>
-  encodeURIComponent(`websocket:${chatId}`);
-
 export interface BackendSessionInfo {
   id: string;
   msg_count: number;
@@ -46,7 +42,7 @@ export async function renameSession(chatId: string, name: string): Promise<boole
       await invoke('rename_session', { id: chatId, name });
       return true;
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}/name`, {
+    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}/name`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -63,7 +59,7 @@ export async function deleteSession(chatId: string): Promise<boolean> {
     if (isTauri) {
       return await invoke<boolean>('delete_session', { id: chatId });
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}`, {
+    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}`, {
       method: 'DELETE',
     });
     return res.ok;
@@ -169,7 +165,7 @@ export async function fetchSessionMessages(chatId: string): Promise<Message[] | 
       if (!list || list.length === 0) return null;
       return mapBackendMessages(list as Parameters<typeof mapBackendMessages>[0]);
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${sessionKey(chatId)}/messages`);
+    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}/messages`);
     if (!res.ok) return null;
     const list = await res.json();
     if (!Array.isArray(list) || list.length === 0) return null;

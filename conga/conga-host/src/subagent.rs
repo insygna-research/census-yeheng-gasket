@@ -1,8 +1,9 @@
 //! Host-side `SubagentSpawner`: fans out parallel sub-agent loops.
 //!
-//! Each sub-agent runs its own `run_agent_loop` with the same built-in tool
-//! set, stream_fn, and policy hooks as the parent (minus `spawn_subagents`
-//! itself — sub-agent contexts carry no spawner, so nesting is disabled).
+//! Each sub-agent runs its own `run_agent_loop` with the tool set,
+//! stream_fn, and policy hooks passed at construction. Hosts pass the
+//! built-ins minus `spawn_subagents` (nesting is disabled: the filtered
+//! set simply has no spawning tool).
 //! Events are mapped from `AgentEvent` to `SubagentEvent` and emitted through
 //! the constructor-injected forwarder (`with_ws_emit`). Results are collected
 //! after all sub-agents finish.

@@ -8,8 +8,6 @@ use dashmap::DashMap;
 use futures_util::stream::SplitSink;
 use tokio::sync::Mutex;
 
-use conga_host::approval::ApprovalRegistry;
-
 pub(crate) struct AppState {
     pub(crate) sessions: DashMap<String, Arc<Mutex<WsSession>>>,
     /// Root of the on-disk session store (`~/.conga/sessions`). REST
@@ -17,17 +15,16 @@ pub(crate) struct AppState {
     /// build their `SessionManager` from this root; tests inject a tempdir.
     pub(crate) store_root: PathBuf,
     /// FTS5 sidecar index (production: `~/.conga/index.db`; tests inject
-    /// a tempdir path).
+    /// a tempdir path). Reindex is an incremental high-water check run per
+    /// search request (see `conga_host::session_api::search_sessions`).
     pub(crate) index_db: PathBuf,
-    /// Reindex-on-demand latch: the first search request per process (per
-    /// state, in tests) populates the index; later requests reuse it.
-    pub(crate) search_ready: tokio::sync::OnceCell<anyhow::Result<()>>,
 }
 
 /// Per-connection state. The transcript itself is NOT kept here - the
 /// on-disk event log is the single source of truth and history is derived
 /// from it (`derive_messages`) wherever needed. Only connection-scoped
-/// stats and the approval registry live in memory.
+/// stats live in memory; approvals live in the session's
+/// `SessionAssembly::registry` (see ws.rs).
 pub(crate) struct WsSession {
     pub(crate) sender: SplitSink<WebSocket, Message>,
     /// Provider-reported token usage accumulated across turns (fed by
@@ -41,5 +38,4 @@ pub(crate) struct WsSession {
     /// Set by the main loop just before `run_turn`, read by the forwarder
     /// when it serializes the `done` event.
     pub(crate) turn_start: Option<std::time::Instant>,
-    pub(crate) registry: ApprovalRegistry,
 }

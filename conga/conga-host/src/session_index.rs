@@ -76,7 +76,9 @@ fn event_rows(events: &[SessionEvent]) -> Vec<Row> {
                 SessionEvent::User(m) => ("user", m),
                 SessionEvent::Assistant { message: m, .. } => ("assistant", m),
                 SessionEvent::ToolResult(m) => ("tool_result", m),
-                SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } => return None,
+                SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } | SessionEvent::Cleared => {
+                    return None
+                }
             };
             let content = match msg {
                 AgentMessage::User(u) => block_text(&u.content),
