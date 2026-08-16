@@ -716,7 +716,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            cancelled_signal() // pre-set: loop aborts before any provider call
+            cancelled_signal(), // pre-set: loop aborts before any provider call
         );
 
         let results = spawner

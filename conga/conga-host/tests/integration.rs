@@ -608,9 +608,15 @@ async fn clear_session_marks_log_and_next_turn_starts_empty() {
     let sid = session.current_id().to_string();
     let fake = FakeStream::new(vec![
         // Turn 1: a plain text answer.
-        vec![StreamChunk::TextDelta("old answer".into()), StreamChunk::Done],
+        vec![
+            StreamChunk::TextDelta("old answer".into()),
+            StreamChunk::Done,
+        ],
         // Turn 2 (post-clear): a fresh answer.
-        vec![StreamChunk::TextDelta("fresh answer".into()), StreamChunk::Done],
+        vec![
+            StreamChunk::TextDelta("fresh answer".into()),
+            StreamChunk::Done,
+        ],
     ]);
     let host = Host::new(
         test_cfg(true),
@@ -652,7 +658,9 @@ async fn clear_session_marks_log_and_next_turn_starts_empty() {
     assert!(texts.contains(&"fresh question".to_string()), "{texts:?}");
     assert!(texts.contains(&"fresh answer".to_string()), "{texts:?}");
     assert!(
-        !texts.iter().any(|t| t == "old question" || t == "old answer"),
+        !texts
+            .iter()
+            .any(|t| t == "old question" || t == "old answer"),
         "pre-clear content must not leak into the derived view: {texts:?}"
     );
 

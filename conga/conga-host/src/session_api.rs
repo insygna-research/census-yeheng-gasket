@@ -118,10 +118,7 @@ pub async fn rename_session(
 /// per-tool state). `Ok(false)` = never existed (`NotFound` is the caller's
 /// choice of framing; this returns the fact). Transports that track live
 /// connections refuse the delete themselves BEFORE calling this.
-pub async fn delete_session(
-    store_root: &Path,
-    session_id: &str,
-) -> Result<bool, SessionApiError> {
+pub async fn delete_session(store_root: &Path, session_id: &str) -> Result<bool, SessionApiError> {
     if !conga::is_valid_session_id(session_id) {
         return Err(SessionApiError::BadRequest("invalid session id".into()));
     }
@@ -168,17 +165,18 @@ mod tests {
     #[tokio::test]
     async fn messages_none_for_unknown_session_some_after_write() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(
-            session_messages(tmp.path(), "ghost")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(session_messages(tmp.path(), "ghost")
+            .await
+            .unwrap()
+            .is_none());
         EventStorage::new(tmp.path().to_path_buf())
             .append_event("sess-1", &user_event("hello"))
             .await
             .unwrap();
-        let msgs = session_messages(tmp.path(), "sess-1").await.unwrap().unwrap();
+        let msgs = session_messages(tmp.path(), "sess-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(msgs.len(), 1);
     }
 

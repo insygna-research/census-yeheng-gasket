@@ -73,9 +73,7 @@ impl SessionManager {
         Self {
             root: root.clone(),
             storage: EventStorage::new(root),
-            current_id: Arc::new(parking_lot::Mutex::new(
-                uuid::Uuid::new_v4().to_string(),
-            )),
+            current_id: Arc::new(parking_lot::Mutex::new(uuid::Uuid::new_v4().to_string())),
         }
     }
 
@@ -385,7 +383,13 @@ mod tests {
                 if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "before clear")))));
 
         // list() mirrors derive: 1 model-visible message after the clear.
-        let info = sm2.list().await.unwrap().into_iter().find(|i| i.id == id).unwrap();
+        let info = sm2
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
         assert_eq!(info.msg_count, 1);
     }
 

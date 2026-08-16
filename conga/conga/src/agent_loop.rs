@@ -132,10 +132,7 @@ pub async fn agent_loop(
 }
 
 fn is_aborted(config: &AgentLoopConfig) -> bool {
-    config
-        .signal
-        .as_ref()
-        .is_some_and(|s| s.is_cancelled())
+    config.signal.as_ref().is_some_and(|s| s.is_cancelled())
 }
 
 /// Hand one [`SessionEvent`] to the loop's `persist` callback (if installed).
@@ -370,10 +367,7 @@ where
     let mut futures = Vec::new();
     for slot in &slots {
         if let Slot::Ready {
-            tc,
-            execute,
-            args,
-            ..
+            tc, execute, args, ..
         } = slot
         {
             emit(AgentEvent::ToolExecutionStart {
@@ -385,11 +379,7 @@ where
             futures.push((execute.clone())(ToolCallCtx {
                 tool_call_id: tc.id.clone(),
                 args: args.clone(),
-                signal: config
-                    .signal
-                    .as_ref()
-                    .map(|s| s.flag())
-                    .unwrap_or_default(),
+                signal: config.signal.as_ref().map(|s| s.flag()).unwrap_or_default(),
                 ctx: ToolContext {
                     cwd: context.cwd.clone(),
                     env: context.env.clone(),
@@ -409,11 +399,7 @@ where
             Slot::Failed(result) => {
                 record_tool_result(config, emit, &mut results, result, true)?;
             }
-            Slot::Ready {
-                tc,
-                args_key,
-                ..
-            } => {
+            Slot::Ready { tc, args_key, .. } => {
                 // A tool-internal error becomes an error tool_result fed
                 // back to the LLM; the run continues instead of aborting.
                 let raw = match cursor.next().expect("join_all result per Ready slot") {
@@ -1676,11 +1662,7 @@ mod tests {
         };
         // first is slowest on purpose: a serial recorder would see it finish
         // last if it recorded at completion time instead of by slot order.
-        let tools = vec![
-            slow("first", 150),
-            slow("second", 90),
-            slow("third", 60),
-        ];
+        let tools = vec![slow("first", 150), slow("second", 90), slow("third", 60)];
 
         let mut config = test_config(vec![
             StreamChunk::ToolCallDelta {

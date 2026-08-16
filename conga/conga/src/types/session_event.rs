@@ -86,9 +86,7 @@ pub fn derive_messages(log: &[SessionEvent]) -> Vec<AgentMessage> {
             SessionEvent::User(msg)
             | SessionEvent::Assistant { message: msg, .. }
             | SessionEvent::ToolResult(msg) => Some(msg.clone()),
-            SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } | SessionEvent::Cleared => {
-                None
-            }
+            SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } | SessionEvent::Cleared => None,
         })
         .collect()
 }

@@ -192,8 +192,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::{delete, get, put};
     use axum::Router;
-    use conga::{AgentMessage, EventStorage, SessionEvent};
     use conga::types::message::{ContentBlock, UserMessage};
+    use conga::{AgentMessage, EventStorage, SessionEvent};
     use dashmap::DashMap;
     use tower::util::ServiceExt;
 

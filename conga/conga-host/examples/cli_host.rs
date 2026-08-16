@@ -14,7 +14,6 @@
 //!
 //! Without CONGA_LLM_KEY this prints a canned reply (smoke test of plumbing).
 
-
 use std::sync::Arc;
 
 use conga::{

@@ -20,7 +20,7 @@ use crate::approval::{self, ApprovalRegistry, RegisterOutcome};
 use crate::permission::{Approver, Mode, PermissionPolicy};
 use crate::subagent::HostSubagentSpawner;
 use crate::subagent_types::SubagentEvent;
-use crate::{ConfigLoader, Host, HostConfig, HookStack, SessionManager};
+use crate::{ConfigLoader, HookStack, Host, HostConfig, SessionManager};
 
 /// A session-API failure for transport mapping: `Config` (provider/env
 /// setup broken — the user must fix `~/.conga` or env) vs `Session` (this

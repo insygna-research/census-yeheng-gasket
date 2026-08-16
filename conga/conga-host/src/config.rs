@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use conga::{
-    AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, CancelSignal, HookChain,
-    ProviderConfig, SessionEvent, StreamFn, ToolDefinition,
+    AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, CancelSignal,
+    HookChain, ProviderConfig, SessionEvent, StreamFn, ToolDefinition,
 };
 
 #[derive(Debug, Clone)]

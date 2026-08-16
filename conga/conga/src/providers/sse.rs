@@ -210,8 +210,8 @@ impl SseFrameSplitter {
         self.buf.extend_from_slice(bytes);
         let mut frames = Vec::new();
         while let Some((start, end)) = find_separator(&self.buf[self.read_pos..]) {
-            let frame =
-                String::from_utf8_lossy(&self.buf[self.read_pos..self.read_pos + start]).into_owned();
+            let frame = String::from_utf8_lossy(&self.buf[self.read_pos..self.read_pos + start])
+                .into_owned();
             self.read_pos += end; // skip past the separator
             frames.push(frame);
         }
@@ -363,8 +363,11 @@ mod tests {
         for _ in 0..20_000 {
             let frames = s.push(frame.as_bytes());
             assert_eq!(frames.len(), 1);
-            assert!(s.buf.len() < frame.len() + COMPACT_THRESHOLD,
-                "buffer grew to {} bytes", s.buf.len());
+            assert!(
+                s.buf.len() < frame.len() + COMPACT_THRESHOLD,
+                "buffer grew to {} bytes",
+                s.buf.len()
+            );
         }
         assert!(s.finish().is_empty());
     }
@@ -399,10 +402,7 @@ mod tests {
             assert_eq!(frames, vec![format!("data: {i}")]);
         }
         // Trailing un-terminated frame still flushes at finish().
-        assert_eq!(
-            s.push(b"data: tail"),
-            Vec::<String>::new()
-        );
+        assert_eq!(s.push(b"data: tail"), Vec::<String>::new());
         assert_eq!(s.finish(), vec!["data: tail".to_string()]);
     }
 
@@ -441,9 +441,7 @@ mod tests {
         // Park on the stalled download, then cancel: the stream must end
         // within milliseconds (watch-backed) rather than hang or poll.
         let started = std::time::Instant::now();
-        let drain = tokio::spawn(async move {
-            while stream.next().await.is_some() {}
-        });
+        let drain = tokio::spawn(async move { while stream.next().await.is_some() {} });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         signal.cancel();
         drain.await.unwrap();

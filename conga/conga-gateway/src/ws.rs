@@ -196,27 +196,26 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
             let _ = wire.send(WireEvent::Subagent(ev));
         })
     };
-    let assembly =
-        match conga_host::SessionAssembly::build(
-            &state.store_root,
-            &session_id,
-            Vec::new(),
-            approval_emit,
-            subagent_emit,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                error!("session {session_id}: {e}");
-                let err = OutgoingEvent::error(e.to_string());
-                let mut s = session.lock().await;
-                send_json(&mut s.sender, &err).await;
-                let _ = s.sender.send(Message::Close(None)).await;
-                state.sessions.remove(&session_id);
-                return;
-            }
-        };
+    let assembly = match conga_host::SessionAssembly::build(
+        &state.store_root,
+        &session_id,
+        Vec::new(),
+        approval_emit,
+        subagent_emit,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            error!("session {session_id}: {e}");
+            let err = OutgoingEvent::error(e.to_string());
+            let mut s = session.lock().await;
+            send_json(&mut s.sender, &err).await;
+            let _ = s.sender.send(Message::Close(None)).await;
+            state.sessions.remove(&session_id);
+            return;
+        }
+    };
     let conga_host::SessionAssembly {
         host,
         registry,
@@ -281,13 +280,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                     s.usage_in = 0;
                                     s.usage_out = 0;
                                     s.last_input_tokens = 0;
-                                    Some(OutgoingEvent::content(
-                                        "(session cleared)".to_string(),
-                                    ))
+                                    Some(OutgoingEvent::content("(session cleared)".to_string()))
                                 }
-                                Err(e) => {
-                                    Some(OutgoingEvent::error(format!("clear failed: {e}")))
-                                }
+                                Err(e) => Some(OutgoingEvent::error(format!("clear failed: {e}"))),
                             }
                         }
                         Some("help") => Some(OutgoingEvent::content(

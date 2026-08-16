@@ -22,9 +22,9 @@ pub mod permission;
 pub mod printer;
 pub mod proxy;
 pub mod session;
+pub mod session_api;
 #[cfg(feature = "session-index")]
 pub mod session_index;
-pub mod session_api;
 pub mod skills;
 pub mod subagent;
 pub mod subagent_types;
@@ -42,12 +42,12 @@ pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use session::{SessionInfo, SessionManager};
+#[cfg(feature = "session-index")]
+pub use session_api::search_sessions;
 pub use session_api::{
     delete_session, list_sessions, rename_session, session_messages, SessionApiError,
     SessionListItem,
 };
-#[cfg(feature = "session-index")]
-pub use session_api::search_sessions;
 pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
 pub use subagent_types::{
