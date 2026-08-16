@@ -207,6 +207,20 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 > （既有定义，informational，park）；plugin-tutorial.md 未提 feature（转最终
 > review/文档任务）。~20 行 mock 工具示例一项并入 T7 示例集执行。
 
+> **追加裁决（2026-08-16，用户指令，覆盖 T4 留守结论与 T6 的 feature 方案；commits c49cf7a + 2bf78f5）**：
+> 用户拍板将 `tools/`、`proxy.rs`、`subagent.rs`（trait）**全部移入 conga-host**。执行事实：
+> - core = `agent_loop + types + providers + storage + extension + guard + error`，
+>   **无 feature、无 tools 依赖**（`built-in-tools` feature 与 5 个 optional 依赖消亡，
+>   T6 的 feature 方案被本裁决取代）；
+> - `AgentContext.spawner` / `ToolContext.spawner` 字段删除（core 不再知道 spawner）；
+> - `spawn_subagents` 工具经 host 进程级槽（`set_spawn_spawner`/`with_spawner`）解析，
+>   未注入时 Noop 兜底——行为与迁移前一致（`no_spawner_reports_unavailable` 回归锁定；
+>   槽测试以互斥锁串行防交叉污染）；
+> - 结构代价（已接受并落地）：conga-ext 新增 conga-host 依赖（ext 不再是 core 叶子）；
+>   core 的 examples/tests（plugins/cli_host/plugins_example/external_echo）迁至 host；
+> - 验证：workspace 318 tests 全绿（core 单独 103）；core `--no-default-features`
+>   依赖树零污染；fmt/clippy `-D warnings` 绿；src-tauri check 绿。
+
 ### T7 双示例（P3）——发布部分已冻结（D4，2026-08-16）
 
 > **D4 裁决影响**：crates.io 发布、semver、`cargo add` 实测验收**冻结**，解冻由用户定。
