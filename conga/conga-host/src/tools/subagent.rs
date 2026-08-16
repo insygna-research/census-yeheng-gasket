@@ -111,6 +111,10 @@ mod tests {
     use crate::subagent_types::{SubagentResult, SubagentSpawner};
     use conga::types::tool::ToolContext;
 
+    /// Serializes tests that touch the process-wide spawner slot (same
+    /// pattern as proxy's LOCK): parallel installs would cross-contaminate.
+    static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Records how many tasks it received; returns one canned result each.
     struct CountingSpawner(Arc<AtomicUsize>);
 
@@ -137,20 +141,23 @@ mod tests {
             })
         }
     }
-    /// Install a spawner into the process-wide slot and return a guard that
-    /// restores it to `None` on drop, so tests cannot leak into each other.
+    /// Install a spawner into the process-wide slot. The returned guard
+    /// holds BOTH the serializing lock (so parallel tests cannot
+    /// cross-contaminate the slot) and restores the slot to `None` on drop.
     fn with_slot(spawner: Option<Arc<dyn SubagentSpawner>>) -> impl Drop {
-        struct Guard;
+        let _lock = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Guard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
         impl Drop for Guard {
             fn drop(&mut self) {
                 *crate::SPAWN_SPAWNER.write() = None;
+                // The lock guard drops here too, releasing serialization.
             }
         }
         match spawner {
             Some(s) => crate::set_spawn_spawner(s),
             None => *crate::SPAWN_SPAWNER.write() = None,
         }
-        Guard
+        Guard(_lock)
     }
 
     fn ctx_with(tasks: serde_json::Value) -> ToolCallCtx {
