@@ -14,7 +14,7 @@
 //!
 //! Without CONGA_LLM_KEY this prints a canned reply (smoke test of plumbing).
 
-use std::sync::atomic::AtomicBool;
+
 use std::sync::Arc;
 
 use conga::{
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thinking_level: tunables.thinking_level,
         max_turns: tunables.max_turns,
         max_tool_calls_per_turn: tunables.max_tool_calls_per_turn,
-        signal: Some(Arc::new(AtomicBool::new(false))),
+        signal: Some(conga::CancelSignal::new()),
         stream_fn,
         hooks: None,
         retry: tunables.retry,
@@ -154,7 +154,7 @@ impl StreamFn for MockStream {
         _messages: &[AgentMessage],
         _system: &str,
         _tools: &[conga::ToolDefinition],
-        _signal: Option<Arc<AtomicBool>>,
+        _signal: Option<conga::CancelSignal>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         Box::pin(futures_util::stream::iter(vec![
             StreamChunk::TextDelta("(mock) conga loop ran successfully.".into()),

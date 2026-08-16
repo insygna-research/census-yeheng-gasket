@@ -7,8 +7,8 @@
 //! `content_block_delta` events with `text_delta` / `input_json_delta`.
 
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+
+use crate::cancel::CancelSignal;
 
 use futures_util::Stream;
 use serde_json::json;
@@ -75,7 +75,7 @@ impl StreamFn for AnthropicProvider {
         messages: &[AgentMessage],
         system_prompt: &str,
         tools: &[ToolDefinition],
-        signal: Option<Arc<AtomicBool>>,
+        signal: Option<CancelSignal>,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let body = build_request_body(model, messages, system_prompt, tools);
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));

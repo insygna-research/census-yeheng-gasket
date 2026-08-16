@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use crate::subagent_types::{SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner};
 use conga::{
-    run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock,
-    ContentDelta, ToolDefinition, UserMessage,
+    run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, CancelSignal,
+    ContentBlock, ContentDelta, ToolDefinition, UserMessage,
 };
 
 /// Max turns for a sub-agent (lower than the parent's default 50).
@@ -28,7 +28,7 @@ pub struct HostSubagentSpawner {
     system_prompt: String,
     tools: Vec<ToolDefinition>,
     hooks: Arc<dyn conga::HookChain>,
-    signal: Arc<std::sync::atomic::AtomicBool>,
+    signal: CancelSignal,
     cwd: std::path::PathBuf,
     /// Process environment captured once at construction; cloned (cheap Arc)
     /// into each sub-agent context instead of re-querying the OS per task.
@@ -49,7 +49,7 @@ impl HostSubagentSpawner {
         system_prompt: String,
         tools: Vec<ToolDefinition>,
         hooks: Arc<dyn conga::HookChain>,
-        signal: Arc<std::sync::atomic::AtomicBool>,
+        signal: CancelSignal,
         cwd: std::path::PathBuf,
         loop_config: AgentLoopConfig,
     ) -> Self {
@@ -87,7 +87,7 @@ impl SubagentSpawner for HostSubagentSpawner {
             system_prompt: self.system_prompt.clone(),
             tools: self.tools.clone(),
             hooks: Arc::clone(&self.hooks),
-            signal: Arc::clone(&self.signal),
+            signal: self.signal.clone(),
             cwd: self.cwd.clone(),
             env: Arc::clone(&self.env),
             loop_config: self.loop_config.clone(),
@@ -139,7 +139,7 @@ impl SubagentSpawner for HostSubagentSpawner {
                 // signal/hooks and cap max_turns below the parent's.
                 let mut sub_config = spawner.loop_config.clone();
                 sub_config.max_turns = SUBAGENT_MAX_TURNS.min(spawner.loop_config.max_turns);
-                sub_config.signal = Some(Arc::clone(&spawner.signal));
+                sub_config.signal = Some(spawner.signal.clone());
                 sub_config.hooks = Some(Arc::clone(&spawner.hooks));
 
                 let user_msg = AgentMessage::User(UserMessage {
@@ -414,7 +414,6 @@ fn extract_summary_and_tools(msgs: &[AgentMessage]) -> (String, usize) {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-    use std::sync::atomic::AtomicBool;
 
     use conga::{
         AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn, ThinkingLevel,
@@ -423,6 +422,13 @@ mod tests {
 
     use crate::hooks::HookStack;
     use crate::permission::{Approver, Mode, PermissionPolicy};
+
+    /// A fresh signal that is already cancelled.
+    fn cancelled_signal() -> conga::CancelSignal {
+        let sig = conga::CancelSignal::new();
+        sig.cancel();
+        sig
+    }
 
     /// A mock StreamFn that replays a fixed chunk sequence on every call.
     struct MockStream(Vec<StreamChunk>);
@@ -434,7 +440,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[ToolDefinition],
-            _signal: Option<Arc<AtomicBool>>,
+            _signal: Option<conga::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             Box::pin(futures_util::stream::iter(self.0.clone()))
         }
@@ -444,7 +450,7 @@ mod tests {
         stream: Arc<dyn StreamFn>,
         hooks: Arc<dyn conga::HookChain>,
         ev_tx: tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
-        signal: Arc<AtomicBool>,
+        signal: conga::CancelSignal,
     ) -> HostSubagentSpawner {
         HostSubagentSpawner::new(
             "sys".into(),
@@ -505,7 +511,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            Arc::new(AtomicBool::new(false)),
+            conga::CancelSignal::new(),
         );
 
         let results = spawner
@@ -565,7 +571,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            Arc::new(AtomicBool::new(false)),
+            conga::CancelSignal::new(),
         );
 
         let results = spawner
@@ -628,7 +634,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            Arc::new(AtomicBool::new(false)),
+            conga::CancelSignal::new(),
         );
 
         let results = spawner
@@ -665,7 +671,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            Arc::new(AtomicBool::new(false)),
+            conga::CancelSignal::new(),
         );
 
         let results = spawner
@@ -710,7 +716,7 @@ mod tests {
             ])),
             hooks,
             ev_tx,
-            Arc::new(AtomicBool::new(true)), // pre-set: loop aborts before any provider call
+            cancelled_signal() // pre-set: loop aborts before any provider call
         );
 
         let results = spawner
@@ -752,7 +758,7 @@ mod tests {
         let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
         let stream: Arc<dyn StreamFn> =
             Arc::new(BlockingStream(parking_lot::Mutex::new(Some(block_rx))));
-        let spawner = test_spawner(stream, hooks, ev_tx, Arc::new(AtomicBool::new(false)));
+        let spawner = test_spawner(stream, hooks, ev_tx, conga::CancelSignal::new());
 
         // `spawn()` already returns `Pin<Box<dyn Future>>` — no tokio::pin!
         // (it would shadow the variable, making `drop(fut)` drop only the
@@ -789,7 +795,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[ToolDefinition],
-            _signal: Option<Arc<AtomicBool>>,
+            _signal: Option<conga::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             let rx = self.0.lock().take();
             Box::pin(futures_util::stream::once(async move {

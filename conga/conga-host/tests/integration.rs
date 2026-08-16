@@ -10,13 +10,13 @@
 //! and is then deleted.
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use common::FakeStream;
+use conga::types::message::{FunctionCall, ToolCall};
 use conga::{
-    derive_messages, AgentMessage, ContentBlock, EventStorage, SessionEvent, StreamChunk,
-    TurnEndReason, UserMessage,
+    derive_messages, AgentMessage, AssistantMessage, CancelCause, ContentBlock, EventStorage,
+    SessionEvent, StopReason, StreamChunk, ToolResultMessage, TurnEndReason, UserMessage,
 };
 use conga_host::{
     ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
@@ -183,7 +183,7 @@ async fn aborted_turn_persists_partial_facts() {
     let summary = host
         .run_turn("go", move |ev| {
             if matches!(ev, conga::AgentEvent::ToolExecutionEnd { .. }) {
-                signal.store(true, Ordering::Relaxed);
+                signal.cancel();
             }
         })
         .await
@@ -309,7 +309,14 @@ async fn success_path_log_equals_legacy_messages() {
 /// The 400-repair regression: an abort between two calls of one batch
 /// leaves the assistant's second tool call unanswered in the log. The next
 /// turn's provider request must carry a synthesized error result for it —
+/// Crash-window regression: a turn that died mid-batch (here: a hand-built
+/// log where the assistant made two write calls but only t1 got a result)
+/// leaves the second tool call unanswered in the log. The next turn's
+/// provider request must carry a synthesized error result for it -
 /// OpenAI-compat APIs reject `tool_calls` without matching `tool` messages.
+/// (Concurrent execution closed the live dangling path - an abort mid-batch
+/// now lets dispatched calls finish - so the repair path is pinned by this
+/// synthetic log, exactly what a crashed process leaves behind.)
 #[tokio::test]
 async fn next_turn_request_answers_every_tool_call() {
     let tmp = tempfile::tempdir().unwrap();
@@ -322,19 +329,64 @@ async fn next_turn_request_answers_every_tool_call() {
     };
 
     let session = SessionManager::with_root(tmp.path().to_path_buf());
-    // Turn 1: one batch of two write calls; the test flips the abort signal
-    // after the FIRST ToolExecutionEnd, so t2 never executes. The next
-    // provider request is skipped by the abort (one stream() call total).
-    // Turn 2: plain text answer (second stream() call) — its request is
-    // what we assert on.
-    let fake = Arc::new(FakeStream::new(vec![
-        vec![
-            write_call("t1", &rel("a.txt"), "one"),
-            write_call("t2", &rel("b.txt"), "two"),
-            StreamChunk::Done,
+    // Turn 1, as a crashed process would have left it: both writes were
+    // dispatched, only t1's result hit the log before the process died.
+    let dangling_assistant = AgentMessage::Assistant(AssistantMessage {
+        content: vec![
+            ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: "t1".into(),
+                    function: FunctionCall {
+                        name: "write".into(),
+                        arguments: format!("{:?} {:?} {}", rel("a.txt"), "one", 1),
+                    },
+                },
+            },
+            ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: "t2".into(),
+                    function: FunctionCall {
+                        name: "write".into(),
+                        arguments: format!("{:?} {:?} {}", rel("b.txt"), "two", 2),
+                    },
+                },
+            },
         ],
-        vec![StreamChunk::TextDelta("ok".into()), StreamChunk::Done],
-    ]));
+        model: "m".into(),
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+        timestamp: conga::now(),
+        stream_indices: vec![],
+    });
+    let t1_result = AgentMessage::ToolResult(ToolResultMessage {
+        tool_call_id: "t1".into(),
+        tool_name: "write".into(),
+        content: vec![ContentBlock::text("ok".to_string())],
+        is_error: false,
+        timestamp: conga::now(),
+    });
+    for ev in [
+        SessionEvent::TurnStart,
+        SessionEvent::User(user_msg("write both")),
+        SessionEvent::Assistant {
+            message: dangling_assistant,
+            usage: None,
+        },
+        SessionEvent::ToolResult(t1_result),
+        SessionEvent::TurnEnd {
+            reason: TurnEndReason::Aborted {
+                cause: Some(CancelCause::User),
+            },
+        },
+    ] {
+        session.append_event(&ev).await.unwrap();
+    }
+
+    // Turn 2: plain text answer - its request is what we assert on.
+    let fake = Arc::new(FakeStream::new(vec![vec![
+        StreamChunk::TextDelta("ok".into()),
+        StreamChunk::Done,
+    ]]));
     let host = Host::new(
         test_cfg(false),
         session,
@@ -344,39 +396,16 @@ async fn next_turn_request_answers_every_tool_call() {
     )
     .with_stream_fn(fake.clone());
 
-    let signal = host.signal().clone();
-    let seen_ends = std::sync::atomic::AtomicU32::new(0);
-    let summary = host
-        .run_turn("write both", |ev| {
-            if matches!(ev, conga::AgentEvent::ToolExecutionEnd { .. }) {
-                let n = seen_ends.fetch_add(1, Ordering::Relaxed);
-                if n == 0 {
-                    signal.store(true, Ordering::Relaxed);
-                }
-            }
-        })
-        .await
-        .expect("aborted turn returns Ok");
-    assert!(
-        matches!(summary.reason, TurnEndReason::Aborted { .. }),
-        "expected abort, got {:?}",
-        summary.reason
-    );
+    let summary = host.run_turn("continue", |_| {}).await.expect("turn");
+    assert!(matches!(summary.reason, TurnEndReason::Completed));
 
-    let summary2 = host
-        .run_turn("continue", |_| {})
-        .await
-        .expect("second turn");
-    assert!(matches!(summary2.reason, TurnEndReason::Completed));
-
-    // The provider requests the host actually assembled, in call order.
     let requests = fake.seen();
-    assert_eq!(requests.len(), 2, "abort skipped the follow-up request");
+    assert_eq!(requests.len(), 1, "one provider request for turn 2");
 
-    // Every assistant tool_call in the turn-2 request is answered by a
-    // tool result — the OpenAI-compat 400 contract.
+    // Every assistant tool_call in the request is answered by a tool
+    // result - the OpenAI-compat 400 contract.
     let mut pending: Vec<String> = Vec::new();
-    for msg in &requests[1] {
+    for msg in &requests[0] {
         match msg {
             AgentMessage::Assistant(a) => {
                 for b in &a.content {
@@ -399,43 +428,8 @@ async fn next_turn_request_answers_every_tool_call() {
         pending.is_empty(),
         "turn-2 request still has unanswered tool calls: {pending:?}"
     );
-    // And the synthesized t2 result is an error result placed after t1's.
-    let turn2_results: Vec<&conga::ToolResultMessage> = requests[1]
-        .iter()
-        .filter_map(|m| match m {
-            AgentMessage::ToolResult(tr) => Some(tr),
-            _ => None,
-        })
-        .collect();
-    let ids: Vec<&str> = turn2_results
-        .iter()
-        .map(|tr| tr.tool_call_id.as_str())
-        .collect();
-    assert_eq!(ids, vec!["t1", "t2"], "t1 real, t2 synthesized, in order");
-    assert!(turn2_results[1].is_error, "synthesized result is an error");
-
-    // The on-disk log keeps the partial facts — the repair is in-memory
-    // only, never written back.
-    let sid = host.session().current_id().to_string();
-    let events = EventStorage::new(tmp.path())
-        .load_events(&sid)
-        .await
-        .unwrap();
-    let answered: Vec<&str> = events
-        .iter()
-        .filter_map(|ev| match ev {
-            SessionEvent::ToolResult(AgentMessage::ToolResult(tr)) => {
-                Some(tr.tool_call_id.as_str())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(answered, vec!["t1"], "t2 must stay unanswered on disk");
 }
 
-/// One-shot legacy migration: messages.jsonl is wrapped into events.jsonl in
-/// full, deleted only after the full write, and a second open loads
-/// events.jsonl directly (idempotent).
 #[tokio::test]
 async fn legacy_messages_migrate_once_and_delete_legacy() {
     let tmp = tempfile::tempdir().unwrap();

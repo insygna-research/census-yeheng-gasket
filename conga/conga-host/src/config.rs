@@ -2,11 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use conga::{
-    AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, HookChain,
+    AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, CancelSignal, HookChain,
     ProviderConfig, SessionEvent, StreamFn, ToolDefinition,
 };
 
@@ -58,7 +57,7 @@ impl HostConfig {
     pub fn build_loop_config(
         &self,
         max_turns: usize,
-        signal: Option<Arc<AtomicBool>>,
+        signal: Option<CancelSignal>,
         hooks: Option<Arc<dyn HookChain>>,
         stream_fn: Arc<dyn StreamFn>,
     ) -> AgentLoopConfig {
@@ -118,14 +117,15 @@ impl HostConfig {
     pub fn prepare_turn(
         &self,
         inputs: TurnInputs<'_>,
-        signal: &Arc<AtomicBool>,
+        signal: &CancelSignal,
         hooks: Arc<dyn HookChain>,
         stream_fn: Arc<dyn StreamFn>,
         max_turns: usize,
         persist: Option<PersistFn>,
     ) -> (AgentContext, AgentLoopConfig) {
-        // A Ctrl-C from a previous turn must not leak into this one.
-        signal.store(false, Ordering::Relaxed);
+        // A Ctrl-C from a previous turn must not leak into this one. reset()
+        // also wakes any approval-wait still parked on the old cancel.
+        signal.reset();
         let context = self.build_context(
             inputs.system_prompt,
             inputs.history,

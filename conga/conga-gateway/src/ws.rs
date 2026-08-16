@@ -1,7 +1,6 @@
 //! WebSocket upgrade handler and the per-connection session loop.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -362,7 +361,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                             match incoming.msg_type.as_str() {
                                                 "cancel" => {
                                                     info!("session {session_id}: cancel during turn");
-                                                    signal.store(true, Ordering::Relaxed);
+                                                    signal.cancel();
                                                     let _ = cancel_tx.send(true);
                                                 }
                                                 "approval_response" => {
@@ -397,14 +396,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                     Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {}
                                     Some(Ok(Message::Close(_))) | None => {
                                         info!("session {session_id}: ws closed during turn");
-                                        signal.store(true, Ordering::Relaxed);
+                                        signal.cancel();
                                         let _ = cancel_tx.send(true);
                                         closing = true;
                                         break;
                                     }
                                     Some(Err(e)) => {
                                         warn!("session {session_id}: ws error during turn: {e}");
-                                        signal.store(true, Ordering::Relaxed);
+                                        signal.cancel();
                                         let _ = cancel_tx.send(true);
                                         closing = true;
                                         break;
@@ -444,7 +443,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
             }
             "cancel" => {
                 // 回合外 cancel：置 signal + 解锁任何残留审批等待。
-                signal.store(true, Ordering::Relaxed);
+                signal.cancel();
                 let _ = cancel_tx.send(true);
                 info!("session {session_id}: cancel outside turn");
             }

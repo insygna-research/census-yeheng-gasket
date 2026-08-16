@@ -9,24 +9,20 @@
 //! body shape and chunk parsing.
 
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 
+use crate::cancel::CancelSignal;
 use crate::types::context::StreamChunk;
-
-/// Abort-poll cadence while a provider body download is in flight.
-const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The shared SSE download loop for provider requests.
 ///
 /// POSTs `body` to `url` (`decorate` adds transport-specific auth headers),
 /// then parses SSE frames incrementally off the wire as bytes arrive (first
 /// token reaches the user at first-token time, not whole-response time)
-/// and races the download against the abort signal so Ctrl-C stops it
-/// mid-flight. Each payload JSON is mapped through `parse_chunk`. `label`
+/// and races the download against the cancel signal so Ctrl-C stops it
+/// mid-flight the instant `cancel()` fires (event-driven - no polling).
+/// Each payload JSON is mapped through `parse_chunk`. `label`
 /// names the provider in errors/logs.
 ///
 /// Behavior contract (pinned by the providers' streaming tests):
@@ -40,7 +36,7 @@ pub(crate) fn download_sse<F, P>(
     url: String,
     decorate: F,
     body: serde_json::Value,
-    signal: Option<Arc<AtomicBool>>,
+    signal: Option<CancelSignal>,
     parse_chunk: P,
 ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>>
 where
@@ -48,7 +44,18 @@ where
     P: Fn(&str) -> Vec<StreamChunk> + Send + 'static,
 {
     Box::pin(async_stream::stream! {
-        let resp = match decorate(client.post(&url).json(&body)).send().await {
+        let resp = match signal.as_ref() {
+            Some(sig) => tokio::select! {
+                biased;
+                _ = sig.cancelled() => {
+                    tracing::debug!("{label} stream aborted before response");
+                    return;
+                }
+                r = decorate(client.post(&url).json(&body)).send() => r,
+            },
+            None => decorate(client.post(&url).json(&body)).send().await,
+        };
+        let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "{label} request failed");
@@ -88,17 +95,15 @@ where
                 }
             }
             let chunk = match signal.as_ref() {
-                Some(flag) => {
-                    // AtomicBool has no async notification; poll at a
-                    // short cadence so a set flag unwinds within ~50ms.
+                Some(sig) => {
+                    // Event-driven abort: the watch-backed cancel future
+                    // resolves the instant cancel() fires - including while
+                    // the HTTP read is parked with no bytes flowing.
                     tokio::select! {
                         biased;
-                        _ = tokio::time::sleep(ABORT_POLL_INTERVAL) => {
-                            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                tracing::debug!("{label} stream aborted mid-download");
-                                return;
-                            }
-                            continue;
+                        _ = sig.cancelled() => {
+                            tracing::debug!("{label} stream aborted mid-download");
+                            return;
                         }
                         c = byte_stream.next() => c,
                     }
@@ -170,17 +175,33 @@ pub fn parse_sse_frame(frame: &str) -> Vec<Option<String>> {
 /// Incremental SSE frame splitter for a live byte stream.
 ///
 /// A frame ends at a blank line (`\n\n` or `\r\n\r\n`). Bytes arrive split at
-/// arbitrary boundaries — mid-frame, mid-UTF-8 — so [`push`](Self::push)
+/// arbitrary boundaries - mid-frame, mid-UTF-8 - so [`push`](Self::push)
 /// buffers until a full separator is present and each complete frame goes
 /// through [`parse_sse_frame`]. [`finish`](Self::finish) flushes a trailing
 /// frame whose blank line never arrived (some servers omit the final one).
+///
+/// Frames are cut via a read cursor over the buffer, NOT `Vec::drain`: a
+/// per-frame drain memmoves the whole remaining tail, which is pure CPU burn
+/// on long token streams. The buffer is compacted only when the consumed
+/// prefix exceeds [`COMPACT_THRESHOLD`] (or is fully drained), amortizing
+/// the memmove to near zero.
 pub(crate) struct SseFrameSplitter {
     buf: Vec<u8>,
+    /// Start of the unconsumed region in `buf` (everything before it has
+    /// already been emitted as frames).
+    read_pos: usize,
 }
+
+/// Once this many consumed bytes sit in front of the cursor, slide the
+/// unconsumed tail to the front in one memmove instead of one per frame.
+const COMPACT_THRESHOLD: usize = 32 * 1024;
 
 impl SseFrameSplitter {
     pub(crate) fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            read_pos: 0,
+        }
     }
 
     /// Feed freshly received bytes; returns every complete frame with its
@@ -188,23 +209,42 @@ impl SseFrameSplitter {
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        while let Some((start, end)) = find_separator(&self.buf) {
-            let frame = String::from_utf8_lossy(&self.buf[..start]).into_owned();
-            self.buf.drain(..end);
+        while let Some((start, end)) = find_separator(&self.buf[self.read_pos..]) {
+            let frame =
+                String::from_utf8_lossy(&self.buf[self.read_pos..self.read_pos + start]).into_owned();
+            self.read_pos += end; // skip past the separator
             frames.push(frame);
         }
+        self.compact();
         frames
     }
 
     /// End of stream: return a trailing frame that was never terminated by a
     /// blank line, if any bytes remain buffered.
     pub(crate) fn finish(&mut self) -> Vec<String> {
-        if self.buf.is_empty() {
+        if self.read_pos >= self.buf.len() {
+            self.buf.clear();
+            self.read_pos = 0;
             return Vec::new();
         }
-        let frame = String::from_utf8_lossy(&self.buf).into_owned();
+        let frame = String::from_utf8_lossy(&self.buf[self.read_pos..]).into_owned();
         self.buf.clear();
+        self.read_pos = 0;
         vec![frame]
+    }
+
+    /// Reclaim consumed prefix space: free the whole buffer when everything
+    /// is consumed (the common steady-state), otherwise memmove the tail to
+    /// the front only once the consumed prefix has grown past the threshold.
+    fn compact(&mut self) {
+        if self.read_pos == self.buf.len() {
+            self.buf.clear();
+            self.read_pos = 0;
+        } else if self.read_pos >= COMPACT_THRESHOLD {
+            self.buf.copy_within(self.read_pos.., 0);
+            self.buf.truncate(self.buf.len() - self.read_pos);
+            self.read_pos = 0;
+        }
     }
 }
 
@@ -312,5 +352,105 @@ mod tests {
         // parse_sse_frame's trailing-flush path must still yield its payload.
         let payloads = parse_sse_frame("data: {\"x\":1}");
         assert_eq!(payloads, vec![Some("{\"x\":1}".to_string())]);
+    }
+
+    #[test]
+    fn splitter_survives_thousands_of_frames_without_growth() {
+        // Regression for the per-frame `drain`: the cursor keeps the buffer
+        // near one frame in size no matter how many frames flow through.
+        let mut s = SseFrameSplitter::new();
+        let frame = format!("data: {}\n\n", "x".repeat(200));
+        for _ in 0..20_000 {
+            let frames = s.push(frame.as_bytes());
+            assert_eq!(frames.len(), 1);
+            assert!(s.buf.len() < frame.len() + COMPACT_THRESHOLD,
+                "buffer grew to {} bytes", s.buf.len());
+        }
+        assert!(s.finish().is_empty());
+    }
+
+    #[test]
+    fn splitter_compacts_across_many_small_chunks() {
+        // Feed one frame larger than the compaction threshold in small
+        // chunks: every push must return empty until the separator arrives,
+        // the single frame must come out whole, and the buffer must reset.
+        let payload = "y".repeat(COMPACT_THRESHOLD + 8 * 1024);
+        let frame = format!("data: {payload}\n\n");
+        let mut s = SseFrameSplitter::new();
+        let bytes = frame.as_bytes();
+        for chunk in bytes[..bytes.len() - 1].chunks(64) {
+            assert!(s.push(chunk).is_empty());
+        }
+        // Last byte completes the frame; the buffer must reset to empty.
+        assert_eq!(s.push(&bytes[bytes.len() - 1..]).len(), 1);
+        assert_eq!(s.buf.len(), 0, "fully-consumed buffer must be cleared");
+        assert!(s.finish().is_empty());
+    }
+
+    #[test]
+    fn splitter_mixed_frames_and_leading_garbage_across_compaction() {
+        // Interleave small frames until several compactions have happened,
+        // verifying frames stay correct across cursor resets.
+        let mut s = SseFrameSplitter::new();
+        let expected_total = 5000;
+        for i in 0..expected_total {
+            let chunk = format!("data: {i}\n\n");
+            let frames = s.push(chunk.as_bytes());
+            assert_eq!(frames, vec![format!("data: {i}")]);
+        }
+        // Trailing un-terminated frame still flushes at finish().
+        assert_eq!(
+            s.push(b"data: tail"),
+            Vec::<String>::new()
+        );
+        assert_eq!(s.finish(), vec!["data: tail".to_string()]);
+    }
+
+    /// A TCP server that accepts connections and never answers: `download_sse`
+    /// parks on the response read with no bytes flowing, proving cancel is
+    /// watch-driven rather than rescued by a poll interval.
+    async fn stalled_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold connections open without writing a byte.
+            while let Ok((_sock, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        format!("http://{addr}/v1/chat")
+    }
+
+    #[tokio::test]
+    async fn download_sse_unwinds_promptly_when_cancelled_mid_download() {
+        use futures_util::StreamExt;
+        let url = stalled_server().await;
+        let signal = crate::cancel::CancelSignal::new();
+        let mut stream = download_sse(
+            "test",
+            reqwest::Client::new(),
+            url,
+            |req| req,
+            serde_json::json!({}),
+            Some(signal.clone()),
+            |frame| {
+                let _ = frame;
+                Vec::new()
+            },
+        );
+        // Park on the stalled download, then cancel: the stream must end
+        // within milliseconds (watch-backed) rather than hang or poll.
+        let started = std::time::Instant::now();
+        let drain = tokio::spawn(async move {
+            while stream.next().await.is_some() {}
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        signal.cancel();
+        drain.await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancel must unwind a stalled download promptly, took {:?}",
+            started.elapsed()
+        );
     }
 }

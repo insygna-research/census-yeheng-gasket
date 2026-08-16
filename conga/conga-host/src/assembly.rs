@@ -1,5 +1,5 @@
-//! Shared Host assembly for server-style transports (the gateway's
-//! WebSocket, the desktop app's IPC).
+//! Shared Host assembly for every transport (the gateway's WebSocket, the
+//! desktop app's IPC, and the CLI REPL).
 //!
 //! ONE place wires: fail-loud session resume → system prompt + skills →
 //! permission mode → approver (registry + cancel watch + transport emit) →
@@ -7,7 +7,9 @@
 //! spawner → `Host`. Transports keep only their channel/emitter plumbing.
 //! Before this module existed, the gateway and the desktop backend each
 //! hand-copied this wiring and the copies drifted (the desktop `/clear`
-//! stopped rotating the log; the desktop missed `policy.set_signal`).
+//! stopped rotating the log; the desktop missed `policy.set_signal`) - and
+//! the CLI kept a third hand-rolled copy that never got the sub-agent
+//! spawner at all.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -18,7 +20,7 @@ use crate::approval::{self, ApprovalRegistry, RegisterOutcome};
 use crate::permission::{Approver, Mode, PermissionPolicy};
 use crate::subagent::HostSubagentSpawner;
 use crate::subagent_types::SubagentEvent;
-use crate::{ConfigLoader, HookStack, Host, SessionManager};
+use crate::{ConfigLoader, Host, HostConfig, HookStack, SessionManager};
 
 /// A session-API failure for transport mapping: `Config` (provider/env
 /// setup broken — the user must fix `~/.conga` or env) vs `Session` (this
@@ -49,6 +51,57 @@ pub type ApprovalEmit = Arc<dyn Fn(String, String, serde_json::Value) + Send + S
 /// Where sub-agent events go. Transports forward onto their ordered event
 /// channel (the same one as approvals and main-agent stream events).
 pub type SubagentEmit = Arc<dyn Fn(SubagentEvent) + Send + Sync>;
+
+/// The tool set every host assembles: built-in first, then `prepend` (the
+/// CLI's in-process ext tools outrank external ones), then external
+/// (`CONGA_EXTERNAL_TOOLS`), then MCP (`~/.conga/mcp.json`), then `append`
+/// (the desktop app's in-process extension tools). One gathering point for
+/// initial load AND the CLI's `/reload-tools`, so a reload can never drift
+/// from the initial set. `quiet` logs to tracing (transports); otherwise
+/// the CLI's stderr banners print.
+pub async fn gather_tools(
+    prepend: Vec<ToolDefinition>,
+    append: Vec<ToolDefinition>,
+    quiet: bool,
+) -> Vec<ToolDefinition> {
+    let external = {
+        let cmds = crate::commands_from_env();
+        if cmds.is_empty() {
+            Vec::new()
+        } else {
+            match crate::load_external_tools(&cmds).await {
+                Ok(t) => {
+                    if quiet {
+                        tracing::info!("loaded {} external tool(s)", t.len());
+                    } else {
+                        eprintln!(
+                            "(external tools: {} from {} command(s))",
+                            t.len(),
+                            cmds.len()
+                        );
+                    }
+                    t
+                }
+                Err(e) => {
+                    if quiet {
+                        tracing::warn!("external tools load failed: {e}");
+                    } else {
+                        eprintln!("(external tools load failed: {e})");
+                    }
+                    Vec::new()
+                }
+            }
+        }
+    };
+    let mcp_tools = crate::mcp::load_all_mcp().await;
+    let built_in = crate::built_in_tools();
+    let mut tools = built_in;
+    tools.extend(prepend);
+    tools.extend(external);
+    tools.extend(mcp_tools);
+    tools.extend(append);
+    tools
+}
 
 /// A fully wired session: the transport drives `host.run_turn` per user
 /// message, fills in approval decisions on `registry`, and cancels via the
@@ -105,15 +158,13 @@ impl SessionAssembly {
         };
         let session_mgr = resume_session(store_root, session_id).await?;
 
-        let cwd = crate::project_dir();
-        let system_prompt = crate::append_skills("You are a helpful, concise assistant.", &cwd);
         // Intentionally one env knob shared by every transport.
         let mode = std::env::var("CONGA_GATEWAY_MODE")
             .ok()
             .and_then(|s| Mode::parse(&s))
             .unwrap_or(Mode::AutoEdit);
 
-        // Cancel 双通道：Host 的 AtomicBool 驱动 loop 中止，watch 解锁挂起的审批。
+        // Cancel 双通道：Host 的取消信号驱动 loop 中止，watch 解锁挂起的审批。
         let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
         let registry = Arc::new(StdMutex::new(ApprovalRegistry::new()));
         let approver: Approver = {
@@ -147,81 +198,124 @@ impl SessionAssembly {
                 })
             })
         };
-        let policy = Arc::new(PermissionPolicy::new(mode, approver));
-
-        // Tool assembly: built-in + external + MCP (+ transport extras) for
-        // the parent; sub-agents get the built-in set minus
-        // `spawn_subagents` (nesting disabled; shared MCP/external servers
-        // are not built for N parallel loops). The shared permission policy
-        // still gates every call the sub-agents do get.
-        let external = {
-            let cmds = crate::commands_from_env();
-            if cmds.is_empty() {
-                Vec::new()
-            } else {
-                match crate::load_external_tools(&cmds).await {
-                    Ok(t) => {
-                        tracing::info!("loaded {} external tool(s)", t.len());
-                        t
-                    }
-                    Err(e) => {
-                        tracing::warn!("external tools load failed: {e}");
-                        Vec::new()
-                    }
-                }
-            }
-        };
-        let mcp_tools = crate::mcp::load_all_mcp().await;
-        let built_in = crate::built_in_tools();
-        let subagent_tools: Vec<_> = built_in
-            .iter()
-            .filter(|t| t.name != "spawn_subagents")
-            .cloned()
-            .collect();
-        let mut tools = built_in;
-        tools.extend(external);
-        tools.extend(mcp_tools);
-        tools.extend(extra_tools);
-
-        let spawner_cfg = cfg;
-        let spawner_policy = Arc::clone(&policy);
-        let mut host =
-            Host::new(spawner_cfg.clone(), session_mgr, policy.clone(), system_prompt, tools);
-        // The approver may wait on a client that never answers; give it the
-        // Host's abort signal so cancel unwinds the wait. (The desktop
-        // backend used to miss this line — it lived only in the gateway's
-        // copy of this wiring.)
-        policy.set_signal(host.signal().clone());
-        {
-            let spawner_signal = host.signal().clone();
-            let spawner_stream_fn = spawner_cfg.provider_stream_fn();
-            let spawner_hooks: Arc<dyn conga::HookChain> =
-                Arc::new(HookStack::new(vec![spawner_policy]));
-            let loop_config = spawner_cfg.build_loop_config(
-                spawner_cfg.tunables.max_turns,
-                Some(spawner_signal.clone()),
-                None,
-                spawner_stream_fn,
-            );
-            let spawner = Arc::new(
-                HostSubagentSpawner::new(
-                    "You are a focused sub-agent. Complete your assigned task concisely.".into(),
-                    subagent_tools,
-                    spawner_hooks,
-                    spawner_signal,
-                    crate::project_dir(),
-                    loop_config,
-                )
-                .with_ws_emit(subagent_emit),
-            );
-            host = host.with_spawner(spawner);
-        }
+        let tools = gather_tools(Vec::new(), extra_tools, true).await;
+        let host = assemble_host(
+            cfg,
+            session_mgr,
+            mode,
+            approver,
+            Vec::new(),
+            tools,
+            subagent_emit,
+        )
+        .await;
         Ok(Self {
             host,
             registry,
             cancel_tx,
         })
     }
+
+    /// The CLI REPL variant: default store root, `--resume=` handled here
+    /// (adopted before assembly, same `last`/id semantics as `/resume`),
+    /// caller-supplied approver (stdin), ext-feature hooks prepended before
+    /// the permission policy, ext tools ranked right after built-ins, and a
+    /// stderr sub-agent tap (the REPL has no event channel). Same wiring as
+    /// [`build`] - one assembly, no third drifting copy. The caller still
+    /// owns `install_ctrl_c` (the CLI hooks it straight after this returns).
+    pub async fn build_cli(
+        mode: Mode,
+        approver: Approver,
+        resume: Option<String>,
+        extra_hooks: Vec<Arc<dyn conga::HookChain>>,
+        ext_tools: Vec<ToolDefinition>,
+    ) -> Result<Host, AssemblyError> {
+        let cfg = match ConfigLoader::load() {
+            Ok(c) => c,
+            Err(e) => return Err(AssemblyError::Config(e.to_string())),
+        };
+        let session = SessionManager::new();
+        if let Some(r) = resume {
+            let res = if r == "last" {
+                session.resume_last().await
+            } else {
+                session.resume(&r).await
+            };
+            match res {
+                Ok(m) => println!("(resumed {} with {} msgs)", session.current_id(), m.len()),
+                Err(e) => println!("(resume: {e})"),
+            }
+        }
+        let tools = gather_tools(ext_tools, Vec::new(), false).await;
+        let tap: SubagentEmit = Arc::new(|ev: SubagentEvent| {
+            eprintln!("[subagent] {ev:?}");
+        });
+        Ok(assemble_host(cfg, session, mode, approver, extra_hooks, tools, tap).await)
+    }
+}
+
+/// The one Host assembly shared by every caller of this module:
+/// skills prompt -> hook stack (`extra_hooks` first, policy last) -> signal
+/// wiring -> sub-agent spawner. Sub-agents get the built-in set minus
+/// `spawn_subagents` (nesting disabled; shared MCP/external servers are not
+/// built for N parallel loops); the shared permission policy still gates
+/// every call the sub-agents do get.
+async fn assemble_host(
+    cfg: HostConfig,
+    session: SessionManager,
+    mode: Mode,
+    approver: Approver,
+    extra_hooks: Vec<Arc<dyn conga::HookChain>>,
+    tools: Vec<ToolDefinition>,
+    subagent_emit: SubagentEmit,
+) -> Host {
+    let cwd = crate::project_dir();
+    let system_prompt = crate::append_skills("You are a helpful, concise assistant.", &cwd);
+    let policy = Arc::new(PermissionPolicy::new(mode, approver));
+
+    // Host hooks: extra gates first (e.g. the CLI's ext permission gate),
+    // the permission policy last so its verdicts see post-gate calls.
+    let mut hook_stack = HookStack::new(Vec::new());
+    for h in extra_hooks {
+        hook_stack.push(h);
+    }
+    hook_stack.push(policy.clone());
+
+    let subagent_tools: Vec<_> = crate::built_in_tools()
+        .iter()
+        .filter(|t| t.name != "spawn_subagents")
+        .cloned()
+        .collect();
+
+    let host = Host::new(cfg.clone(), session, policy.clone(), system_prompt, tools)
+        .with_hooks(Arc::new(hook_stack));
+    // The approver may wait on a client that never answers; give it the
+    // Host's cancel signal so cancel unwinds the wait. (The desktop
+    // backend used to miss this line - it lived only in the gateway's
+    // copy of this wiring.)
+    policy.set_signal(host.signal().clone());
+
+    let spawner_signal = host.signal().clone();
+    let spawner_stream_fn = cfg.provider_stream_fn();
+    let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(HookStack::new(vec![policy]));
+    let loop_config = cfg.build_loop_config(
+        cfg.tunables.max_turns,
+        Some(spawner_signal.clone()),
+        None,
+        spawner_stream_fn,
+    );
+    let spawner = Arc::new(
+        HostSubagentSpawner::new(
+            "You are a focused sub-agent. Complete your assigned task concisely.".into(),
+            subagent_tools,
+            spawner_hooks,
+            spawner_signal,
+            crate::project_dir(),
+            loop_config,
+        )
+        .with_ws_emit(subagent_emit),
+    );
+    host.with_spawner(spawner)
 }
 
 #[cfg(test)]

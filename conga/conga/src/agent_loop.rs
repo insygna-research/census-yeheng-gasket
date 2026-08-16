@@ -1,7 +1,6 @@
 //! The agent loop — single outer loop: LLM call → tool calls → repeat.
 
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 
 use futures_util::StreamExt;
 
@@ -9,7 +8,7 @@ use crate::error::AgentError;
 use crate::types::context::{AgentContext, AgentLoopConfig, StreamChunk};
 use crate::types::event::{AgentEvent, ContentDelta};
 use crate::types::message::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, ToolResultMessage,
 };
 use crate::types::session_event::SessionEvent;
 use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext};
@@ -102,7 +101,8 @@ where
             StopReason::ToolUse => {} // fall through to execution
         }
 
-        // 3. Execute tool calls (serial in V0.1).
+        // 3. Execute tool calls (concurrently within the batch; results are
+        //    recorded in declaration order).
         let tool_results =
             execute_tool_calls(&context, &assistant, &config, &mut guard, &mut emit).await?;
         for r in &tool_results {
@@ -135,7 +135,7 @@ fn is_aborted(config: &AgentLoopConfig) -> bool {
     config
         .signal
         .as_ref()
-        .is_some_and(|s| s.load(Ordering::Relaxed))
+        .is_some_and(|s| s.is_cancelled())
 }
 
 /// Hand one [`SessionEvent`] to the loop's `persist` callback (if installed).
@@ -219,6 +219,37 @@ fn error_tool_result(
 
 /// Execute every tool call in `assistant`, running before/after hooks (V0.1:
 /// hooks are no-ops; wired in stage 3g).
+/// One tool call of a batch, prepared by the sequential pre-pass.
+///
+/// The pre-pass resolves limits, arg parsing, hooks (approvers must be
+/// asked in declaration order), and tool lookup; only calls that clear all
+/// of that become [`Slot::Ready`] and fan out concurrently.
+enum Slot {
+    Ready {
+        tc: ToolCall,
+        execute: crate::types::tool::ToolFn,
+        args: serde_json::Value,
+        args_key: String,
+    },
+    /// Pre-execution rejection (limit / parse error / hook block / unknown
+    /// tool) with the error tool_result to record for the model.
+    Failed(ToolResultMessage),
+}
+
+/// Executes one batch of tool calls in three phases:
+///
+/// 1. **Sequential pre-pass** - per-call limit check, cooperative abort
+///    check, arg parsing, `before_tool_call` hooks, and tool lookup. Hooks
+///    run in declaration order so a human approver is asked about call #1
+///    before call #2 exists as an approved fact.
+/// 2. **Concurrent execution** - approved calls dispatch together via
+///    `join_all` (I/O-bound tools overlap; `Start` events still emit in
+///    declaration order). A mid-batch abort no longer skips already-
+///    dispatched calls: they run to completion so every call gets a result.
+/// 3. **Sequential post-pass** - `after_tool_call` hooks, repeat-guard
+///    advisories, persistence, and `End` events, all in declaration order,
+///    so the session log replays exactly as declared regardless of which
+///    tool finished first.
 async fn execute_tool_calls<E>(
     context: &AgentContext,
     assistant: &AssistantMessage,
@@ -238,21 +269,22 @@ where
         })
         .collect();
 
-    let mut results = Vec::with_capacity(tool_calls.len());
+    // ---- Phase 1: sequential pre-pass (hooks must fire in order) ----
+    let mut slots: Vec<Slot> = Vec::with_capacity(tool_calls.len());
     for (i, tc) in tool_calls.into_iter().enumerate() {
         if i >= config.max_tool_calls_per_turn {
             // Limit reached: report the dropped call as an error tool_result so
             // the model sees one result per call instead of a silent gap.
             let limit = config.max_tool_calls_per_turn;
-            let result = error_tool_result(
+            slots.push(Slot::Failed(error_tool_result(
                 &tc.id,
                 &tc.function.name,
                 format!("tool call limit reached ({limit} per turn); call dropped"),
-            );
-            record_tool_result(config, emit, &mut results, result, true)?;
+            )));
             continue;
         }
-        // Cooperative abort between tool calls in a batch.
+        // Cooperative abort before dispatching more calls in this batch.
+        // Calls already dispatched still complete (Phase 2 runs them out).
         if is_aborted(config) {
             break;
         }
@@ -268,22 +300,21 @@ where
             }
             Err(e) => {
                 tracing::warn!(tool = %tc.function.name, error = %e, "malformed tool arguments");
-                let result = error_tool_result(
+                slots.push(Slot::Failed(error_tool_result(
                     &tc.id,
                     &tc.function.name,
                     format!(
                         "failed to parse tool arguments as JSON: {e}\nraw arguments: {:?}",
                         tc.function.arguments
                     ),
-                );
-                record_tool_result(config, emit, &mut results, result, true)?;
+                )));
                 continue;
             }
         };
 
-        // 1. before_tool_call hook: consult the hook chain if installed.
-        //    Risk is looked up from the tool definition (unknown tools default
-        //    to High - the safe default, matching the old host-side table).
+        // before_tool_call hook: consult the hook chain if installed.
+        // Risk is looked up from the tool definition (unknown tools default
+        // to High - the safe default, matching the old host-side table).
         let risk = context
             .tools
             .iter()
@@ -300,97 +331,137 @@ where
         match verdict {
             ToolCallVerdict::Block(reason) => {
                 tracing::warn!(tool = %tc.function.name, "tool blocked by before_tool_call hook");
-                let result = error_tool_result(&tc.id, &tc.function.name, reason);
-                record_tool_result(config, emit, &mut results, result, true)?;
+                slots.push(Slot::Failed(error_tool_result(
+                    &tc.id,
+                    &tc.function.name,
+                    reason,
+                )));
                 continue;
             }
             ToolCallVerdict::Modify(new_args) => args = new_args,
             ToolCallVerdict::Allow => {}
         }
 
-        // 2. Locate the tool. Unknown tool -> error tool_result (the model may
-        //    have hallucinated a name); continue the run.
+        // Locate the tool. Unknown tool -> error tool_result (the model may
+        // have hallucinated a name); continue the run.
         let tool = match context.tools.iter().find(|t| t.name == tc.function.name) {
             Some(t) => t,
             None => {
                 tracing::warn!(tool = %tc.function.name, "tool not found");
-                let result = error_tool_result(
+                slots.push(Slot::Failed(error_tool_result(
                     &tc.id,
                     &tc.function.name,
                     format!("tool not found: {}", tc.function.name),
-                );
-                record_tool_result(config, emit, &mut results, result, true)?;
+                )));
                 continue;
             }
         };
 
         let args_key = args.to_string();
-
-        emit(AgentEvent::ToolExecutionStart {
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.function.name.clone(),
-            args: args.clone(),
-        });
-        tracing::info!(tool = %tc.function.name, "tool execute");
-
-        // 3. Execute. A tool-internal error becomes an error tool_result fed
-        //    back to the LLM; the run continues instead of aborting.
-        let raw = match (tool.execute)(ToolCallCtx {
-            tool_call_id: tc.id.clone(),
+        slots.push(Slot::Ready {
+            tc,
+            execute: tool.execute.clone(),
             args,
-            signal: config.signal.clone().unwrap_or_default(),
-            ctx: ToolContext {
-                cwd: context.cwd.clone(),
-                env: context.env.clone(),
-                session_id: context.session_id.clone(),
-                state_dir: tool_state_dir(context, &tc.function.name),
-            },
-        })
-        .await
+            args_key,
+        });
+    }
+
+    // ---- Phase 2: concurrent dispatch (Start events stay in order) ----
+    let mut futures = Vec::new();
+    for slot in &slots {
+        if let Slot::Ready {
+            tc,
+            execute,
+            args,
+            ..
+        } = slot
         {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::warn!(tool = %tc.function.name, error = %msg, "tool execute error");
-                crate::types::tool::ToolResult::error(msg)
-            }
-        };
-
-        let mut result = ToolResultMessage {
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.function.name.clone(),
-            content: raw.content,
-            is_error: raw.is_error,
-            timestamp: crate::now(),
-        };
-
-        // 4. after_tool_call hook: chain may replace the result (redact, etc.).
-        if let Some(h) = &config.hooks {
-            result = h.after_tool_call(&tc.id, &result);
+            emit(AgentEvent::ToolExecutionStart {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.function.name.clone(),
+                args: args.clone(),
+            });
+            tracing::info!(tool = %tc.function.name, "tool execute");
+            futures.push((execute.clone())(ToolCallCtx {
+                tool_call_id: tc.id.clone(),
+                args: args.clone(),
+                signal: config
+                    .signal
+                    .as_ref()
+                    .map(|s| s.flag())
+                    .unwrap_or_default(),
+                ctx: ToolContext {
+                    cwd: context.cwd.clone(),
+                    env: context.env.clone(),
+                    session_id: context.session_id.clone(),
+                    state_dir: tool_state_dir(context, &tc.function.name),
+                },
+            }));
         }
+    }
+    let raws = futures_util::future::join_all(futures).await;
 
-        if let Some(note) =
-            crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key))
-        {
-            match result.content.iter_mut().find_map(|b| match b {
-                crate::ContentBlock::Text { text } => Some(text),
-                _ => None,
-            }) {
-                Some(text) => {
-                    text.push_str("\n\n[");
-                    text.push_str(&note);
-                    text.push(']');
+    // ---- Phase 3: sequential post-pass (record in declaration order) ----
+    let mut results = Vec::with_capacity(slots.len());
+    let mut cursor = raws.into_iter();
+    for slot in slots {
+        match slot {
+            Slot::Failed(result) => {
+                record_tool_result(config, emit, &mut results, result, true)?;
+            }
+            Slot::Ready {
+                tc,
+                args_key,
+                ..
+            } => {
+                // A tool-internal error becomes an error tool_result fed
+                // back to the LLM; the run continues instead of aborting.
+                let raw = match cursor.next().expect("join_all result per Ready slot") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!(tool = %tc.function.name, error = %msg, "tool execute error");
+                        crate::types::tool::ToolResult::error(msg)
+                    }
+                };
+
+                let mut result = ToolResultMessage {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.function.name.clone(),
+                    content: raw.content,
+                    is_error: raw.is_error,
+                    timestamp: crate::now(),
+                };
+
+                // after_tool_call hook: chain may replace the result (redact, etc.).
+                if let Some(h) = &config.hooks {
+                    result = h.after_tool_call(&tc.id, &result);
                 }
-                None => result
-                    .content
-                    .push(crate::ContentBlock::text(format!("[{note}]"))),
+
+                if let Some(note) =
+                    crate::guard::repeat_advisory(guard.observe(&tc.function.name, &args_key))
+                {
+                    match result.content.iter_mut().find_map(|b| match b {
+                        crate::ContentBlock::Text { text } => Some(text),
+                        _ => None,
+                    }) {
+                        Some(text) => {
+                            text.push_str("\n\n[");
+                            text.push_str(&note);
+                            text.push(']');
+                        }
+                        None => result
+                            .content
+                            .push(crate::ContentBlock::text(format!("[{note}]"))),
+                    }
+                }
+
+                let is_error = result.is_error;
+                record_tool_result(config, emit, &mut results, result, is_error)?;
+
+                tracing::info!(tool = %tc.function.name, is_error, "tool done");
             }
         }
-
-        let is_error = result.is_error;
-        record_tool_result(config, emit, &mut results, result, is_error)?;
-
-        tracing::info!(tool = %tc.function.name, is_error, "tool done");
     }
 
     Ok(results)
@@ -635,7 +706,6 @@ mod tests {
     use crate::StreamFn;
     use crate::ThinkingLevel;
     use futures_util::stream;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -650,7 +720,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[crate::types::tool::ToolDefinition],
-            _signal: Option<std::sync::Arc<AtomicBool>>,
+            _signal: Option<crate::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             Box::pin(stream::iter(self.0.clone()))
         }
@@ -939,7 +1009,7 @@ mod tests {
             messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[crate::types::tool::ToolDefinition],
-            _signal: Option<std::sync::Arc<AtomicBool>>,
+            _signal: Option<crate::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             self.seen.lock().unwrap().push(messages.to_vec());
             Box::pin(stream::iter(self.chunks.clone()))
@@ -1419,10 +1489,10 @@ mod tests {
             _messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[crate::types::tool::ToolDefinition],
-            signal: Option<std::sync::Arc<AtomicBool>>,
+            signal: Option<crate::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             if let Some(s) = signal {
-                s.store(true, std::sync::atomic::Ordering::Relaxed);
+                s.cancel();
             }
             Box::pin(stream::iter(vec![
                 StreamChunk::TextDelta("partial".into()),
@@ -1446,7 +1516,7 @@ mod tests {
             thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
-            signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
+            signal: Some(crate::CancelSignal::new()),
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
             persist: None,
@@ -1477,8 +1547,11 @@ mod tests {
 
     #[tokio::test]
     async fn loop_aborts_mid_tool_batch() {
-        // Two tool calls in one turn. The first (`set_abort`) flips the signal;
-        // the second (`echo`) must NOT execute.
+        // Two tool calls in one turn. The first (`set_abort`) cancels the
+        // signal mid-batch. Under concurrent execution BOTH calls were
+        // already dispatched, so both complete and record results in
+        // declaration order - what the abort must guarantee is that no
+        // further provider request happens afterwards.
         let set_abort = crate::types::tool::ToolDefinition {
             name: "set_abort".into(),
             label: "SetAbort".into(),
@@ -1504,24 +1577,44 @@ mod tests {
                 )
             }),
         };
-        let mut config = test_config(vec![
-            StreamChunk::ToolCallDelta {
-                index: None,
-                id: "t1".into(),
-                name: Some("set_abort".into()),
-                args_delta: "{}".into(),
-            },
-            StreamChunk::ToolCallDelta {
-                index: None,
-                id: "t2".into(),
-                name: Some("echo".into()),
-                args_delta: "{}".into(),
-            },
-            StreamChunk::Done,
-        ]);
-        config.signal = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            false,
-        )));
+        // Script comes from AbortScriptStream below; test_config only sets
+        // defaults.
+        let mut config = test_config(vec![]);
+        config.signal = Some(crate::CancelSignal::new());
+
+        // The provider must be consulted exactly once: the abort (raised
+        // during the tool batch) must stop the loop before a 2nd request.
+        struct AbortScriptStream(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl StreamFn for AbortScriptStream {
+            fn stream(
+                &self,
+                _model: &ModelSpec,
+                _messages: &[AgentMessage],
+                _system: &str,
+                _tools: &[ToolDefinition],
+                _signal: Option<crate::CancelSignal>,
+            ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(n, 0, "provider must not be polled again after abort");
+                Box::pin(futures_util::stream::iter(vec![
+                    StreamChunk::ToolCallDelta {
+                        index: None,
+                        id: "t1".into(),
+                        name: Some("set_abort".into()),
+                        args_delta: "{}".into(),
+                    },
+                    StreamChunk::ToolCallDelta {
+                        index: None,
+                        id: "t2".into(),
+                        name: Some("echo".into()),
+                        args_delta: "{}".into(),
+                    },
+                    StreamChunk::Done,
+                ]))
+            }
+        }
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        config.stream_fn = std::sync::Arc::new(AbortScriptStream(provider_calls.clone()));
 
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1535,6 +1628,11 @@ mod tests {
         let msgs = run_agent_loop(vec![], context, config, |_| {})
             .await
             .unwrap();
+        assert_eq!(
+            provider_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "abort must stop the loop before another provider request"
+        );
 
         let ran_set_abort = msgs
             .iter()
@@ -1546,7 +1644,94 @@ mod tests {
             ran_set_abort,
             "first tool should have executed before abort"
         );
-        assert!(!ran_echo, "second tool must not execute after abort");
+        // Concurrent batches run already-dispatched calls to completion so
+        // every declared call gets a result (no dangling tool_call).
+        assert!(
+            ran_echo,
+            "dispatched second tool must complete even after mid-batch abort"
+        );
+        // The abort must stop the LOOP, not the batch: no further provider
+        // request. run_agent_loop returned after the tool round, so the
+        // single scripted provider call above was the last one - the
+        // signal-carrying loop config is what enforced it.
+    }
+
+    #[tokio::test]
+    async fn tool_batch_runs_concurrently_and_records_in_declaration_order() {
+        // Three 150ms tools in one batch must overlap (total well under the
+        // 450ms serial floor), and their results must land in the session
+        // in declaration order despite intentionally staggered finish times.
+        let slow = |name: &'static str, delay_ms: u64| crate::types::tool::ToolDefinition {
+            name: name.into(),
+            label: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(move |_| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    Ok(crate::types::tool::ToolResult::text(name))
+                })
+            }),
+        };
+        // first is slowest on purpose: a serial recorder would see it finish
+        // last if it recorded at completion time instead of by slot order.
+        let tools = vec![
+            slow("first", 150),
+            slow("second", 90),
+            slow("third", 60),
+        ];
+
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("first".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t2".into(),
+                name: Some("second".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t3".into(),
+                name: Some("third".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        // The mock replays the same script every call; stop after the batch.
+        config.max_turns = 1;
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools,
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+
+        let started = std::time::Instant::now();
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let order: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr.tool_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["first", "second", "third"]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(420),
+            "three 150/90/60ms tools took {elapsed:?} - batch is not concurrent"
+        );
     }
 
     /// A mock that errors `failures` times, then replays `success`. Shares a
@@ -1563,7 +1748,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system_prompt: &str,
             _tools: &[crate::types::tool::ToolDefinition],
-            _signal: Option<std::sync::Arc<AtomicBool>>,
+            _signal: Option<crate::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < self.failures {
@@ -1754,9 +1939,9 @@ mod tests {
             _messages: &[AgentMessage],
             _system: &str,
             _tools: &[ToolDefinition],
-            _signal: Option<Arc<AtomicBool>>,
+            _signal: Option<crate::CancelSignal>,
         ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
-            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            let n = self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
                 n, 0,
                 "provider stream must not be polled after a pre-set abort"
@@ -1768,7 +1953,9 @@ mod tests {
     #[tokio::test]
     async fn pre_set_signal_aborts_before_provider_request() {
         let mut config = test_config(vec![]);
-        config.signal = Some(Arc::new(AtomicBool::new(true)));
+        let sig = crate::CancelSignal::new();
+        sig.cancel();
+        config.signal = Some(sig);
         config.stream_fn = Arc::new(PollCountingStream {
             polls: Default::default(),
         });

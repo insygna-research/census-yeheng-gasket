@@ -5,6 +5,7 @@
 //! host startup (optionally behind Cargo features). No dynamic library loading.
 
 pub mod agent_loop;
+pub mod cancel;
 pub mod error;
 pub mod extension;
 pub mod guard;
@@ -15,6 +16,7 @@ pub mod types;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub use agent_loop::{agent_loop, run_agent_loop};
+pub use cancel::CancelSignal;
 pub use error::{AgentError, ToolError};
 pub use extension::{ExtensionApi, ExtensionApiImpl};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};

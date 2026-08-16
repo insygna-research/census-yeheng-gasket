@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::cancel::CancelSignal;
 use crate::error::AgentError;
 use crate::types::message::{AgentMessage, ModelId};
 use crate::types::session_event::SessionEvent;
@@ -43,8 +43,10 @@ pub struct AgentLoopConfig {
     pub max_turns: usize,
     /// Hard ceiling on tool calls executed within a single turn. Default 20.
     pub max_tool_calls_per_turn: usize,
-    /// Cooperative abort: when set to true, the loop exits at the next safe point.
-    pub signal: Option<Arc<AtomicBool>>,
+    /// Cooperative abort: cancels the loop at the next safe point. Async
+    /// waiters (SSE download, approval waits) are woken the instant
+    /// [`CancelSignal::cancel`](crate::CancelSignal::cancel) fires - no polling.
+    pub signal: Option<CancelSignal>,
     /// The LLM call entry point. Injected by the host so the loop is
     /// provider-agnostic and testable with a mock.
     pub stream_fn: Arc<dyn StreamFn>,
@@ -245,7 +247,7 @@ pub trait StreamFn: Send + Sync {
         messages: &[crate::types::message::AgentMessage],
         system_prompt: &str,
         tools: &[ToolDefinition],
-        signal: Option<Arc<AtomicBool>>,
+        signal: Option<CancelSignal>,
     ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>>;
 }
 

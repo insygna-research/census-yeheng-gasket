@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use conga::{HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
+use conga::{CancelSignal, HookChain, RiskLevel, ToolCallVerdict, ToolResultMessage};
 use parking_lot::RwLock as PlRwLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -39,10 +39,11 @@ pub type Approver = Arc<
 pub struct PermissionPolicy {
     mode: AtomicU8,
     approver: Approver,
-    /// Shared abort flag (the Host's signal). When set while waiting on the
-    /// approver, the wait is abandoned — cancellation is centralized here
-    /// instead of trusting every approver to be cancel-aware.
-    signal: PlRwLock<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// Shared cancel signal (the Host's). When cancelled while waiting on
+    /// the approver, the wait is abandoned immediately (event-driven -
+    /// cancellation is centralized here instead of trusting every approver
+    /// to be cancel-aware).
+    signal: PlRwLock<Option<CancelSignal>>,
 }
 
 impl PermissionPolicy {
@@ -54,10 +55,10 @@ impl PermissionPolicy {
         }
     }
 
-    /// Attach the shared abort signal (the Host's). Call once after the Host
+    /// Attach the shared cancel signal (the Host's). Call once after the Host
     /// owning the signal is built; the policy is typically Arc-shared into
     /// the Host's hook chain before that point.
-    pub fn set_signal(&self, signal: Arc<std::sync::atomic::AtomicBool>) {
+    pub fn set_signal(&self, signal: CancelSignal) {
         *self.signal.write() = Some(signal);
     }
 
@@ -74,29 +75,29 @@ impl PermissionPolicy {
         }
     }
 
-    /// Poll the shared abort signal while the approver decides. The HookChain
-    /// contract requires human-blocking implementors to return promptly on
-    /// cancel; an approver parked on stdin or a dead WS client cannot.
+    /// Race the approver against cancellation. The HookChain contract
+    /// requires human-blocking implementors to return promptly on cancel;
+    /// an approver parked on stdin or a dead WS client cannot. The cancel
+    /// branch is watch-backed, so the verdict returns the instant
+    /// `cancel()` fires - no polling loop, no cancel latency.
     async fn await_approver(&self, name: &str, args: &serde_json::Value) -> ToolCallVerdict {
         let signal = self.signal.read().clone();
         let mut approver = std::pin::pin!((self.approver)(name, args));
-        loop {
-            if let Some(sig) = &signal {
-                if sig.load(Ordering::Relaxed) {
+        let allowed = match signal {
+            Some(sig) => tokio::select! {
+                biased;
+                _ = sig.cancelled() => {
+                    tracing::debug!("{name} approval wait cancelled");
                     return ToolCallVerdict::Block(format!("{name} aborted"));
                 }
-            }
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
-                allowed = &mut *approver => {
-                    return if allowed {
-                        ToolCallVerdict::Allow
-                    } else {
-                        ToolCallVerdict::Block(format!("{name} denied by user"))
-                    };
-                }
-            }
+                allowed = &mut *approver => allowed,
+            },
+            None => approver.await,
+        };
+        if allowed {
+            ToolCallVerdict::Allow
+        } else {
+            ToolCallVerdict::Block(format!("{name} denied by user"))
         }
     }
 }
@@ -235,22 +236,33 @@ mod tests {
     }
 
     /// P1-5 regression: an approver that never resolves must not out-wait the
-    /// abort signal — the verdict must return promptly with a Block("…aborted").
+    /// cancel signal - the verdict must return promptly (event-driven, no
+    /// poll interval) with a Block("…aborted").
     #[tokio::test]
     async fn approver_wait_is_cancel_aware() {
         let policy = PermissionPolicy::new(
             Mode::AutoEdit,
             Arc::new(|_n, _a| Box::pin(async { std::future::pending::<bool>().await })),
         );
-        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = CancelSignal::new();
         policy.set_signal(signal.clone());
 
-        signal.store(true, Ordering::Relaxed);
+        // Cancel while the (never-resolving) approver is parked: the wait
+        // must unwind within milliseconds, not on a poll deadline.
+        let verdicts = tokio::spawn(async move {
+            policy
+                .before_tool_call("2", "bash", &serde_json::json!({}), RiskLevel::High)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let started = std::time::Instant::now();
-        let verdict = policy
-            .before_tool_call("2", "bash", &serde_json::json!({}), RiskLevel::High)
-            .await;
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        signal.cancel();
+        let verdict = verdicts.await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "cancel must unwind the approval wait immediately, took {:?}",
+            started.elapsed()
+        );
         match verdict {
             ToolCallVerdict::Block(msg) => assert!(msg.contains("aborted"), "{msg}"),
             v => panic!("expected Block, got {v:?}"),

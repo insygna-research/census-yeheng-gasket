@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use conga::{
     derive_messages, repair_unanswered_tool_calls, AgentError, AgentEvent, AgentMessage,
-    CancelCause, ContentBlock, SessionEvent, StopReason, StreamFn, ToolDefinition, TurnEndReason,
-    UserMessage,
+    CancelCause, CancelSignal, ContentBlock, SessionEvent, StopReason, StreamFn, ToolDefinition,
+    TurnEndReason, UserMessage,
 };
 
 pub mod approval;
@@ -31,7 +31,7 @@ pub mod subagent_types;
 pub mod tools;
 pub mod wire;
 
-pub use assembly::{resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
+pub use assembly::{gather_tools, resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
 pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use conga::RiskLevel;
@@ -91,7 +91,7 @@ pub struct Host {
     session: SessionManager,
     policy: Arc<PermissionPolicy>,
     hooks: Arc<dyn conga::HookChain>,
-    signal: Arc<AtomicBool>,
+    signal: CancelSignal,
     stream_fn: Arc<dyn StreamFn>,
     system_prompt: String,
     tools: Vec<ToolDefinition>,
@@ -132,7 +132,7 @@ impl Host {
         let cwd = project_dir();
         Self {
             cwd,
-            signal: Arc::new(AtomicBool::new(false)),
+            signal: CancelSignal::new(),
             stream_fn: cfg.provider_stream_fn(),
             max_turns: cfg.tunables.max_turns,
             budget: ContextBudget::from_env(),
@@ -220,9 +220,10 @@ impl Host {
         &self.policy
     }
 
-    /// The shared abort flag. `install_ctrl_c` wants the Arc; callers that
-    /// only read/write the flag can deref it (`signal().load(…)`).
-    pub fn signal(&self) -> &Arc<AtomicBool> {
+    /// The shared cancel signal. `install_ctrl_c` wants a clone; readers
+    /// poll [`is_cancelled`](conga::CancelSignal::is_cancelled) cheaply,
+    /// async waiters use [`cancelled`](conga::CancelSignal::cancelled).
+    pub fn signal(&self) -> &CancelSignal {
         &self.signal
     }
 
@@ -322,7 +323,7 @@ impl Host {
                 message: e.to_string(),
             },
             Ok(msgs) => {
-                if self.signal.load(Ordering::Relaxed) {
+                if self.signal.is_cancelled() {
                     TurnEndReason::Aborted {
                         cause: Some(CancelCause::User),
                     }
@@ -383,16 +384,16 @@ pub struct TurnSummary {
     pub new_messages: Vec<AgentMessage>,
 }
 
-/// Install a SIGINT handler that sets `signal` true (cooperative abort).
-/// Every press is honored; callers reset the flag via
-/// [`run_turn`](Host::run_turn) or `signal().store(false, …)` before a turn.
-pub fn install_ctrl_c(signal: Arc<AtomicBool>) {
+/// Install a SIGINT handler that cancels `signal` (cooperative abort).
+/// Every press is honored; `Host::run_turn` resets the signal at the start
+/// of each turn (see [`HostConfig::prepare_turn`]).
+pub fn install_ctrl_c(signal: CancelSignal) {
     tokio::spawn(async move {
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 break; // handler could not be installed; give up quietly
             }
-            signal.store(true, Ordering::Relaxed);
+            signal.cancel();
         }
     });
 }
@@ -448,7 +449,7 @@ mod tests {
             vec![],
         );
         assert!(!host.session().current_id().is_empty());
-        assert!(!host.signal().load(Ordering::Relaxed));
+        assert!(!host.signal().is_cancelled());
 
         host.set_tools(vec![]); // compile check: setter exists
         let _ = host
@@ -470,7 +471,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system: &str,
             _tools: &[ToolDefinition],
-            _signal: Option<Arc<AtomicBool>>,
+            _signal: Option<conga::CancelSignal>,
         ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = conga::StreamChunk> + Send>>
         {
             unreachable!("not called in construction tests")
@@ -486,7 +487,7 @@ mod tests {
             _messages: &[AgentMessage],
             _system: &str,
             _tools: &[ToolDefinition],
-            _signal: Option<Arc<AtomicBool>>,
+            _signal: Option<conga::CancelSignal>,
         ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = conga::StreamChunk> + Send>>
         {
             Box::pin(futures_util::stream::pending())
@@ -520,7 +521,7 @@ mod tests {
             _: &[AgentMessage],
             _: &str,
             _: &[ToolDefinition],
-            _: Option<Arc<AtomicBool>>,
+            _: Option<conga::CancelSignal>,
         ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = conga::StreamChunk> + Send>>
         {
             Box::pin(futures_util::stream::iter([

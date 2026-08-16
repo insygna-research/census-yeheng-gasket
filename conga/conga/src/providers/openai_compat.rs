@@ -8,8 +8,8 @@
 //! parsing differ.
 
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+
+use crate::cancel::CancelSignal;
 
 use futures_util::Stream;
 use serde_json::json;
@@ -71,7 +71,7 @@ impl StreamFn for OpenAiCompat {
         messages: &[AgentMessage],
         system_prompt: &str,
         tools: &[ToolDefinition],
-        signal: Option<Arc<AtomicBool>>,
+        signal: Option<CancelSignal>,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let body = build_request_body(model, messages, system_prompt, tools);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));

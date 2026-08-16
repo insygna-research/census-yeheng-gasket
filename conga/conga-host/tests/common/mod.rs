@@ -4,8 +4,6 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use conga::{AgentMessage, ModelSpec, StreamChunk, StreamFn, ToolDefinition};
 use parking_lot::Mutex;
@@ -47,7 +45,7 @@ impl StreamFn for FakeStream {
         messages: &[AgentMessage],
         _system: &str,
         _tools: &[ToolDefinition],
-        _signal: Option<Arc<AtomicBool>>,
+        _signal: Option<conga::CancelSignal>,
     ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
         self.seen.lock().push(messages.to_vec());
         let chunks = self.scripts.lock().pop_front().expect(

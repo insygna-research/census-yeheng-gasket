@@ -82,7 +82,7 @@ impl StreamFn for MockThatCallsHello {
         _messages: &[AgentMessage],
         _system: &str,
         _tools: &[conga::ToolDefinition],
-        _signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        _signal: Option<conga::CancelSignal>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         Box::pin(futures_util::stream::iter(vec![
             StreamChunk::ToolCallDelta {

@@ -19,7 +19,7 @@ impl StreamFn for CallToolOnce {
         _messages: &[AgentMessage],
         _system: &str,
         _tools: &[ToolDefinition],
-        _signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+        _signal: Option<conga::CancelSignal>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         let tool = self.tool.clone();
         let args_str = self.args.to_string();
