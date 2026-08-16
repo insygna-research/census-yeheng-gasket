@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/subagent-orchestration.sequence.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/subagent-orchestration.sequence.html",
     "sha256": "94dd952fe0c9ba2f805007a7c4f1bdf1826fb469e479b7af899c3af0a3acf4d2",
     "bytes": 638544
   },

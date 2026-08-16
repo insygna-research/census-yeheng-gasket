@@ -1,40 +1,40 @@
-# gasket 架构设计
+# conga 架构设计
 
-> 对应 workspace 版本 `2.0.0` · 仓库 [YeHeng/gasket](https://github.com/YeHeng/gasket) · MIT
+> 对应 workspace 版本 `2.0.0` · 仓库 [YeHeng/conga](https://github.com/YeHeng/conga) · MIT
 >
-> 本文面向想理解 gasket 内部结构、做二次开发或集成的工程师。若只想安装使用,请阅读 [使用文档](./usage.md)。
+> 本文面向想理解 conga 内部结构、做二次开发或集成的工程师。若只想安装使用,请阅读 [使用文档](./usage.md)。
 
 ---
 
-## 1. gasket 是什么
+## 1. conga 是什么
 
-gasket 是一个**轻量级、可自托管的个人 AI 助手框架**(自述:*"A lightweight personal AI assistant framework"*)。它把"一个能调用工具、能流式输出、能管理会话与权限的 LLM agent"做成了分层可复用的 Rust 工作区,并配有一个 Vue 3 的 Web / 桌面前端。
+conga 是一个**轻量级、可自托管的个人 AI 助手框架**(自述:*"A lightweight personal AI assistant framework"*)。它把"一个能调用工具、能流式输出、能管理会话与权限的 LLM agent"做成了分层可复用的 Rust 工作区,并配有一个 Vue 3 的 Web / 桌面前端。
 
 关键词(workspace `Cargo.toml`):`ai / agent / chatbot / llm`。
 
 ### 设计哲学
 
-gasket 的内核借鉴 "pi-style" 的可插拔 agent 设计,核心有三条原则,贯穿整个代码库:
+conga 的内核借鉴 "pi-style" 的可插拔 agent 设计,核心有三条原则,贯穿整个代码库:
 
 | 原则 | 含义 | 体现在 |
 |---|---|---|
 | **loop 是无状态纯函数** | agent 推理循环不持有状态,状态全部由上层 host 持有 | `agent_loop` 只接收 `AgentContext` + `AgentLoopConfig`,返回新消息 |
 | **provider 通过依赖注入接入** | 内核不知道"具体哪家 LLM",只认一个 `StreamFn` trait | `AgentLoopConfig.stream_fn` |
-| **插件用进程内 Rust crate,而非动态加载** | 额外工具 / hook 由扩展 crate 在启动时 `register`,可选挂 Cargo feature | `gasket-ext` + `ExtensionApi` |
+| **插件用进程内 Rust crate,而非动态加载** | 额外工具 / hook 由扩展 crate 在启动时 `register`,可选挂 Cargo feature | `conga-ext` + `ExtensionApi` |
 
-> 这三条决定了 gasket 的可测试性(注入 mock provider)、可复用性(同一套 host 同时驱动 CLI 和 Web 网关)和可扩展性(加工具不必改内核)。
+> 这三条决定了 conga 的可测试性(注入 mock provider)、可复用性(同一套 host 同时驱动 CLI 和 Web 网关)和可扩展性(加工具不必改内核)。
 
 ---
 
 ## 2. 顶层架构与 Crate 分层
 
-gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,呈"内核 → 宿主 → 前端壳"的严格分层。
+conga 后端是一个 Cargo workspace(`conga/Cargo.toml`),包含 5 个 crate,呈"内核 → 宿主 → 前端壳"的严格分层。
 
 ### 依赖关系图
 
 ```
                          ┌──────────────────────────────────────────┐
-                         │            gasket-core (内核)             │
+                         │            conga (内核)             │
                          │  agent_loop · types · tools · providers   │
                          │  extension · storage                      │
                          └────────────────────┬─────────────────────┘
@@ -42,7 +42,7 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
                 ┌─────────────────────────────┴──────────────────────────┐
                 ▼                                                          ▼
    ┌─────────────────────┐                                       ┌────────────────────┐
-   │    gasket-host      │                                       │    gasket-ext      │
+   │    conga-host      │                                       │    conga-ext      │
    │ config · session    │                                       │  hello · todo      │
    │ permission · compact│                                       │  search            │
    │ hooks · external    │
@@ -51,7 +51,7 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
    ┌──────────┴──────────────────────┐                                     │
    ▼                                 ▼                                     ▼
 ┌──────────────────┐         ┌──────────────────┐               ┌──────────────────┐
-│  gasket-gateway  │         │   gasket-cli     │◄──────────────┘  ext feature
+│  conga-gateway  │         │   conga-cli     │◄──────────────┘  ext feature
 │ (bin, WS 网关)   │         │  (bin, REPL)     │
 │ core + host      │         │ host + core      │
 └──────────────────┘         └──────────────────┘
@@ -68,13 +68,13 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
 
 | crate | 类型 | 职责 | 关键依赖 |
 |---|---|---|---|
-| **`gasket-core`** | lib(`gasket_core`) | 内核:agent loop、消息/事件/工具类型、内置工具、LLM provider、扩展 API、JSONL 存储。**无内部依赖** | reqwest、ignore、glob、regex、async-stream |
-| **`gasket-host`** | lib | 可复用宿主层:配置加载、会话管理、权限策略、hook 组合、上下文压缩、外部工具桥接、事件渲染。把 loop 装进一个 `Host` 驱动器 | `gasket-core` |
-| **`gasket-ext`** | lib | 可选的进程内扩展 crate(`hello`/`todo`/`search`/`permission_gate`),启动时经 `ExtensionApi` 注册工具与 hook | `gasket-core` |
-| **`gasket-gateway`** | bin(`gasket-gateway`) | WebSocket 网关服务器,把 Vue 前端桥接到 agent loop,并提供 REST 上下文接口 + 托管前端静态资源 | `gasket-core` + `gasket-host`、axum |
-| **`gasket-cli`** | bin(`gasket`) | 交互式终端 REPL agent,每行输入调一次 `run_turn`。带斜杠命令 | `gasket-host` + `gasket-core` + 可选 `gasket-ext`、reedline |
+| **`conga`** | lib(`conga`) | 内核:agent loop、消息/事件/工具类型、内置工具、LLM provider、扩展 API、JSONL 存储。**无内部依赖** | reqwest、ignore、glob、regex、async-stream |
+| **`conga-host`** | lib | 可复用宿主层:配置加载、会话管理、权限策略、hook 组合、上下文压缩、外部工具桥接、事件渲染。把 loop 装进一个 `Host` 驱动器 | `conga` |
+| **`conga-ext`** | lib | 可选的进程内扩展 crate(`hello`/`todo`/`search`/`permission_gate`),启动时经 `ExtensionApi` 注册工具与 hook | `conga` |
+| **`conga-gateway`** | bin(`conga-gateway`) | WebSocket 网关服务器,把 Vue 前端桥接到 agent loop,并提供 REST 上下文接口 + 托管前端静态资源 | `conga` + `conga-host`、axum |
+| **`conga-cli`** | bin(`conga`) | 交互式终端 REPL agent,每行输入调一次 `run_turn`。带斜杠命令 | `conga-host` + `conga` + 可选 `conga-ext`、reedline |
 
-> **两个二进制要分清**:包名是 `gasket-cli`,但产出的二进制名是 **`gasket`**;另一个二进制是 **`gasket-gateway`**。
+> **两个二进制要分清**:包名是 `conga-cli`,但产出的二进制名是 **`conga`**;另一个二进制是 **`conga-gateway`**。
 
 ### 分层原则
 
@@ -88,7 +88,7 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
 
 | 概念 | 定义 | 代码位置 |
 |---|---|---|
-| **Session** | 一次连续对话,对应磁盘上 `~/.gasket/sessions/<id>/events.jsonl` 的一份 append-only 事件日志(唯一真相源) | `host/src/session.rs`(`SessionManager`) |
+| **Session** | 一次连续对话,对应磁盘上 `~/.conga/sessions/<id>/events.jsonl` 的一份 append-only 事件日志(唯一真相源) | `host/src/session.rs`(`SessionManager`) |
 | **SessionEvent** | 事件日志的追加写词汇表:`TurnStart` / `User` / `Assistant{message,usage}` / `ToolResult` / `TurnEnd{reason}` | `core/src/types/session_event.rs:15` |
 | **derive_messages** | 纯投影:事件日志 → 模型可见消息列表(`TurnStart`/`TurnEnd` 不产出消息) | `core/src/types/session_event.rs:69` |
 | **EventStorage** | `events.jsonl` 的追加写 / 读取存储:`O_APPEND` 单次 `write_all`、torn-tail 自愈、未知变体 fail-closed、原子批量安装(tmp+rename) | `core/src/storage/mod.rs:323` |
@@ -98,13 +98,13 @@ gasket 后端是一个 Cargo workspace(`gasket/Cargo.toml`),包含 5 个 crate,�
 | **Hook** | 围绕每次工具调用的拦截器:`before_tool_call` 可 Allow/Block/Modify,`after_tool_call` 可改写结果(如脱敏) | `core/src/types/tool.rs`(`HookChain`) |
 | **Provider** | 一个实现了 `StreamFn` 的 LLM 客户端;内核只认这个 trait,不认具体厂商 | `core/src/providers/mod.rs` |
 | **Compaction** | 在喂给 LLM 之前**压缩工作内存**(只缩内存、日志仍是 append-only 全量);预算从日志尾部恢复 | `host/src/compact.rs`(`ContextBudget`) |
-| **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS;历史按需从日志 `derive_messages` | `gasket-gateway/src/ws.rs` |
+| **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS;历史按需从日志 `derive_messages` | `conga-gateway/src/ws.rs` |
 
 ---
 
 ## 4. 请求生命周期(数据流)
 
-gasket 有两条入口路径,但都汇聚到同一个 `Host::run_turn` → `run_agent_loop`。
+conga 有两条入口路径,但都汇聚到同一个 `Host::run_turn` → `run_agent_loop`。
 
 ### 4.1 共同内核:`run_turn`
 
@@ -158,7 +158,7 @@ host.run_turn(user_msg, |ev| {
 ### 4.3 内核循环:`run_agent_loop` 单轮结构
 
 ```
-for turn in 0..max_turns {                       ← 外层循环,受 GASKET_MAX_TURNS 限制
+for turn in 0..max_turns {                       ← 外层循环,受 CONGA_MAX_TURNS 限制
     若 signal 被置位 → 协作式中止,返回已累积的 partial transcript
 
     stream = stream_fn.stream(model, messages, system_prompt, tools, signal)
@@ -191,7 +191,7 @@ on_event(AgentEnd);  返回本轮新增消息
 
 ```
 浏览器/桌面端 ──WS──► /ws?user_id=<chatId>
-   │  每条 WS 连接 = 一个 session (gasket-gateway/src/ws.rs)
+   │  每条 WS 连接 = 一个 session (conga-gateway/src/ws.rs)
    ▼
 收到 {"type":"message","content":"...","trace_id":"..."}
    │  内联 host.run_turn(select! 多路复用事件转发 + cancel/approval)
@@ -206,13 +206,13 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ---
 
-## 5. gasket-core 内核详解
+## 5. conga 内核详解
 
 内核导出见 `core/src/lib.rs`。
 
 ### 准入标准:什么才进 core
 
-一个能力想进入 `gasket-core`,先过三问;任何一问答不上来,它就属于 `host`、`ext` 或某个 feature 之后:
+一个能力想进入 `conga`,先过三问;任何一问答不上来,它就属于 `host`、`ext` 或某个 feature 之后:
 
 | # | 问题 | 判据 |
 |---|---|---|
@@ -220,7 +220,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | 2 | **依赖代价是什么?** | 零新增依赖直接进;重依赖必须 opt-in feature 且默认关闭(如 Linux Landlock → `sandbox-landlock`),默认构建零影响 |
 | 3 | **持有的是什么状态?** | 配置状态(可注入、无资源持有,如 `proxy.rs` 的 override、`guard.rs` 的重复计数)可以进 core;资源状态(进程句柄、连接池、会话注册表、可重建的派生数据)属于宿主或扩展层 |
 
-先例:PTY 会话注册表是进程状态 → 整个 `terminal` 工具住 `gasket-ext` feature 之后;FTS5 索引是可重建派生数据 → 引擎住 `gasket-host` feature 之后;Landlock 是重依赖 → core 内 feature 之后,且无 feature 时 fail-closed。
+先例:PTY 会话注册表是进程状态 → 整个 `terminal` 工具住 `conga-ext` feature 之后;FTS5 索引是可重建派生数据 → 引擎住 `conga-host` feature 之后;Landlock 是重依赖 → core 内 feature 之后,且无 feature 时 fail-closed。
 
 ### 5.1 类型系统(`types/`)
 
@@ -260,16 +260,16 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `fetch` | `tools/fetch.rs` | HTTP GET URL,HTML 转可读 markdown 文本(30s 超时,200KB 截断) | Low |
 | `spawn_subagents` | `tools/subagent.rs` | 并行子 agent 编排(maxItems 5,见 §11) | Medium |
 
-工具执行闭包签名(`ToolFn`):`Arc<dyn Fn(ToolCallCtx) -> Future<Output=Result<ToolResult,ToolError>>>`。`ToolContext.state_dir`(`~/.gasket/tool_state/<session>/<tool>/`)是每个工具的**私有**状态目录;`ToolCallCtx.aborted()` 用于长循环里协作式中止。
+工具执行闭包签名(`ToolFn`):`Arc<dyn Fn(ToolCallCtx) -> Future<Output=Result<ToolResult,ToolError>>>`。`ToolContext.state_dir`(`~/.conga/tool_state/<session>/<tool>/`)是每个工具的**私有**状态目录;`ToolCallCtx.aborted()` 用于长循环里协作式中止。
 
 ### 5.3 LLM Provider(`providers/`)
 
-- **`ProviderConfig`**(`providers/mod.rs:26`):从环境读取连接配置。必填 `GASKET_LLM_BASE_URL` / `GASKET_LLM_KEY` / `GASKET_LLM_MODEL`;`GASKET_LLM_API` 选 `openai`(默认)或 `anthropic`。
+- **`ProviderConfig`**(`providers/mod.rs:26`):从环境读取连接配置。必填 `CONGA_LLM_BASE_URL` / `CONGA_LLM_KEY` / `CONGA_LLM_MODEL`;`CONGA_LLM_API` 选 `openai`(默认)或 `anthropic`。
 - **两个实现**,都实现 `StreamFn`:
   - `OpenAiCompat`(`openai_compat.rs`):OpenAI 兼容协议——DeepSeek、智谱、xAI、Groq、Ollama、vLLM 等。
   - `AnthropicProvider`(`anthropic.rs`):Anthropic 原生 messages API。
 - **`sse.rs`**:SSE 流解析,把 HTTP chunk 流切成 `StreamChunk`。
-- **代理**:支持 `GASKET_LLM_PROXY`(http+https 通吃)/ `GASKET_LLM_HTTP_PROXY` / `GASKET_LLM_HTTPS_PROXY`,按 scheme 取优先级。
+- **代理**:支持 `CONGA_LLM_PROXY`(http+https 通吃)/ `CONGA_LLM_HTTP_PROXY` / `CONGA_LLM_HTTPS_PROXY`,按 scheme 取优先级。
 
 ### 5.4 扩展 API(`extension/`)
 
@@ -296,11 +296,11 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 |---|---|---|
 | `proxy.rs` | fetch / web_search 等工具出站 HTTP 流量的运行时可配代理 | `set_tool_proxy` / `tool_proxy` / `validate_tool_proxy` / `apply_tool_proxy` |
 
-优先级:**进程内 override(桌面 UI 设置)> `GASKET_TOOL_PROXY` env > 无代理**。支持 scheme:http / https / socks5 / socks5h(可内嵌 `user:pass@`)。env 值非法时 **fail-open**(warn 后直连,不阻断工具);日志中凭据经 `redact` 脱敏(`http://***@proxy:8080`)。与 §5.3 的 LLM 代理(`GASKET_LLM_PROXY`)互不影响——一个管工具流量,一个管模型 API 流量。
+优先级:**进程内 override(桌面 UI 设置)> `CONGA_TOOL_PROXY` env > 无代理**。支持 scheme:http / https / socks5 / socks5h(可内嵌 `user:pass@`)。env 值非法时 **fail-open**(warn 后直连,不阻断工具);日志中凭据经 `redact` 脱敏(`http://***@proxy:8080`)。与 §5.3 的 LLM 代理(`CONGA_LLM_PROXY`)互不影响——一个管工具流量,一个管模型 API 流量。
 
 ---
 
-## 6. gasket-host 宿主层详解
+## 6. conga-host 宿主层详解
 
 宿主层把内核的"无状态循环"包装成一个有状态、可复用的驱动器,目录 `host/src/`。
 
@@ -324,7 +324,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `permission.rs` | 权限策略:三档 `Mode` × 工具 `RiskLevel` 决策,内部持 approver 回调 | `Mode` / `PermissionPolicy` |
 | `hooks.rs` | 把多个 `HookChain` 串成栈;`before` 取首个 Block / 末个 Modify,`after` 链式改写 | `HookStack` |
 | `compact.rs` | 上下文压缩(见第 9 章) | `ContextBudget` / `compact_by_count` |
-| `external_tool.rs` | 从 `GASKET_EXTERNAL_TOOLS` 白名单加载外部命令工具 | `ExternalToolBridge` / `commands_from_env` / `load_all` |
+| `external_tool.rs` | 从 `CONGA_EXTERNAL_TOOLS` 白名单加载外部命令工具 | `ExternalToolBridge` / `commands_from_env` / `load_all` |
 | `mcp.rs` | MCP(Model Context Protocol)客户端:连接外部 MCP 工具服务器(stdio),握手 → tools/list → tools/call | `McpBridge` / `load_all_mcp` / `McpServerConfig` |
 | `printer.rs` | 把 `AgentEvent` 渲染到终端(含 Error 分支与 flush) | `EventPrinter` |
 | `wire.rs` | 出站 wire 协议类型(`OutgoingEvent`):`thinking`/`tool_start`/`tool_end`/`content`/`error`/`done`/`busy`/`approval_request` 的 JSON schema,网关与桌面端共用 | `OutgoingEvent` |
@@ -338,9 +338,9 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ---
 
-## 7. gasket-gateway 网关详解
+## 7. conga-gateway 网关详解
 
-网关(`gasket-gateway/src/`)是前端与内核之间的桥,基于 axum。自有模块仅 4 个:`main`(路由/启动)、`state`(共享 `AppState`)、`ws`(WS 连接处理)、`api`(REST);另有 `wire.rs`(仅入站协议类型)。出站 wire 协议(`OutgoingEvent`)、`AgentEvent`→WS JSON 映射(`event_map`)与审批登记(`approval`)都复用 **gasket-host** 的模块(见 §6.2),桌面端走同一份实现。
+网关(`conga-gateway/src/`)是前端与内核之间的桥,基于 axum。自有模块仅 4 个:`main`(路由/启动)、`state`(共享 `AppState`)、`ws`(WS 连接处理)、`api`(REST);另有 `wire.rs`(仅入站协议类型)。出站 wire 协议(`OutgoingEvent`)、`AgentEvent`→WS JSON 映射(`event_map`)与审批登记(`approval`)都复用 **conga-host** 的模块(见 §6.2),桌面端走同一份实现。
 
 ### 7.1 启动与路由(`main.rs`)
 
@@ -359,7 +359,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `/api/sessions/{key}` | DELETE | 删除会话 |
 | *(fallback)* | — | 托管 `web/dist` 静态资源,SPA 回退到 `index.html` |
 
-- 端口 `GASKET_GATEWAY_PORT`(默认 **3000**),监听 `0.0.0.0`;静态目录 `GASKET_GATEWAY_STATIC_DIR`(默认 `../web/dist`);CORS 放开。
+- 端口 `CONGA_GATEWAY_PORT`(默认 **3000**),监听 `0.0.0.0`;静态目录 `CONGA_GATEWAY_STATIC_DIR`(默认 `../web/dist`);CORS 放开。
 
 ### 7.2 连接模型(每连接一会话)
 
@@ -389,7 +389,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `approval_request` | `id`,`tool_name`,`description`,`arguments` | 请求人工审批 |
 | `subagent_*`(10 种) | — | ✅ **已实现**:子 agent 编排(`spawn_subagents` 工具)触发,网关经 `event_map::subagent_event_to_ws` 转发,前端 `SubagentThoughtsPanel` 渲染(见 §11) |
 
-### 7.4 审批(`gasket-host/src/approval.rs`)
+### 7.4 审批(`conga-host/src/approval.rs`)
 
 `ApprovalRegistry` 登记在途审批并维护 "remember" 缓存。`wait_for_decision` 用 **oneshot(用户决策)/ cancel(中止)/ 超时**三路 `select` 等待,避免闩锁毒化——`approval.rs` 内有专门的回归测试覆盖。
 
@@ -414,7 +414,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ### 8.3 三档权限模式 × 三档风险
 
-`Mode`(`host/src/permission.rs`):`Suggest` / `AutoEdit` / `FullAuto`,配合 approver 回调决定每个工具调用是自动放行、提示审批、还是直接阻断。默认值因入口而异:CLI 默认 `AutoEdit`(`--mode=` 可改),gateway 默认 `auto-edit`(`GASKET_GATEWAY_MODE`,见 ws.rs)。
+`Mode`(`host/src/permission.rs`):`Suggest` / `AutoEdit` / `FullAuto`,配合 approver 回调决定每个工具调用是自动放行、提示审批、还是直接阻断。默认值因入口而异:CLI 默认 `AutoEdit`(`--mode=` 可改),gateway 默认 `auto-edit`(`CONGA_GATEWAY_MODE`,见 ws.rs)。
 
 典型决策矩阵(语义,具体以代码为准):
 
@@ -432,7 +432,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 压缩是**纯宿主策略**(`host/src/compact.rs`),目的是在喂给 LLM 前缩小工作 transcript。三个硬约束:
 
-1. **只缩内存,不改盘**——`~/.gasket/sessions/<id>/events.jsonl` 始终是 append-only 事件日志,压缩只作用于本次喂给 LLM 的 `history`(每轮现派生)。
+1. **只缩内存,不改盘**——`~/.conga/sessions/<id>/events.jsonl` 始终是 append-only 事件日志,压缩只作用于本次喂给 LLM 的 `history`(每轮现派生)。
 2. **无 LLM 摘要**——不调用模型做总结,只做"丢弃最旧的若干组 + 前置一条 `[compacted N earlier messages]` 提示"。
 3. **永不切断 tool_call ↔ result**——见 `atomic_groups`。
 
@@ -445,7 +445,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | 模式 | 触发 | 实现 |
 |---|---|---|
 | **Token 感知(主)** | provider 上报的 `usage.input_tokens` 超过 `window` 的 `threshold_pct`(默认 80%)时触发;压缩后留到 `target_pct`(默认 50%)——**带滞后**,避免在阈值附近反复压缩 | `ContextBudget`(`compact.rs:122`) |
-| **条数兜底** | 当尚无 usage 数据(`last_input_tokens==0`)时,按消息条数 `GASKET_COMPACT_MAX_MESSAGES`(默认 80)压缩 | `compact_by_count`(`compact.rs:56`) |
+| **条数兜底** | 当尚无 usage 数据(`last_input_tokens==0`)时,按消息条数 `CONGA_COMPACT_MAX_MESSAGES`(默认 80)压缩 | `compact_by_count`(`compact.rs:56`) |
 
 `ContextBudget::compact` 在超阈值时,按 `target = messages.len() * target_pct / 100` 算出保留消息数,复用 `compact_by_count`(贪心保留最新整组 + 前置提示)。**一套算法,两个触发器**:token 感知(主)和条数兜底。无 tokenizer,不假装建模 per-message token 成本。
 
@@ -489,14 +489,14 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 **关键事实**:Tauri 桌面端有**两种传输模式**,前端通过 `isTauri`(检查 `window.__TAURI_INTERNALS__`)在运行时自动切换:
 
-- **浏览器模式**:经 `ws://<host>:3000` 的 WS/HTTP 与独立部署的 gasket-gateway 通信。
+- **浏览器模式**:经 `ws://<host>:3000` 的 WS/HTTP 与独立部署的 conga-gateway 通信。
 - **桌面模式**:经 Tauri IPC(`invoke` + `chat-event` 监听)与 `src-tauri/src/chat.rs` 中的进程内 Host 通信,无需独立 gateway 进程。
 
-桌面端共 11 个 `#[tauri::command]`:`chat.rs` 4 个(`send_message`、`cancel_turn`、`approval_response`、`get_context`),`lib.rs` 7 个(`list_sessions`、`get_session_messages`、`rename_session`、`delete_session`、`get_app_config`、`set_app_config`、`validate_proxy`)。前 8 个与 gateway 的 WS 消息类型和 REST 端点一一对应,确保前端逻辑共享;`validate_proxy` 在 UI 保存工具代理 URL 前按与 `gasket_core::set_tool_proxy` 相同的规则校验(前端 `NetworkProxyDialog.vue` 弹窗,对应 §5.6 的运行时出站工具代理)。每个 session 拥有一个进程内 Host 实例(与 gateway 的 per-connection Host 完全一致:同一 config loader、system prompt、tool set、sub-agent wiring),事件经单一有序 IPC 通道(`WireEvent` 枚举 -> emitter task -> `app.emit`)流回前端。
+桌面端共 11 个 `#[tauri::command]`:`chat.rs` 4 个(`send_message`、`cancel_turn`、`approval_response`、`get_context`),`lib.rs` 7 个(`list_sessions`、`get_session_messages`、`rename_session`、`delete_session`、`get_app_config`、`set_app_config`、`validate_proxy`)。前 8 个与 gateway 的 WS 消息类型和 REST 端点一一对应,确保前端逻辑共享;`validate_proxy` 在 UI 保存工具代理 URL 前按与 `conga::set_tool_proxy` 相同的规则校验(前端 `NetworkProxyDialog.vue` 弹窗,对应 §5.6 的运行时出站工具代理)。每个 session 拥有一个进程内 Host 实例(与 gateway 的 per-connection Host 完全一致:同一 config loader、system prompt、tool set、sub-agent wiring),事件经单一有序 IPC 通道(`WireEvent` 枚举 -> emitter task -> `app.emit`)流回前端。
 
-**持久化完全由 Rust 后端拥有,桌面端不使用 localStorage**:会话记录由 Host 的 `persist_fn` 逐事件追加到 `~/.gasket/sessions/{id}/events.jsonl`(append-only JSONL),显示名经 `rename_session` 原子写 `meta.json` 侧车,会话列表来自 `list_sessions`,删除即 `delete_session`——前端 chatStore 不再本地缓存任何会话记录。app 配置(主题、侧栏状态)由 `lib.rs` 的 `get_app_config`/`set_app_config` 读写 `~/.gasket/app_config.json`(tmp+rename 原子写):前端 `storage.ts` 是内存 KV,桌面模式启动时(`initStorage`,在动态 import 应用模块图之前执行,避免 useTheme 模块级初始化竞争)从后端载入,写入防抖落盘。浏览器模式(无内嵌后端)仍以 localStorage 为持久层,同一套 `storage.ts` 接口写透。
+**持久化完全由 Rust 后端拥有,桌面端不使用 localStorage**:会话记录由 Host 的 `persist_fn` 逐事件追加到 `~/.conga/sessions/{id}/events.jsonl`(append-only JSONL),显示名经 `rename_session` 原子写 `meta.json` 侧车,会话列表来自 `list_sessions`,删除即 `delete_session`——前端 chatStore 不再本地缓存任何会话记录。app 配置(主题、侧栏状态)由 `lib.rs` 的 `get_app_config`/`set_app_config` 读写 `~/.conga/app_config.json`(tmp+rename 原子写):前端 `storage.ts` 是内存 KV,桌面模式启动时(`initStorage`,在动态 import 应用模块图之前执行,避免 useTheme 模块级初始化竞争)从后端载入,写入防抖落盘。浏览器模式(无内嵌后端)仍以 localStorage 为持久层,同一套 `storage.ts` 接口写透。
 
-> **部署含义**:浏览器模式需要独立 gateway;桌面模式自包含(进程内 Host 直接做推理),但桌面端仍需 LLM API key 和 `~/.gasket` 配置。
+> **部署含义**:浏览器模式需要独立 gateway;桌面模式自包含(进程内 Host 直接做推理),但桌面端仍需 LLM API key 和 `~/.conga` 配置。
 
 ### 10.3 项目结构(`web/src/`)
 
@@ -560,9 +560,9 @@ src/
 
 | 层 | 载体 | 职责 | 持久化 |
 |---|---|---|---|
-| 持久聊天域 | Pinia `chatStore` | 所有聊天/消息/工具调用/子 agent CRUD | 不本地持久化——会话由 Rust 后端拥有(桌面 `~/.gasket/sessions/`,浏览器经 gateway 同一盘),前端经 REST/IPC 读写(见 §10.2) |
+| 持久聊天域 | Pinia `chatStore` | 所有聊天/消息/工具调用/子 agent CRUD | 不本地持久化——会话由 Rust 后端拥有(桌面 `~/.conga/sessions/`,浏览器经 gateway 同一盘),前端经 REST/IPC 读写(见 §10.2) |
 | 瞬时会话 | `useChatSession`(每聊天一个) | 连接状态机(`disconnected\|idle\|sending\|receiving`)、审批队列、子 agent 跟踪、5 分钟超时兜底 | 不持久化 |
-| 主题 | `useTheme`(**模块级单例**,非 Pinia) | 亮/暗、5 色相、12 种 Markdown 风格 | `storage.ts` 偏好 KV:桌面同步 `~/.gasket/app_config.json`,浏览器 `localStorage`(键 `gasket_theme_v2` 等,见 §10.2) |
+| 主题 | `useTheme`(**模块级单例**,非 Pinia) | 亮/暗、5 色相、12 种 Markdown 风格 | `storage.ts` 偏好 KV:桌面同步 `~/.conga/app_config.json`,浏览器 `localStorage`(键 `conga_theme_v2` 等,见 §10.2) |
 
 > 主题用自定义 `th-*` 工具类(`th-app-bg`/`th-text`/`th-border`/`th-gradient-brand`...)代替原始 Tailwind 配色,整张调色板可经 CSS 变量 + `data-hue`/`data-md-style` 属性整体切换。
 
@@ -576,15 +576,15 @@ src/
 
 ---
 
-## 11. 扩展机制(gasket-ext)
+## 11. 扩展机制(conga-ext)
 
-`gasket-ext` 是可选的进程内扩展 crate,启动时经 `ExtensionApi` 注册工具与 hook:
+`conga-ext` 是可选的进程内扩展 crate,启动时经 `ExtensionApi` 注册工具与 hook:
 
 - `register_all(&mut api)` 把 `hello` / `todo` / `search` / `permission_gate` 注册进去。
 - CLI 通过 Cargo feature `ext`(`--features ext`)链接它;gateway 可类似接入。
 - **事件 vs hook**:事件是纯观察(emit 闭包),hook 返回 verdict 控制流程,二者在类型层不可混淆(见 5.4)。
-- 搜索扩展(`search.rs`)支持多家 provider:Brave / Tavily / **Serper(默认)** / SerpAPI / Exa / Firecrawl / DuckDuckGo,由 `GASKET_SEARCH_PROVIDER` + 对应 `*_API_KEY` 选择。
-- **桌面 App 链接 gasket-ext**:`web/src-tauri/src/chat.rs` 把 `gasket_ext::search` 注册的 `web_search` 加入每个 session 的 tool set(`chat.rs:321-329`),其 HTTP client 遵守运行时工具代理(`gasket_core::apply_tool_proxy`,见 §5.6)。
+- 搜索扩展(`search.rs`)支持多家 provider:Brave / Tavily / **Serper(默认)** / SerpAPI / Exa / Firecrawl / DuckDuckGo,由 `CONGA_SEARCH_PROVIDER` + 对应 `*_API_KEY` 选择。
+- **桌面 App 链接 conga-ext**:`web/src-tauri/src/chat.rs` 把 `conga_ext::search` 注册的 `web_search` 加入每个 session 的 tool set(`chat.rs:321-329`),其 HTTP client 遵守运行时工具代理(`conga::apply_tool_proxy`,见 §5.6)。
 
 > 想加自己的工具:实现一个返回 `Vec<ToolDefinition>`(+ 可选 `HookChain`)的注册函数,在宿主启动时调用;无需改内核。
 

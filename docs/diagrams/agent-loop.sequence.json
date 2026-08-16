@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "sequence",
   "meta": {
-    "title": "gasket Agent Loop 完整时序",
+    "title": "conga Agent Loop 完整时序",
     "output": "docs/diagrams/agent-loop.sequence.html",
     "quality_profile": "showcase",
     "column_fit": "spread",
@@ -16,8 +16,8 @@
   },
   "participants": [
     { "id": "fe", "type": "external", "label": "前端", "sublabel": "Web / CLI / Tauri" },
-    { "id": "host", "type": "backend", "label": "gasket-host", "sublabel": "Host::run_turn" },
-    { "id": "loop", "type": "backend", "label": "agent_loop", "sublabel": "gasket-core · 无状态" },
+    { "id": "host", "type": "backend", "label": "conga-host", "sublabel": "Host::run_turn" },
+    { "id": "loop", "type": "backend", "label": "agent_loop", "sublabel": "conga · 无状态" },
     { "id": "store", "type": "database", "label": "EventStorage", "sublabel": "events.jsonl" },
     { "id": "llm", "type": "external", "label": "LLM Provider", "sublabel": "StreamFn · SSE" },
     { "id": "hooks", "type": "security", "label": "Hook + 权限", "sublabel": "before / after" },

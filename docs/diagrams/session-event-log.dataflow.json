@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "dataflow",
   "meta": {
-    "title": "gasket 会话事件日志数据流",
+    "title": "conga 会话事件日志数据流",
     "output": "docs/diagrams/session-event-log.dataflow.html",
     "quality_profile": "showcase",
     "viewBox": [1160, 820],

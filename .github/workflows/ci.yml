@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'gasket/**'
+      - 'conga/**'
       - 'web/src/**'
       - 'web/src-tauri/**'
       - 'web/package.json'
@@ -13,7 +13,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'gasket/**'
+      - 'conga/**'
       - 'web/src/**'
       - 'web/src-tauri/**'
       - 'web/package.json'
@@ -40,19 +40,19 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            gasket/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
+            conga/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('conga/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Check formatting
-        run: cd gasket && cargo fmt --all -- --check
+        run: cd conga && cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cd gasket && cargo clippy --all-features -- -D warnings
+        run: cd conga && cargo clippy --all-features -- -D warnings
 
       - name: Run tests
-        run: cd gasket && cargo test --all-features
+        run: cd conga && cargo test --all-features
 
   build:
     name: Build (Rust)
@@ -70,19 +70,19 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            gasket/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
+            conga/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('conga/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        run: cd gasket && cargo build --release --all-features
+        run: cd conga && cargo build --release --all-features
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: gasket-linux
-          path: gasket/target/release/gasket
+          name: conga-linux
+          path: conga/target/release/conga
 
   build-macos:
     name: Build (macOS)
@@ -100,19 +100,19 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            gasket/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
+            conga/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('conga/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        run: cd gasket && cargo build --release --all-features
+        run: cd conga && cargo build --release --all-features
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: gasket-macos
-          path: gasket/target/release/gasket
+          name: conga-macos
+          path: conga/target/release/conga
 
   build-windows:
     name: Build (Windows)
@@ -130,24 +130,24 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            gasket/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
+            conga/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('conga/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        run: cd gasket && cargo build --release --all-features
+        run: cd conga && cargo build --release --all-features
 
       - name: Package binary
         run: |
-          cd gasket/target/release
-          Compress-Archive -Update -Path gasket.exe -DestinationPath gasket-windows.zip
+          cd conga/target/release
+          Compress-Archive -Update -Path conga.exe -DestinationPath conga-windows.zip
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: gasket-windows
-          path: gasket/target/release/gasket-windows.zip
+          name: conga-windows
+          path: conga/target/release/conga-windows.zip
 
   frontend:
     name: Frontend (typecheck + build)

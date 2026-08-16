@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/ws-connection.sequence.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/ws-connection.sequence.html",
     "sha256": "0e99a52bc88dd077a9bdc160cebcdc738ac2d5121cbe34d13031f8c6ddac78d6",
     "bytes": 642111
   },

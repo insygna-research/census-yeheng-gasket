@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/session-event-log.dataflow.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/session-event-log.dataflow.html",
     "sha256": "b4e26cb5ea1599d34c55de32755c86be1ae5a517b90d98d1c4767c08a98c4b11",
     "bytes": 641050
   },

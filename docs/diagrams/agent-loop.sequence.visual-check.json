@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/agent-loop.sequence.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/agent-loop.sequence.html",
     "sha256": "a8233cf857b5881635e9e9544c3775aeed6a31140516c509a616e886346c9ae4",
     "bytes": 654074
   },

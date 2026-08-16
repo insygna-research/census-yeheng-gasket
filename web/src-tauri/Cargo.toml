@@ -1,7 +1,7 @@
 [package]
-name = "gasket"
+name = "conga"
 version = "1.0.0"
-description = "Gasket desktop application"
+description = "Conga desktop application"
 authors = ["you"]
 license = ""
 repository = ""
@@ -26,8 +26,8 @@ tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 dashmap = "6"
-gasket-core = { path = "../../gasket/gasket-core" }
-gasket-host = { path = "../../gasket/gasket-host", features = ["session-index"] }
-gasket-ext = { path = "../../gasket/gasket-ext", features = ["terminal"] }
+conga = { path = "../../conga/conga" }
+conga-host = { path = "../../conga/conga-host", features = ["session-index"] }
+conga-ext = { path = "../../conga/conga-ext", features = ["terminal"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
 dotenvy = "0.15.7"

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "workflow",
   "meta": {
-    "title": "gasket 上下文压缩流程",
+    "title": "conga 上下文压缩流程",
     "output": "docs/diagrams/context-compaction.workflow.html",
     "quality_profile": "showcase",
     "views": [

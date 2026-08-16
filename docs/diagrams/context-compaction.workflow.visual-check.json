@@ -5,7 +5,7 @@
   "status": "fail",
   "visualReview": "pending",
   "artifact": {
-    "path": "/Users/yeheng/workspaces/Github/gasket/docs/diagrams/context-compaction.workflow.html",
+    "path": "/Users/yeheng/workspaces/Github/conga/docs/diagrams/context-compaction.workflow.html",
     "sha256": "8c98c20c06b0e737b22eced89904f20fec5be54cf785d701651f0050a6ea88a6",
     "bytes": 631459
   },

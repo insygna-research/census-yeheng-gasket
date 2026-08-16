@@ -2,17 +2,17 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "gasket 生产部署拓扑",
+    "title": "conga 生产部署拓扑",
     "output": "docs/diagrams/deployment.architecture.html",
     "quality_profile": "showcase",
     "repository": {
-      "url": "https://github.com/YeHeng/gasket",
+      "url": "https://github.com/YeHeng/conga",
       "revision": "0a97189bf80b9b37b702c796a5c6de4eabbef708"
     },
     "viewBox": [1240, 640],
     "views": [
       { "id": "ingress", "label": "入口链路", "focus": ["user", "gw", "dist"], "note": "浏览器经 :3000 访问网关与静态前端。" },
-      { "id": "state", "label": "会话状态", "focus": ["gw", "gdir"], "note": "会话真相源在容器内 ~/.gasket。" },
+      { "id": "state", "label": "会话状态", "focus": ["gw", "gdir"], "note": "会话真相源在容器内 ~/.conga。" },
       { "id": "egress", "label": "出站链路", "focus": ["gw", "llm", "proxy"], "note": "LLM API 必配,出站代理可选。" }
     ]
   },
@@ -30,7 +30,7 @@
       "type": "frontend",
       "label": "web/dist 静态资源",
       "sublabel": "SPA 回退 index.html",
-      "tag": "GASKET_GATEWAY_STATIC_DIR",
+      "tag": "CONGA_GATEWAY_STATIC_DIR",
       "pos": [470, 100],
       "size": [260, 80],
       "sources": [{ "path": "Dockerfile", "line": 105, "label": "构建产物 COPY" }]
@@ -38,7 +38,7 @@
     {
       "id": "gw",
       "type": "backend",
-      "label": "gasket-gateway",
+      "label": "conga-gateway",
       "sublabel": "WS + REST · EXPOSE 3000",
       "tag": "单二进制 ENTRYPOINT",
       "pos": [470, 250],
@@ -48,9 +48,9 @@
     {
       "id": "gdir",
       "type": "database",
-      "label": "~/.gasket",
+      "label": "~/.conga",
       "sublabel": "sessions/ · mcp.json",
-      "tag": "容器内 /root/.gasket",
+      "tag": "容器内 /root/.conga",
       "pos": [470, 430],
       "size": [260, 80],
       "sources": [{ "path": "Dockerfile", "line": 108, "label": "配置目录" }]
@@ -59,22 +59,22 @@
       "id": "llm",
       "type": "external",
       "label": "LLM API",
-      "sublabel": "GASKET_LLM_BASE_URL / KEY / MODEL / API",
+      "sublabel": "CONGA_LLM_BASE_URL / KEY / MODEL / API",
       "pos": [950, 160],
       "size": [230, 96],
-      "sources": [{ "path": "gasket/.env.example", "label": "必填连接配置" }]
+      "sources": [{ "path": "conga/.env.example", "label": "必填连接配置" }]
     },
     {
       "id": "proxy",
       "type": "external",
       "label": "出站代理(可选)",
-      "sublabel": "GASKET_TOOL_PROXY / GASKET_LLM_PROXY",
+      "sublabel": "CONGA_TOOL_PROXY / CONGA_LLM_PROXY",
       "pos": [950, 400],
       "size": [230, 80]
     }
   ],
   "boundaries": [
-    { "kind": "region", "label": "Docker 容器 gasket(debian:bookworm-slim)", "wraps": ["dist", "gw", "gdir"] }
+    { "kind": "region", "label": "Docker 容器 conga(debian:bookworm-slim)", "wraps": ["dist", "gw", "gdir"] }
   ],
   "connections": [
     { "id": "user-gw", "from": "user", "to": "gw", "label": "HTTP :3000 · WS /ws", "variant": "emphasis" },
@@ -106,9 +106,9 @@
       "dot": "slate",
       "title": "数据与出站",
       "items": [
-        "会话真相源在容器内 ~/.gasket,重建容器需挂载卷保留",
-        "LLM 流量直连或走 GASKET_LLM_PROXY",
-        "工具出站流量独立走 GASKET_TOOL_PROXY,两条代理互不影响"
+        "会话真相源在容器内 ~/.conga,重建容器需挂载卷保留",
+        "LLM 流量直连或走 CONGA_LLM_PROXY",
+        "工具出站流量独立走 CONGA_TOOL_PROXY,两条代理互不影响"
       ]
     }
   ]

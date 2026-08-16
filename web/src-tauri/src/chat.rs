@@ -1,11 +1,11 @@
 //! In-process chat transport for the desktop app.
 //!
-//! Mirrors the gateway's per-connection session loop (gasket-gateway ws.rs):
+//! Mirrors the gateway's per-connection session loop (conga-gateway ws.rs):
 //! one `Host` per session, assembled from the same config/env knobs, with the
 //! same cancellation and approval semantics. The only difference is the
 //! transport — instead of WebSocket frames, turn events are emitted as Tauri
 //! `chat-event` IPC events whose `event` payload is byte-for-byte the
-//! gateway's wire JSON (host-owned schema, `gasket_host::wire`), so the
+//! gateway's wire JSON (host-owned schema, `conga_host::wire`), so the
 //! frontend's message handling is shared unchanged between both transports.
 
 use std::collections::HashMap;
@@ -19,12 +19,12 @@ use log::{info, warn};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use gasket_core::{built_in_tools, AgentEvent};
-use gasket_host::approval::{self, ApprovalRegistry, RegisterOutcome};
-use gasket_host::event_map::{event_to_ws, subagent_event_to_ws};
-use gasket_host::permission::Approver;
-use gasket_host::wire::OutgoingEvent;
-use gasket_host::{
+use conga::{built_in_tools, AgentEvent};
+use conga_host::approval::{self, ApprovalRegistry, RegisterOutcome};
+use conga_host::event_map::{event_to_ws, subagent_event_to_ws};
+use conga_host::permission::Approver;
+use conga_host::wire::OutgoingEvent;
+use conga_host::{
   load_all_mcp, ConfigLoader, Host, HostSubagentSpawner, Mode, PermissionPolicy, SessionManager,
 };
 
@@ -45,7 +45,7 @@ struct ChatEventPayload {
 /// turn-boundary `done` can never overtake the last subagent event and an
 enum WireEvent {
   Agent(AgentEvent),
-  Subagent(gasket_core::SubagentEvent),
+  Subagent(conga::SubagentEvent),
   Approval {
     request_id: String,
     tool_name: String,
@@ -107,7 +107,7 @@ pub struct ChatState {
 impl ChatState {
   pub fn new() -> Self {
     Self {
-      store_root: gasket_core::JsonlStorage::default_root().base_dir_clone(),
+      store_root: conga::JsonlStorage::default_root().base_dir_clone(),
       ..Default::default()
     }
   }
@@ -172,7 +172,7 @@ fn spawn_emitter(
         WireEvent::Subagent(ev) => {
           // Sub-agent provider usage counts toward the session's token
           // totals (same as the gateway); it has no IPC message of its own.
-          if let gasket_core::SubagentEvent::Usage {
+          if let conga::SubagentEvent::Usage {
             input_tokens,
             output_tokens,
           } = ev
@@ -232,7 +232,7 @@ fn spawn_emitter(
 /// Assemble a session's Host exactly as the gateway does per WS connection:
 /// same config loader, same system prompt, same mode env knob, same tool set
 /// (built-in + external + MCP), same sub-agent wiring. Do not invent new
-/// config here — the desktop app reads the same `~/.gasket` setup.
+/// config here — the desktop app reads the same `~/.conga` setup.
 async fn build_session(
   app: &AppHandle,
   store_root: &std::path::Path,
@@ -250,11 +250,11 @@ async fn build_session(
 
   // Skills (and the Host's tool sandbox) follow the project dir, not the
   // process cwd — the desktop app is launched outside the project it serves.
-  let cwd = gasket_host::project_dir();
-  let system_prompt = gasket_host::append_skills("You are a helpful, concise assistant.", &cwd);
+  let cwd = conga_host::project_dir();
+  let system_prompt = conga_host::append_skills("You are a helpful, concise assistant.", &cwd);
   // Intentionally the gateway's env knob: one mode setting shared by both
   // transports.
-  let mode = std::env::var("GASKET_GATEWAY_MODE")
+  let mode = std::env::var("CONGA_GATEWAY_MODE")
     .ok()
     .and_then(|s| Mode::parse(&s))
     .unwrap_or(Mode::AutoEdit);
@@ -287,7 +287,7 @@ async fn build_session(
           tool_name: tool_name.to_string(),
           args: args.clone(),
         });
-        let timeout_s = std::env::var("GASKET_APPROVAL_TIMEOUT_S")
+        let timeout_s = std::env::var("CONGA_APPROVAL_TIMEOUT_S")
           .ok()
           .and_then(|v| v.parse().ok())
           .unwrap_or(300u64);
@@ -307,11 +307,11 @@ async fn build_session(
   // Tool assembly mirrors the gateway: built-in + external + MCP for the
   // parent; built-in minus `spawn_subagents` for sub-agents.
   let extra_tools = {
-    let cmds = gasket_host::commands_from_env();
+    let cmds = conga_host::commands_from_env();
     if cmds.is_empty() {
       Vec::new()
     } else {
-      match gasket_host::load_external_tools(&cmds).await {
+      match conga_host::load_external_tools(&cmds).await {
         Ok(t) => t,
         Err(e) => {
           warn!("session {session_id}: external tools load failed: {e}");
@@ -321,13 +321,13 @@ async fn build_session(
     }
   };
   let mcp_tools = load_all_mcp().await;
-  // Production extensions from gasket-ext (currently web_search only) —
+  // Production extensions from conga-ext (currently web_search only) —
   // the non-demo composition root; the CLI's register_all adds the
   // hello/todo/permission_gate demos on top. Its HTTP client honors the
-  // runtime tool proxy (gasket_core::set_tool_proxy).
+  // runtime tool proxy (conga::set_tool_proxy).
   let search_tools = {
-    let mut api = gasket_core::ExtensionApiImpl::new();
-    gasket_ext::prod_register(&mut api);
+    let mut api = conga::ExtensionApiImpl::new();
+    conga_ext::prod_register(&mut api);
     api.tools
   };
   let built_in = built_in_tools();
@@ -349,15 +349,15 @@ async fn build_session(
   let mut host = Host::new(host_cfg, session_mgr, policy, system_prompt, tools);
   {
     let spawner_signal = host.signal().clone();
-    let emit: Arc<dyn Fn(gasket_core::SubagentEvent) + Send + Sync> = {
+    let emit: Arc<dyn Fn(conga::SubagentEvent) + Send + Sync> = {
       let wire = wire_tx.clone();
-      Arc::new(move |ev: gasket_core::SubagentEvent| {
+      Arc::new(move |ev: conga::SubagentEvent| {
         let _ = wire.send(WireEvent::Subagent(ev));
       })
     };
     let spawner_stream_fn = spawner_cfg.provider_stream_fn();
-    let spawner_hooks: Arc<dyn gasket_core::HookChain> =
-      Arc::new(gasket_host::HookStack::new(vec![spawner_policy]));
+    let spawner_hooks: Arc<dyn conga::HookChain> =
+      Arc::new(conga_host::HookStack::new(vec![spawner_policy]));
     let loop_config = spawner_cfg.build_loop_config(
       spawner_cfg.tunables.max_turns,
       Some(spawner_signal.clone()),
@@ -370,7 +370,7 @@ async fn build_session(
         subagent_tools,
         spawner_hooks,
         spawner_signal,
-        gasket_host::project_dir(),
+        conga_host::project_dir(),
         loop_config,
       )
       .with_ws_emit(emit),
@@ -406,7 +406,7 @@ pub async fn send_message(
   content: String,
   trace_id: Option<String>,
 ) -> Result<(), String> {
-  if !gasket_core::is_valid_session_id(&session_id) {
+  if !conga::is_valid_session_id(&session_id) {
     return Err("invalid session id".into());
   }
   if content.trim().is_empty() {
@@ -541,7 +541,7 @@ pub fn approval_response(
 /// Context occupancy for the desktop app. Mirrors the gateway's
 /// `GET /api/sessions/:id/context` endpoint: reads the session's accumulated
 /// usage counters and computes a saturation percentage against
-/// `GASKET_CONTEXT_WINDOW` (default 128k). Returns the same JSON shape the
+/// `CONGA_CONTEXT_WINDOW` (default 128k). Returns the same JSON shape the
 /// frontend expects: `{ context_stats, watermark_info }`.
 #[tauri::command]
 pub fn get_context(
@@ -556,7 +556,7 @@ pub fn get_context(
     ),
     None => (0u64, 0u64, 0u64),
   };
-  let window = std::env::var("GASKET_CONTEXT_WINDOW")
+  let window = std::env::var("CONGA_CONTEXT_WINDOW")
     .ok()
     .and_then(|s| s.parse::<u64>().ok())
     .unwrap_or(128_000);

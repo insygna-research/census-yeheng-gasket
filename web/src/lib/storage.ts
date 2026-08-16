@@ -5,11 +5,11 @@
  * calls across components/composables.
  *
  * Desktop (Tauri): NO localStorage. The Rust backend's
- * `~/.gasket/app_config.json` is the only durable store — it is loaded
+ * `~/.conga/app_config.json` is the only durable store — it is loaded
  * into an in-memory map before the app mounts (`initStorage`) and flushed
  * back (debounced, atomic tmp+rename) on every write. Session records are
  * NOT part of this map at all: the backend's session store
- * (`~/.gasket/sessions`) owns them end to end.
+ * (`~/.conga/sessions`) owns them end to end.
  *
  * Browser (no embedded backend): the memory map hydrates from localStorage
  * once and writes through to it, preserving the pre-desktop behavior.
@@ -18,10 +18,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { isTauri } from '@/lib/platform';
 
 export const storageKeys = {
-  theme: 'gasket_theme_v2',
-  sidebarWidth: 'gasket_sidebar_width',
-  sidebarCollapsed: 'gasket_sidebar_collapsed',
-  proxy: 'gasket_proxy',
+  theme: 'conga_theme_v2',
+  sidebarWidth: 'conga_sidebar_width',
+  sidebarCollapsed: 'conga_sidebar_collapsed',
+  proxy: 'conga_proxy',
 } as const;
 
 const memory = new Map<string, string>();

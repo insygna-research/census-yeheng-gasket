@@ -9,7 +9,7 @@ import { initStorage } from './lib/storage'
 // Load the persisted app config into memory BEFORE importing the app's
 // module graph — composables like useTheme initialize from storage at
 // module-evaluation time, so a static `import App` would race the hydrate.
-// Tauri reads the Rust backend's ~/.gasket/app_config.json; the browser
+// Tauri reads the Rust backend's ~/.conga/app_config.json; the browser
 // copies localStorage. Never rejects.
 initStorage().finally(async () => {
   const { default: App } = await import('./App.vue')

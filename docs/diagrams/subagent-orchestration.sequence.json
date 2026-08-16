@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "sequence",
   "meta": {
-    "title": "gasket 子 Agent 编排时序",
+    "title": "conga 子 Agent 编排时序",
     "output": "docs/diagrams/subagent-orchestration.sequence.html",
     "quality_profile": "showcase",
     "viewBox": [1500, 950],

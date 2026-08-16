@@ -1,20 +1,20 @@
-//! Gasket desktop backend.
+//! Conga desktop backend.
 //!
 //! The session-management API lives here as Tauri commands so the desktop
 //! app is self-contained: it reads/writes the on-disk session store
-//! (`~/.gasket/sessions`) directly through gasket-core/gasket-host instead of
+//! (`~/.conga/sessions`) directly through conga/conga-host instead of
 //! depending on a separately running gateway process. The `chat` module goes
 //! one step further and hosts the agent loop itself: per-session Hosts stream
 //! turn events over Tauri IPC (`chat-event`), replacing the gateway's
 //! WebSocket transport inside the desktop shell. The gateway remains the
 //! transport for plain-browser (dev) usage.
 
-use gasket_core::{EventStorage, SessionMeta};
+use conga::{EventStorage, SessionMeta};
 
 mod chat;
 
 fn session_store() -> EventStorage {
-  EventStorage::new(gasket_core::JsonlStorage::default_root().base_dir_clone())
+  EventStorage::new(conga::JsonlStorage::default_root().base_dir_clone())
 }
 
 #[derive(serde::Serialize)]
@@ -28,7 +28,7 @@ struct SessionInfoDto {
 
 #[tauri::command]
 async fn list_sessions() -> Result<Vec<SessionInfoDto>, String> {
-  let mgr = gasket_host::SessionManager::new();
+  let mgr = conga_host::SessionManager::new();
   let mut sessions = mgr.list().await.map_err(|e| e.to_string())?;
   // Newest first.
   sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
@@ -58,9 +58,9 @@ async fn get_session_messages(id: String) -> Result<Option<Vec<serde_json::Value
   if !storage.has_events(&id) && !storage.messages_path(&id).exists() {
     return Ok(None);
   }
-  let mgr = gasket_host::SessionManager::new();
+  let mgr = conga_host::SessionManager::new();
   let events = mgr.open_or_migrate(&id).await.map_err(|e| e.to_string())?;
-  let messages = gasket_core::derive_messages(&events);
+  let messages = conga::derive_messages(&events);
   serde_json::to_value(messages)
     .map(|v| v.as_array().cloned())
     .map_err(|e| e.to_string())
@@ -71,7 +71,7 @@ async fn get_session_messages(id: String) -> Result<Option<Vec<serde_json::Value
 /// turn lands on disk.
 #[tauri::command]
 async fn rename_session(id: String, name: String) -> Result<(), String> {
-  if !gasket_core::is_valid_session_id(&id) {
+  if !conga::is_valid_session_id(&id) {
     return Err("invalid session id".into());
   }
   let trimmed = name.trim();
@@ -90,49 +90,49 @@ async fn rename_session(id: String, name: String) -> Result<(), String> {
 }
 
 
-/// Cross-session full-text search (FTS5 sidecar at `~/.gasket/index.db`).
+/// Cross-session full-text search (FTS5 sidecar at `~/.conga/index.db`).
 /// Stateless per call: open the connection, run the high-water incremental
 /// reindex check, run the query, return hits. No registry, no cached
 /// state — resource state belongs to the host, not process globals.
 #[tauri::command]
 async fn search_sessions(
   query: String,
-) -> Result<Vec<gasket_host::session_index::SessionHit>, String> {
+) -> Result<Vec<conga_host::session_index::SessionHit>, String> {
   let q = query.trim().to_string();
   if q.is_empty() {
     return Err("query must be non-empty".into());
   }
-  let root = gasket_core::JsonlStorage::default_root().base_dir_clone();
-  let db = gasket_core::storage::config_dir().join("index.db");
+  let root = conga::JsonlStorage::default_root().base_dir_clone();
+  let db = conga::storage::config_dir().join("index.db");
   tokio::task::spawn_blocking(move || {
-    gasket_host::session_index::reindex(&root, &db).map_err(|e| e.to_string())?;
-    gasket_host::session_index::search(&root, &db, &q, 20).map_err(|e| e.to_string())
+    conga_host::session_index::reindex(&root, &db).map_err(|e| e.to_string())?;
+    conga_host::session_index::search(&root, &db, &q, 20).map_err(|e| e.to_string())
   })
   .await
   .map_err(|e| format!("engine task join failed: {e}"))?
 }
 
-/// `~/.gasket/app_config.json` — the desktop shell's durable mirror of the
+/// `~/.conga/app_config.json` — the desktop shell's durable mirror of the
 /// browser build's localStorage preferences (theme, sidebar state, chats
 /// meta, hidden sessions). One JSON object keyed by storage key; values are
 /// parsed JSON when possible, else the raw string — the frontend round-trips
 /// them back into localStorage byte-for-byte. Same fail-loud conventions as
 /// the session store: corruption is an error, never silently re-created.
 fn app_config_path() -> std::path::PathBuf {
-  gasket_core::storage::config_dir().join("app_config.json")
+  conga::storage::config_dir().join("app_config.json")
 }
 
-/// Extract `gasket_proxy` from the app config and install it as the
+/// Extract `conga_proxy` from the app config and install it as the
 /// fetch/web_search proxy override. Missing or empty clears the override
 /// (direct connection). Values may be raw strings (writeString path — not
 /// JSON) or JSON strings; `as_str` covers both.
 fn apply_proxy_from_config(config: &serde_json::Value) -> Result<(), String> {
   let url = config
-    .get("gasket_proxy")
+    .get("conga_proxy")
     .and_then(|v| v.as_str())
     .map(str::trim)
     .filter(|s| !s.is_empty());
-  gasket_core::set_tool_proxy(url).map_err(|e| format!("gasket_proxy invalid: {e}"))
+  conga::set_tool_proxy(url).map_err(|e| format!("conga_proxy invalid: {e}"))
 }
 
 #[tauri::command]
@@ -173,7 +173,7 @@ fn validate_proxy(url: String) -> Result<(), String> {
   if url.is_empty() {
     return Ok(()); // clearing is always valid
   }
-  gasket_core::validate_tool_proxy(url)
+  conga::validate_tool_proxy(url)
 }
 
 /// Delete the session's on-disk data wholesale (event log + meta sidecar).
@@ -189,7 +189,7 @@ async fn delete_session(id: String) -> Result<bool, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let _ = dotenvy::dotenv();
-  // gasket-core/gasket-host emit through `tracing`; without a global
+  // conga/conga-host emit through `tracing`; without a global
   // subscriber those records vanish. This is separate from tauri-plugin-log
   // (fern, registered in setup) which handles `log`-crate records — the two
   // coexist only because tracing-subscriber is built without `tracing-log`

@@ -47,8 +47,8 @@ export interface SubagentState {
 
 /**
  * The gateway→frontend wire protocol, field-for-field.
- * Source of truth: `gasket-host/src/wire.rs` (OutgoingEvent) and
- * `gasket-host/src/event_map.rs::subagent_event_to_ws`. Add fields, never
+ * Source of truth: `conga-host/src/wire.rs` (OutgoingEvent) and
+ * `conga-host/src/event_map.rs::subagent_event_to_ws`. Add fields, never
  * rename — this union IS the contract.
  */
 export type WsMessage =

@@ -100,7 +100,7 @@ const disable = () => {
             Browser mode: the proxy only takes effect in the desktop app.
           </p>
           <p v-else class="text-[11px] text-muted-foreground">
-            Applies to the next tool call — no restart needed. Disable falls back to GASKET_TOOL_PROXY if set.
+            Applies to the next tool call — no restart needed. Disable falls back to CONGA_TOOL_PROXY if set.
           </p>
 
           <!-- Actions -->

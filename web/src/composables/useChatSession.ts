@@ -259,7 +259,7 @@ export function useChatSession(chatId: { value: string }) {
         }
         fetchContext();
         notifyTurnComplete(
-          chatStore.getChat(chatId.value)?.name || 'Gasket',
+          chatStore.getChat(chatId.value)?.name || 'Conga',
           botMsg.content
         );
         break;
