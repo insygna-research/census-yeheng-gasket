@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertCircle, ArrowDown, Bot, Sparkles, X as XIcon } from 'lucide-vue-next';
+import { AlertCircle, ArrowDown, FileText, Lightbulb, Rocket, SearchCode, Sparkles, X as XIcon } from 'lucide-vue-next';
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useChatSession } from '../composables/useChatSession';
 import { useChatStore } from '../stores/chatStore';
@@ -70,6 +70,14 @@ onUnmounted(() => {
 // Messages
 const messages = computed(() => chatStore.activeMessages);
 const hasUserMessages = computed(() => messages.value.some(m => m.role === 'user' || m.role === 'bot'));
+const chatTitle = computed(() => chatStore.getChat(props.chatId)?.name || 'Chat');
+
+// Esc stops an in-flight generation
+const onKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && (session.isReceiving || session.isThinking)) {
+    session.stopGenerating();
+  }
+};
 
 watch(() => messages.value.length, () => scrollToBottom());
 watch(() => props.chatId, () => {
@@ -83,13 +91,18 @@ onMounted(() => {
   session.fetchContext();
   nextTick(() => scrollToBottom(true));
   setupScrollObserver();
+  window.addEventListener('keydown', onKeydown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown);
 });
 
 const suggestedPrompts = [
-  { icon: '💡', text: 'Explain how this project is structured' },
-  { icon: '🔍', text: 'Help me find and fix bugs in my code' },
-  { icon: '📝', text: 'Write a unit test for a function' },
-  { icon: '🚀', text: 'Suggest performance improvements' },
+  { icon: Lightbulb, text: 'Explain how this project is structured' },
+  { icon: SearchCode, text: 'Help me find and fix bugs in my code' },
+  { icon: FileText, text: 'Write a unit test for a function' },
+  { icon: Rocket, text: 'Suggest performance improvements' },
 ];
 
 const sendPrompt = (prompt: string) => {
@@ -120,6 +133,7 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
   <div class="flex h-full w-full relative">
     <div class="flex flex-col flex-1 min-w-0">
       <ChatHeader
+        :chat-title="chatTitle"
         :is-connected="session.isConnected"
         :session-status="session.sessionStatus"
         :show-reconnect-button="session.showReconnectButton"
@@ -146,24 +160,24 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
       <ScrollArea class="flex-1 p-4" ref="scrollAreaRef">
         <!-- Empty State -->
         <div v-if="!hasUserMessages"
-          class="flex flex-col items-center justify-center h-full max-w-full md:max-w-3xl lg:max-w-4xl xl:max-w-5xl mx-auto text-center py-16 th-text">
-          <div class="w-14 h-14 rounded-2xl th-gradient-brand flex items-center justify-center mb-5 shadow-lg shadow-primary/20">
-            <Sparkles class="w-7 h-7 text-white" />
+          class="flex flex-col items-center justify-center h-full max-w-3xl mx-auto text-center py-16 th-text">
+          <div class="w-14 h-14 rounded-2xl bg-primary flex items-center justify-center mb-5">
+            <Sparkles class="w-7 h-7 text-primary-foreground" />
           </div>
           <h2 class="text-xl font-semibold th-text mb-2">How can I help you today?</h2>
-          <p class="th-text-muted mb-6 text-xs">Ask me anything about your code, project, or ideas.</p>
+          <p class="th-text-muted mb-6 text-sm">Ask me anything about your code, project, or ideas.</p>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
             <button v-for="(prompt, idx) in suggestedPrompts" :key="idx" @click="sendPrompt(prompt.text)"
               :disabled="!session.isConnected"
-              class="flex items-center gap-2 p-3 th-surface th-border th-hover rounded-xl text-left text-xs th-text-secondary hover:th-text transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed group shadow-sm">
-              <span class="text-base flex-shrink-0 group-hover:scale-110 transition-transform">{{ prompt.icon }}</span>
+              class="flex items-center gap-2.5 p-3 th-surface th-border th-hover rounded-xl text-left text-sm th-text-secondary hover:th-text transition-colors duration-150 disabled:opacity-40 disabled:cursor-not-allowed group">
+              <component :is="prompt.icon" class="w-4 h-4 shrink-0 th-text-dim group-hover:th-text transition-colors" />
               <span>{{ prompt.text }}</span>
             </button>
           </div>
         </div>
 
         <!-- Messages List -->
-        <div v-else class="flex flex-col gap-1 max-w-full md:max-w-4xl lg:max-w-5xl xl:max-w-6xl mx-auto w-full pb-4 px-4">
+        <div v-else class="flex flex-col gap-1 max-w-3xl mx-auto w-full pb-4 px-4">
           <template v-for="(msg, idx) in messages" :key="msg.id">
             <ChatTimeDivider
               v-if="idx > 0 && msg.timestamp - messages[idx - 1].timestamp > 5 * 60 * 1000"
@@ -180,11 +194,8 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
           </template>
 
           <!-- Typing indicator -->
-          <div v-if="session.isReceiving && !session.isThinking" class="flex items-end gap-2 mt-2 ml-1">
-            <div class="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shrink-0">
-              <Bot class="w-3.5 h-3.5 text-white" />
-            </div>
-            <div class="px-3 py-2 rounded-2xl rounded-bl-sm th-typing-bg th-text-secondary text-xs flex items-center gap-1">
+          <div v-if="session.isReceiving && !session.isThinking" class="flex mt-2">
+            <div class="px-3 py-2 rounded-2xl th-typing-bg flex items-center gap-1">
               <span class="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style="animation-delay: 0ms" />
               <span class="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style="animation-delay: 150ms" />
               <span class="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style="animation-delay: 300ms" />
@@ -220,13 +231,3 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
     </div>
   </div>
 </template>
-
-<style>
-.custom-scrollbar::-webkit-scrollbar { width: 6px; }
-.custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 4px; }
-.dark .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
-.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 4px; }
-.dark .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); }
-.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.3); }
-.dark .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
-</style>

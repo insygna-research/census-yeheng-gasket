@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "gasket 子 Agent 编排时序",
+    "output": "docs/diagrams/subagent-orchestration.sequence.html",
+    "quality_profile": "showcase",
+    "viewBox": [1500, 950],
+    "views": [
+      { "id": "fanout", "label": "并行触发", "focus": ["parent", "spawn", "sa", "sb"], "note": "spawn_subagents 一次性 fan-out。" },
+      { "id": "streaming", "label": "事件实时转发", "focus": ["sa", "sb", "fe"], "note": "子 agent 事件流直达前端面板。" },
+      { "id": "collect", "label": "收集与回喂", "focus": ["sa", "sb", "spawn", "parent"], "note": "摘要收集后作为 ToolResult 回到父循环。" }
+    ]
+  },
+  "participants": [
+    { "id": "parent", "type": "backend", "label": "父 agent_loop", "sublabel": "spawn_subagents" },
+    { "id": "spawn", "type": "backend", "label": "编排器", "sublabel": "HostSubagentSpawner" },
+    { "id": "sa", "type": "backend", "label": "子 agent #1", "sublabel": "独立循环" },
+    { "id": "sb", "type": "backend", "label": "子 agent #2", "sublabel": "并行执行" },
+    { "id": "fe", "type": "frontend", "label": "前端面板", "sublabel": "SubagentPanel" }
+  ],
+  "segments": [
+    { "from": 150, "to": 275, "label": "触发与 fan-out" },
+    { "from": 300, "to": 590, "label": "并行执行 · 事件转发" },
+    { "from": 615, "to": 845, "label": "收集与回喂" }
+  ],
+  "messages": [
+    { "id": "s01-spawn", "from": "parent", "to": "spawn", "y": 190, "label": "spawn(specs[])", "variant": "emphasis", "note": "maxItems 5 · 子上下文无 spawner,禁嵌套" },
+    { "id": "s02-t1", "from": "spawn", "to": "sa", "y": 240, "label": "tokio::spawn · run_agent_loop", "note": "max_turns = 10 · 同父级工具集与 hook" },
+    { "id": "s03-t2", "from": "spawn", "to": "sb", "y": 274, "label": "tokio::spawn · run_agent_loop", "note": "同一时刻发出:并行" },
+    { "id": "s04-a1", "from": "sa", "to": "fe", "y": 320, "label": "subagent_started / thinking", "variant": "dashed", "note": "map_agent_event 打上子 id" },
+    { "id": "s05-b1", "from": "sb", "to": "fe", "y": 366, "label": "subagent_started / thinking", "variant": "dashed" },
+    { "id": "s06-a2", "from": "sa", "to": "fe", "y": 424, "label": "subagent_tool_start / tool_end", "variant": "dashed", "note": "经网关 event_map 转发,单一有序通道" },
+    { "id": "s07-b2", "from": "sb", "to": "fe", "y": 470, "label": "subagent_tool_start / tool_end", "variant": "dashed" },
+    { "id": "s08-a3", "from": "sa", "to": "fe", "y": 528, "label": "subagent_content 增量", "variant": "dashed" },
+    { "id": "s09-b3", "from": "sb", "to": "fe", "y": 574, "label": "subagent_content 增量", "variant": "dashed" },
+    { "id": "s10-join1", "from": "sa", "to": "spawn", "y": 648, "label": "JoinHandle 完成", "variant": "return", "note": "AbortOnDrop:future 被取消即全部中止" },
+    { "id": "s11-join2", "from": "sb", "to": "spawn", "y": 690, "label": "JoinHandle 完成", "variant": "return" },
+    { "id": "s12-result", "from": "spawn", "to": "parent", "y": 746, "label": "ToolResult:各子摘要 + 工具计数", "variant": "return", "note": "摘要 ≤200 字 · max_turns 耗尽标记未完成" },
+    { "id": "s13-loop", "from": "parent", "to": "fe", "y": 800, "label": "tool_end · 继续主循环", "variant": "dashed", "note": "结果回喂父循环,再问 LLM" }
+  ],
+  "activations": [
+    { "participant": "parent", "from": 185, "to": 808, "type": "backend" },
+    { "participant": "spawn", "from": 185, "to": 751, "type": "backend" },
+    { "participant": "sa", "from": 235, "to": 695, "type": "backend" },
+    { "participant": "sb", "from": 269, "to": 695, "type": "backend" },
+    { "participant": "fe", "from": 315, "to": 805, "type": "frontend" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "并行 fan-out",
+      "items": [
+        "spawn_subagents 一次最多 5 个子任务,同一时刻发出",
+        "子 agent 复用父级工具集、stream_fn 与策略 hook",
+        "子上下文不携带 spawner,结构上禁止嵌套"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "事件实时转发",
+      "items": [
+        "AgentEvent 映射为带子 id 的 SubagentEvent,10 种类型",
+        "经网关 event_map 转发,与主循环事件共用有序通道",
+        "前端 SubagentThoughtsPanel 渲染思考与工具时间轴"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "收集与取消语义",
+      "items": [
+        "全部完成后收集:最后一条 assistant 即子摘要",
+        "max_turns 耗尽时摘要标记未完成,避免误读中间结论",
+        "AbortOnDrop 在任意 await 点取消即中止全部子任务"
+      ]
+    }
+  ]
+}

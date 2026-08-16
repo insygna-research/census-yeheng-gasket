@@ -2,6 +2,7 @@
 import { Button } from '@/components/ui/button';
 import { Send, Square, Terminal } from 'lucide-vue-next';
 import { computed, nextTick, onMounted, ref } from 'vue';
+import { isTauri } from '@/lib/platform';
 
 const props = defineProps<{
   isConnected: boolean;
@@ -29,6 +30,15 @@ interface SlashCommand {
 const commands = ref<SlashCommand[]>([]);
 
 const fetchCommands = async () => {
+  // Tauri: no gateway HTTP to query; the backend handles /clear and /help
+  // in-process (chat.rs). Keep this in sync with the slash-command handler.
+  if (isTauri) {
+    commands.value = [
+      { name: 'clear', description: 'Clear the current session' },
+      { name: 'help', description: 'Show available commands' },
+    ];
+    return;
+  }
   try {
     const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000';
     const res = await fetch(`${apiUrl}/api/commands`);
@@ -37,7 +47,7 @@ const fetchCommands = async () => {
       commands.value = Array.isArray(data) ? data : [];
     }
   } catch (e) {
-    // Silently fail — completer just won't show commands
+    // Silently fail - completer just won't show commands
     console.warn('Failed to fetch commands:', e);
   }
 };
@@ -150,7 +160,7 @@ const submit = () => {
 
 <template>
   <div class="p-4 bg-transparent shrink-0">
-    <div class="max-w-full md:max-w-4xl lg:max-w-5xl xl:max-w-6xl mx-auto w-full relative">
+    <div class="max-w-3xl mx-auto w-full relative">
       <!-- Slash Command Completer Dropdown -->
       <Transition
         enter-active-class="transition-all duration-150 ease-out"
@@ -165,10 +175,10 @@ const submit = () => {
           class="absolute bottom-full left-0 right-0 mb-2 z-50"
         >
           <div class="th-surface border th-border rounded-xl shadow-2xl overflow-hidden max-h-64 flex flex-col">
-            <div class="px-3 py-1.5 text-[10px] font-semibold th-text-muted uppercase tracking-wider border-b th-border">
+            <div class="px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider border-b th-border">
               Commands
             </div>
-            <div class="overflow-y-auto custom-scrollbar">
+            <div class="overflow-y-auto">
               <button
                 v-for="(cmd, idx) in filteredCommands"
                 :key="cmd.name"
@@ -181,7 +191,7 @@ const submit = () => {
                 <div class="flex-1 min-w-0">
                   <div class="flex items-center gap-1.5">
                     <span class="text-xs font-medium th-text">/{{ cmd.name }}</span>
-                    <span v-if="cmd.aliases?.length" class="text-[10px] th-text-dim">
+                    <span v-if="cmd.aliases?.length" class="text-[11px] th-text-dim">
                       ({{ cmd.aliases.map(a => '/' + a).join(', ') }})
                     </span>
                   </div>
@@ -193,16 +203,16 @@ const submit = () => {
         </div>
       </Transition>
 
-      <div class="flex items-end th-input-bg border th-border rounded-2xl p-2 shadow-xl backdrop-blur-xl transition-all"
+      <div class="flex items-end th-input-bg border th-border rounded-2xl p-2 transition-all"
         :class="{
-          'focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/20': sessionStatus === 'idle' || sessionStatus === 'disconnected',
-          'border-primary/30 ring-2 ring-primary/20': sessionStatus === 'receiving' || sessionStatus === 'sending'
+          'focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/20': sessionStatus === 'idle' || sessionStatus === 'disconnected',
+          'border-primary/30 ring-1 ring-primary/20': sessionStatus === 'receiving' || sessionStatus === 'sending'
         }">
         <textarea ref="inputRef" v-model="inputValue" @keydown="handleKeydown" @input="handleInput"
           :placeholder="sessionStatus === 'receiving' ? 'AI is processing...' : 'Type a message...'"
           :disabled="!isConnected || sessionStatus === 'receiving' || sessionStatus === 'sending'"
           autofocus rows="1"
-          class="flex-1 overflow-x-hidden border-0 bg-transparent shadow-none focus:outline-none focus:ring-0 th-text px-3 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed resize-none custom-scrollbar min-h-[40px] max-h-[200px]"></textarea>
+          class="flex-1 overflow-x-hidden border-0 bg-transparent shadow-none focus:outline-none focus:ring-0 th-text px-3 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed resize-none min-h-[40px] max-h-[200px]"></textarea>
 
         <Button v-if="sessionStatus === 'receiving' || isThinking" @click="emit('stop')"
           class="w-9 h-9 rounded-xl bg-destructive/80 hover:bg-destructive text-white shrink-0 ml-2 transition-all" size="icon" title="Stop generating">
@@ -215,19 +225,9 @@ const submit = () => {
           <Send class="w-4 h-4" />
         </Button>
       </div>
-      <div class="flex items-center justify-center text-[10px] th-text-dim mt-2 px-1">
+      <div class="flex items-center justify-center text-[11px] th-text-dim mt-2 px-1">
         <span>Shift+Enter for new line</span>
       </div>
     </div>
   </div>
 </template>
-
-<style>
-.custom-scrollbar::-webkit-scrollbar { width: 6px; }
-.custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 4px; }
-.dark .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
-.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 4px; }
-.dark .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); }
-.custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.3); }
-.dark .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
-</style>

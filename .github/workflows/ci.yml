@@ -5,11 +5,19 @@ on:
     branches: [main]
     paths:
       - 'gasket/**'
+      - 'web/src/**'
+      - 'web/src-tauri/**'
+      - 'web/package.json'
+      - 'web/pnpm-lock.yaml'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'gasket/**'
+      - 'web/src/**'
+      - 'web/src-tauri/**'
+      - 'web/package.json'
+      - 'web/pnpm-lock.yaml'
       - '.github/workflows/ci.yml'
 
 env:
@@ -18,21 +26,14 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Test (Rust)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -43,31 +44,26 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      
-      # - name: Check formatting
-      #   run: cd gasket && cargo fmt --all -- --check
-      
-      # - name: Run clippy
-      #   run: cd gasket && cargo clippy --all-features -- -D warnings
-      
+
+      - name: Check formatting
+        run: cd gasket && cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cd gasket && cargo clippy --all-features -- -D warnings
+
       - name: Run tests
         run: cd gasket && cargo test --all-features
 
   build:
-    name: Build
+    name: Build (Rust)
     runs-on: ubuntu-latest
     needs: test
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -78,10 +74,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      
+
       - name: Build release
         run: cd gasket && cargo build --release --all-features
-      
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -94,15 +90,10 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -113,10 +104,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      
+
       - name: Build release
         run: cd gasket && cargo build --release --all-features
-      
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -129,15 +120,10 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -148,18 +134,53 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('gasket/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      
+
       - name: Build release
         run: cd gasket && cargo build --release --all-features
-      
+
       - name: Package binary
         run: |
           cd gasket/target/release
-          Compress-Archive -Update -Path gasket.exe -DestinationPath gasket-windows.zip 
-      
+          Compress-Archive -Update -Path gasket.exe -DestinationPath gasket-windows.zip
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: gasket-windows
           path: gasket/target/release/gasket-windows.zip
 
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+        working-directory: web
+
+      - name: Type-check (vue-tsc)
+        run: pnpm vue-tsc -b --noEmit
+        working-directory: web
+
+      - name: Build (vite)
+        run: pnpm build
+        working-directory: web
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist

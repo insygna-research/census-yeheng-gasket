@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Gasket",
-  "version": "0.0.0",
+  "version": "2.0.0",
   "identifier": "com.gasket.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -13,14 +13,18 @@
     "windows": [
       {
         "title": "Gasket",
-        "width": 800,
-        "height": 600,
+        "width": 960,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 480,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*"
     }
   },
   "bundle": {

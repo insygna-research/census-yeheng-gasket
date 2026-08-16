@@ -1,106 +1,93 @@
 # =============================================================================
-# gasket Dockerfile - Multi-platform (Rust)
+# gasket Dockerfile - Multi-stage build (Rust gateway + Vue frontend)
 # =============================================================================
-# Build target: rust (default)
+# Produces a single image running `gasket-gateway` on port 3000, serving the
+# built Vue frontend from /app/web/dist.
+#
 # Usage:
 #   docker build -t gasket .
+#   docker run -d -p 3000:3000 \
+#     -e GASKET_LLM_BASE_URL=... -e GASKET_LLM_KEY=... \
+#     -e GASKET_LLM_MODEL=... -e GASKET_LLM_API=openai \
+#     gasket
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Stage 1: Rust Builder
+# Stage 1: Frontend builder (Vue 3 + Vite → dist/)
+# -----------------------------------------------------------------------------
+FROM node:20-bookworm-slim AS web-builder
+
+WORKDIR /web
+
+# Install pnpm
+RUN npm install -g pnpm@9
+
+# Copy lockfile + package.json first for cache
+COPY web/package.json web/pnpm-lock.yaml ./
+
+RUN pnpm install --frozen-lockfile
+
+# Copy the rest of the frontend source and build
+COPY web/ ./
+RUN pnpm build
+
+# -----------------------------------------------------------------------------
+# Stage 2: Rust builder (gasket-gateway binary)
 # -----------------------------------------------------------------------------
 FROM rust:1.82-bookworm AS rust-builder
 
 WORKDIR /build
 
-# Install build dependencies (protoc is required by lance-encoding -> prost-build)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        pkg-config \
-        libssl-dev \
-        protobuf-compiler && \
-    rm -rf /var/lib/apt/lists/*
-
 # Copy workspace root files for dependency caching
 COPY gasket/Cargo.toml gasket/Cargo.lock ./
 
 # Copy all workspace member Cargo.toml files
-COPY gasket/types/Cargo.toml ./types/
-COPY gasket/storage/Cargo.toml ./storage/
-COPY gasket/embedding/Cargo.toml ./embedding/
-COPY gasket/broker/Cargo.toml ./broker/
-COPY gasket/engine/Cargo.toml ./engine/
-COPY gasket/cli/Cargo.toml ./cli/
-COPY gasket/providers/Cargo.toml ./providers/
-COPY gasket/channels/Cargo.toml ./channels/
-COPY gasket/sandbox/Cargo.toml ./sandbox/
-COPY gasket/wiki/Cargo.toml ./wiki/
+COPY gasket/gasket-core/Cargo.toml ./gasket-core/
+COPY gasket/gasket-host/Cargo.toml ./gasket-host/
+COPY gasket/gasket-cli/Cargo.toml ./gasket-cli/
+COPY gasket/gasket-ext/Cargo.toml ./gasket-ext/
+COPY gasket/gasket-gateway/Cargo.toml ./gasket-gateway/
 
 # Create dummy source files so cargo can build dependencies layer
 RUN mkdir -p \
-        types/src \
-        storage/src \
-        embedding/src \
-        broker/src \
-        engine/src \
-        cli/src \
-        providers/src \
-        channels/src \
-        sandbox/src \
-        wiki/src && \
-    echo "pub fn dummy() {}" > types/src/lib.rs && \
-    echo "pub fn dummy() {}" > storage/src/lib.rs && \
-    echo "pub fn dummy() {}" > embedding/src/lib.rs && \
-    echo "pub fn dummy() {}" > broker/src/lib.rs && \
-    echo "pub fn dummy() {}" > engine/src/lib.rs && \
-    echo "fn main() {}" > cli/src/main.rs && \
-    echo "pub fn dummy() {}" > providers/src/lib.rs && \
-    echo "pub fn dummy() {}" > channels/src/lib.rs && \
-    echo "pub fn dummy() {}" > sandbox/src/lib.rs && \
-    echo "pub fn dummy() {}" > wiki/src/lib.rs && \
-    cargo build --release --all-features && \
+        gasket-core/src \
+        gasket-host/src \
+        gasket-cli/src \
+        gasket-ext/src \
+        gasket-gateway/src && \
+    echo "pub fn dummy() {}" > gasket-core/src/lib.rs && \
+    echo "pub fn dummy() {}" > gasket-host/src/lib.rs && \
+    echo "fn main() {}" > gasket-cli/src/main.rs && \
+    echo "pub fn dummy() {}" > gasket-ext/src/lib.rs && \
+    echo "fn main() {}" > gasket-gateway/src/main.rs && \
+    cargo build --release --bin gasket-gateway --all-features && \
     rm -rf \
-        types/src \
-        storage/src \
-        embedding/src \
-        broker/src \
-        engine/src \
-        cli/src \
-        providers/src \
-        channels/src \
-        sandbox/src \
-        wiki/src
+        gasket-core/src \
+        gasket-host/src \
+        gasket-cli/src \
+        gasket-ext/src \
+        gasket-gateway/src
 
 # Copy actual source code
-COPY gasket/types/src ./types/src
-COPY gasket/storage/src ./storage/src
-COPY gasket/embedding/src ./embedding/src
-COPY gasket/broker/src ./broker/src
-COPY gasket/engine/src ./engine/src
-COPY gasket/cli/src ./cli/src
-COPY gasket/providers/src ./providers/src
-COPY gasket/channels/src ./channels/src
-COPY gasket/sandbox/src ./sandbox/src
-COPY gasket/wiki/src ./wiki/src
+COPY gasket/gasket-core/src ./gasket-core/src
+COPY gasket/gasket-host/src ./gasket-host/src
+COPY gasket/gasket-cli/src ./gasket-cli/src
+COPY gasket/gasket-ext/src ./gasket-ext/src
+COPY gasket/gasket-gateway/src ./gasket-gateway/src
 
 # Touch source files to invalidate cargo cache and rebuild
 RUN touch \
-        types/src/lib.rs \
-        storage/src/lib.rs \
-        embedding/src/lib.rs \
-        broker/src/lib.rs \
-        engine/src/lib.rs \
-        cli/src/main.rs \
-        providers/src/lib.rs \
-        channels/src/lib.rs \
-        sandbox/src/lib.rs \
-        wiki/src/lib.rs && \
-    cargo build --release --all-features
+        gasket-core/src/lib.rs \
+        gasket-host/src/lib.rs \
+        gasket-cli/src/main.rs \
+        gasket-ext/src/lib.rs \
+        gasket-gateway/src/main.rs && \
+    cargo build --release --bin gasket-gateway --all-features
 
 # -----------------------------------------------------------------------------
-# Stage 2: Rust Runtime
+# Stage 3: Runtime
 # -----------------------------------------------------------------------------
-FROM debian:bookworm-slim AS rust
+FROM debian:bookworm-slim AS runtime
 
 # Install runtime dependencies
 RUN apt-get update && \
@@ -111,14 +98,20 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=rust-builder /build/target/release/gasket /usr/local/bin/gasket
+# Copy the gateway binary
+COPY --from=rust-builder /build/target/release/gasket-gateway /usr/local/bin/gasket-gateway
+
+# Copy the built frontend
+COPY --from=web-builder /web/dist /app/web/dist
 
 # Create config directory
 RUN mkdir -p /root/.gasket
 
 # Gateway default port
-EXPOSE 18790
+EXPOSE 3000
 
-ENTRYPOINT ["gasket"]
-CMD ["status"]
+# Point the gateway at the bundled frontend
+ENV GASKET_GATEWAY_STATIC_DIR=/app/web/dist
+
+ENTRYPOINT ["gasket-gateway"]
+CMD []

@@ -10,6 +10,8 @@ export interface SubagentToolCall {
   status: 'running' | 'complete' | 'error';
   output?: string | null;
   duration?: string;
+  /** Start timestamp (ms) — duration is derived from this, never parsed from id. */
+  startTime?: number;
 }
 
 /**
@@ -33,7 +35,7 @@ export interface SubagentState {
   toolCalls: SubagentToolCall[];
   /** Total tool call count */
   toolCount: number;
-  /** Brief summary (first 100 chars of result) */
+  /** Brief summary (first 200 chars of the sub-agent's final text) */
   summary?: string;
   /** Error message if status is 'error' */
   error?: string;
@@ -44,8 +46,53 @@ export interface SubagentState {
 }
 
 /**
- * WebSocket message types for subagent events
- * These correspond to the Rust WebSocketMessage enum variants
+ * The gateway→frontend wire protocol, field-for-field.
+ * Source of truth: `gasket-host/src/wire.rs` (OutgoingEvent) and
+ * `gasket-host/src/event_map.rs::subagent_event_to_ws`. Add fields, never
+ * rename — this union IS the contract.
+ */
+export type WsMessage =
+  // ── main agent stream ──
+  | { type: 'thinking'; content: string }
+  | { type: 'content'; content: string }
+  | { type: 'text'; content: string } // legacy alias still accepted
+  | { type: 'tool_start'; name: string; arguments?: string; tool_call_id?: string }
+  | { type: 'tool_end'; name: string; output?: string; error?: string; tool_call_id?: string }
+  | { type: 'error'; content?: string; message?: string }
+  | { type: 'done'; usage_in?: number; usage_out?: number; elapsed_ms?: number }
+  | { type: 'busy'; content?: string; message?: string }
+  | { type: 'approval_request'; id: string; tool_name: string; description: string; arguments: string }
+  // ── subagent_* (all 9 wire variants; Usage never leaves the server) ──
+  | SubagentWsMessage;
+
+/**
+ * Runtime guard: a parsed WS/Tauri payload with a known `type` discriminant.
+ * Unknown types (future protocol) fall through as `null`.
+ */
+const WS_MESSAGE_TYPES = new Set([
+  'thinking', 'content', 'text', 'tool_start', 'tool_end', 'error', 'done',
+  'busy', 'approval_request',
+  'subagent_all_started', 'subagent_synthesizing', 'subagent_started',
+  'subagent_thinking', 'subagent_content', 'subagent_tool_start',
+  'subagent_tool_end', 'subagent_completed', 'subagent_error',
+]);
+
+export function parseWsMessage(raw: unknown): WsMessage | null {
+  if (typeof raw !== 'object' || raw === null || !('type' in raw)) {
+    return null;
+  }
+  const t = raw.type; // narrowed to unknown by the `in` check above
+  if (typeof t === 'string' && WS_MESSAGE_TYPES.has(t)) {
+    // Known discriminant: this is a WsMessage by construction of the
+    // server-side serializer (wire.rs / event_map.rs).
+    const msg: WsMessage = raw as WsMessage;
+    return msg;
+  }
+  return null;
+}
+
+/**
+ * Subagent message types for real-time UI updates
  */
 export type SubagentWsMessage =
   | { type: 'subagent_all_started'; count: number }
@@ -54,7 +101,7 @@ export type SubagentWsMessage =
   | { type: 'subagent_thinking'; id: string; content: string }
   | { type: 'subagent_content'; id: string; content: string }
   | { type: 'subagent_tool_start'; id: string; name: string; arguments?: string }
-  | { type: 'subagent_tool_end'; id: string; tool_id?: string; name: string; output?: string }
+  | { type: 'subagent_tool_end'; id: string; name: string; output?: string }
   | { type: 'subagent_completed'; id: string; index: number; summary: string; tool_count: number }
   | { type: 'subagent_error'; id: string; index: number; error: string };
 
@@ -100,15 +147,30 @@ export interface Message {
   timestamp: number;
   status?: MessageStatus;
   pending?: boolean;
+  /** Turn summary: cumulative tokens + elapsed time, populated when the
+   * `done` event for this bot reply carries `usage_in`/`usage_out`/`elapsed_ms`.
+   * Absent for slash-command replies and pre-summary turns. */
+  turnSummary?: TurnSummary;
 }
 
+/** Usage line shown after a completed turn. */
+export interface TurnSummary {
+  /** Cumulative input tokens across the session so far. */
+  usageIn: number;
+  /** Cumulative output tokens across the session so far. */
+  usageOut: number;
+  /** Wall-clock duration of this turn in milliseconds. */
+  elapsedMs: number;
+}
+
+/** Mirrors the JSON shape sent by both the gateway's
+ * `GET /api/sessions/:id/context` and the Tauri `get_context` command. */
 export interface ContextStats {
-  token_budget: number;
-  compaction_threshold: number;
-  threshold_tokens: number;
   current_tokens: number;
   usage_percent: number;
   is_compressing: boolean;
+  cumulative_in: number;
+  cumulative_out: number;
 }
 
 export interface WatermarkInfo {

@@ -1,6 +1,6 @@
 [package]
 name = "gasket"
-version = "0.0.0"
+version = "1.0.0"
 description = "Gasket desktop application"
 authors = ["you"]
 license = ""
@@ -23,3 +23,11 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+dashmap = "6"
+gasket-core = { path = "../../gasket/gasket-core" }
+gasket-host = { path = "../../gasket/gasket-host", features = ["session-index"] }
+gasket-ext = { path = "../../gasket/gasket-ext", features = ["terminal"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
+dotenvy = "0.15.7"

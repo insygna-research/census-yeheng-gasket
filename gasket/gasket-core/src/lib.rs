@@ -1,0 +1,55 @@
+//! gasket-core — a pi-style pluggable agent core.
+//!
+//! A single `agent_loop` function plus an `ExtensionApi` trait. Extra tools and
+//! hooks come from in-process Rust extension crates that call `register` at
+//! host startup (optionally behind Cargo features). No dynamic library loading.
+
+pub mod agent_loop;
+pub mod error;
+pub mod extension;
+pub mod guard;
+pub mod providers;
+pub mod proxy;
+pub mod storage;
+pub mod subagent;
+pub mod tools;
+pub mod types;
+
+#[cfg(test)]
+pub(crate) mod test_util;
+pub use agent_loop::{agent_loop, run_agent_loop};
+pub use error::{AgentError, ToolError};
+pub use extension::{ExtensionApi, ExtensionApiImpl};
+pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
+pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
+pub use storage::{is_valid_session_id, EventStorage, JsonlStorage, SessionMeta};
+pub use subagent::{
+    NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
+};
+pub use tools::built_in_tools;
+pub use types::context::{
+    AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,
+    StreamFn, ThinkingLevel,
+};
+pub use types::event::{AgentEvent, ContentDelta};
+pub use types::message::{
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
+};
+pub use types::session_event::{
+    derive_messages, repair_unanswered_tool_calls, CancelCause, SessionEvent, TurnEndReason,
+};
+pub use types::tool::{
+    HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,
+    ToolResult,
+};
+
+/// Current monotonically-increasing time in milliseconds since UNIX epoch.
+///
+/// Used for message timestamps.
+pub fn now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

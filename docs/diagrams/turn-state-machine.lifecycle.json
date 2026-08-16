@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "gasket Agent 轮次状态机",
+    "output": "docs/diagrams/turn-state-machine.lifecycle.html",
+    "quality_profile": "showcase",
+    "viewBox": [1000, 720],
+    "views": [
+      { "id": "happy-path", "label": "主路径", "focus": ["tstart", "infer", "tools", "gate", "tend"], "note": "TurnStart 到 Completed 的五段主轨。" },
+      { "id": "approval-gate", "label": "审批等待", "focus": ["tools", "appr", "abort"], "note": "人工审批挂起与恢复,或转入中止。" },
+      { "id": "recovery-exits", "label": "恢复与终态", "focus": ["infer", "retry", "abort", "err"], "note": "可重试失败与不可恢复终态的边界。" }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "轮次主流程" },
+    { "id": "waiting", "label": "人工等待" },
+    { "id": "terminal", "label": "终态与恢复" }
+  ],
+  "states": [
+    { "id": "tstart", "type": "start", "label": "TurnStart", "sublabel": "轮次开启 · 用户消息先落盘", "lane": "main", "col": 0, "step": "01" },
+    { "id": "infer", "type": "active", "label": "LLM 推理", "sublabel": "stream_fn · SSE 流式", "lane": "main", "col": 1, "step": "02", "tag": "循环体" },
+    { "id": "tools", "type": "active", "label": "工具调用", "sublabel": "hook 裁决 → execute → persist", "lane": "main", "col": 2, "step": "03", "tag": "循环体" },
+    { "id": "gate", "type": "decision", "label": "结束判定", "sublabel": "EndTurn / ToolUse / 超限", "lane": "main", "col": 3, "step": "04" },
+    { "id": "tend", "type": "success", "label": "TurnEnd · Completed", "sublabel": "done 推送前端", "lane": "main", "col": 4, "step": "05" },
+    { "id": "appr", "type": "waiting", "label": "审批等待", "sublabel": "oneshot · cancel · 超时", "lane": "waiting", "col": 2, "tag": "可恢复" },
+    { "id": "retry", "type": "failure", "label": "流启动失败", "sublabel": "首 chunk 前失败", "lane": "terminal", "col": 0, "tag": "可恢复" },
+    { "id": "abort", "type": "failure", "label": "Aborted", "sublabel": "User / Parent / Hook 中止", "lane": "terminal", "col": 1, "tag": "终态" },
+    { "id": "err", "type": "failure", "label": "Error", "sublabel": "TurnEnd{reason} 仍落盘", "lane": "terminal", "col": 2, "tag": "终态" }
+  ],
+  "transitions": [
+    { "id": "tools-infer", "from": "tools", "to": "infer", "label": "ToolResult 回喂", "route": "top-channel", "labelDy": -22 },
+    { "id": "tools-appr", "from": "tools", "to": "appr", "label": "需人工审批", "variant": "security", "fromSide": "bottom", "toSide": "top" },
+    { "id": "appr-tools", "from": "appr", "to": "tools", "label": "Allow / Modify", "variant": "emphasis", "fromSide": "top", "toSide": "bottom", "labelDx": 96 },
+    { "id": "appr-abort", "from": "appr", "to": "abort", "label": "拒绝 / 超时 / 取消", "variant": "security", "route": "drop", "labelDy": 26 },
+    { "id": "infer-retry", "from": "infer", "to": "retry", "label": "首 chunk 前失败", "variant": "security", "fromSide": "bottom", "toSide": "top", "labelAt": [180, 240] },
+    { "id": "retry-infer", "from": "retry", "to": "infer", "label": "退避重试", "variant": "emphasis", "fromSide": "top", "toSide": "bottom", "labelDx": 118 },
+    { "id": "infer-abort", "from": "infer", "to": "abort", "label": "signal 协作中止", "route": "drop", "labelAt": [150, 380] },
+    { "id": "infer-err", "from": "infer", "to": "err", "label": "流中途失败(不重试)", "route": "bottom-channel", "labelDx": 60, "labelDy": 46 }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "五段主轨",
+      "items": [
+        "TurnStart → 推理 → 工具 → 判定 → Completed 由一条水平主轨承载",
+        "工具结果回喂形成推理 ↔ 工具的内循环",
+        "TurnEnd 无论成败总是落盘,不存在静默半截对话"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "审批门",
+      "items": [
+        "审批等待是可恢复状态:Allow / Modify 回到工具执行",
+        "等待由 oneshot + cancel + 超时三路 select 守护",
+        "拒绝、超时或取消把轮次转入 Aborted 终态"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "恢复与终态",
+      "items": [
+        "仅首 chunk 前的流失败可重试;流中途失败直接上报",
+        "Aborted{User / Parent / Hook} 保留已发生的部分转录",
+        "Error 与 Aborted 都是终态,不再指回活跃执行"
+      ]
+    }
+  ]
+}

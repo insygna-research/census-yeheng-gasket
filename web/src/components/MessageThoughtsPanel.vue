@@ -13,7 +13,6 @@ import {
 } from 'lucide-vue-next';
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible';
 import type { Message, SubagentState, TimelineItem, ToolCall } from '../types';
-import SubagentGridPanel from './SubagentGridPanel.vue';
 import SubagentThoughtsPanel from './SubagentThoughtsPanel.vue';
 
 const props = defineProps<{
@@ -161,7 +160,7 @@ function iconForStatus(status: ToolCall['status']) {
         </span>
         <span
           v-if="hasTools"
-          class="text-[10px] th-text-muted flex items-center gap-1"
+          class="text-[11px] th-text-muted flex items-center gap-1"
         >
           <Wrench class="w-3 h-3" />
           <span v-if="errorToolCount > 0" class="text-destructive">{{ errorToolCount }} failed</span>
@@ -169,7 +168,7 @@ function iconForStatus(status: ToolCall['status']) {
         </span>
       </div>
 
-      <div class="flex items-center gap-1.5 text-[10px] th-text-muted">
+      <div class="flex items-center gap-1.5 text-[11px] th-text-muted">
         <span v-if="!expanded" class="hidden sm:inline">Expand to view model thoughts</span>
         <ChevronDown
           class="w-4 h-4 text-muted-foreground transition-transform"
@@ -213,14 +212,14 @@ function iconForStatus(status: ToolCall['status']) {
                 {{ item.tool.name }}
               </span>
               <span
-                class="text-[10px] px-1.5 py-0.5 rounded-full border shrink-0"
+                class="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
                 :class="statusClasses(item.tool.status)"
               >
                 {{ statusLabel(item.tool.status) }}
               </span>
               <span
                 v-if="item.tool.duration"
-                class="text-[10px] opacity-70 shrink-0"
+                class="text-[11px] opacity-70 shrink-0"
               >
                 {{ item.tool.duration }}
               </span>
@@ -236,7 +235,7 @@ function iconForStatus(status: ToolCall['status']) {
             <div class="px-2.5 pb-2.5 space-y-2">
               <!-- Input -->
               <div v-if="item.tool.arguments" class="space-y-1">
-                <div class="flex items-center gap-1 text-[10px] opacity-70 uppercase tracking-wider">
+                <div class="flex items-center gap-1 text-[11px] opacity-70 uppercase tracking-wider">
                   <Terminal class="w-3 h-3" />
                   <span>Input</span>
                 </div>
@@ -249,7 +248,7 @@ function iconForStatus(status: ToolCall['status']) {
 
               <!-- Output / Error -->
               <div v-if="item.tool.result" class="space-y-1">
-                <div class="flex items-center gap-1 text-[10px] uppercase tracking-wider"
+                <div class="flex items-center gap-1 text-[11px] uppercase tracking-wider"
                   :class="item.tool.status === 'error' ? 'text-destructive opacity-90' : 'opacity-70'"
                 >
                   <ArrowRight class="w-3 h-3" />
@@ -278,15 +277,12 @@ function iconForStatus(status: ToolCall['status']) {
         </div>
       </div>
 
+      <!-- subagent_* 协议已实现：当 spawn_subagents 工具被调用时，网关转发子 agent 事件，以下渲染 -->
       <!-- Subagent results -->
-      <SubagentGridPanel
-        v-if="subagents && subagents.length > 0 && ['running', 'synthesizing'].includes(subagentPhase || 'idle')"
-        :subagents="subagents"
-        :phase="(subagentPhase as 'running' | 'synthesizing') || 'running'"
-      />
       <SubagentThoughtsPanel
-        v-if="subagents && subagents.length > 0 && !['running', 'synthesizing'].includes(subagentPhase || 'idle')"
+        v-if="subagents && subagents.length > 0"
         :subagents="subagents"
+        :phase="subagentPhase || 'completed'"
       />
     </div>
   </div>

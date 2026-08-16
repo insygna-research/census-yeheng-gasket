@@ -17,3 +17,16 @@ body {
   height: 100%;
   display: flex;
 }
+
+/* Window drag regions: Tauri only honors the attribute on the exact
+   event target, so children must not swallow the gesture. Interactive
+   controls re-enable pointer events explicitly. */
+[data-tauri-drag-region] * {
+  pointer-events: none;
+}
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] a,
+[data-tauri-drag-region] [role='button'] {
+  pointer-events: auto;
+}

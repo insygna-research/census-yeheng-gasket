@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "gasket 会话事件日志数据流",
+    "output": "docs/diagrams/session-event-log.dataflow.html",
+    "quality_profile": "showcase",
+    "viewBox": [1160, 820],
+    "views": [
+      { "id": "produce-append", "label": "产生与落盘", "focus": ["uin", "side", "persist", "legacy", "log"], "note": "副作用发生即逐事件追加。" },
+      { "id": "project", "label": "派生投影", "focus": ["log", "derive", "compact"], "note": "历史每轮现派生,压缩只缩内存。" },
+      { "id": "consume", "label": "消费面", "focus": ["compact", "llm", "rest", "fe"], "note": "模型与前端都从同一真相源取数。" }
+    ]
+  },
+  "stages": [
+    { "label": "产生" },
+    { "label": "落盘" },
+    { "label": "派生" },
+    { "label": "消费" }
+  ],
+  "nodes": [
+    { "id": "uin", "type": "frontend", "label": "用户输入", "sublabel": "CLI / WS / IPC", "stage": 0, "row": 0, "width": 140 },
+    { "id": "side", "type": "backend", "label": "agent loop 副作用", "sublabel": "Assistant · ToolResult", "stage": 0, "row": 2, "tag": "发生即落盘", "width": 150 },
+    { "id": "persist", "type": "backend", "label": "persist 回调", "sublabel": "Assistant 先于工具", "stage": 1, "row": 0, "width": 150 },
+    { "id": "log", "type": "database", "label": "events.jsonl", "sublabel": "每行一条 SessionEvent", "stage": 1, "row": 2, "tag": "torn-tail 自愈", "width": 160 },
+    { "id": "legacy", "type": "database", "label": "messages.jsonl", "sublabel": "旧格式迁移源", "stage": 1, "row": 4, "tag": "迁移后删除", "width": 150 },
+    { "id": "derive", "type": "backend", "label": "derive_messages", "sublabel": "TurnStart/End 不产出", "stage": 2, "row": 0, "tag": "纯投影", "width": 150 },
+    { "id": "compact", "type": "backend", "label": "ContextBudget 压缩", "sublabel": "只缩内存 · 预算自尾部", "stage": 2, "row": 2, "width": 160 },
+    { "id": "rest", "type": "backend", "label": "REST 转录端点", "sublabel": "按需派生 · 未知 key 404", "stage": 2, "row": 4, "width": 160 },
+    { "id": "llm", "type": "external", "label": "LLM Provider", "sublabel": "模型可见消息", "stage": 3, "row": 1, "width": 140 },
+    { "id": "fe", "type": "frontend", "label": "前端 / CLI", "sublabel": "会话恢复 · 转录", "stage": 3, "row": 3, "width": 140 }
+  ],
+  "flows": [
+    { "id": "f-user", "from": "uin", "to": "persist", "label": "User 事件", "classification": "先于循环落盘", "variant": "default", "route": "straight", "fromSide": "right", "toSide": "left", "labelDy": -28 },
+    { "id": "f-side", "from": "side", "to": "persist", "label": "副作用流", "classification": "Assistant{usage} · ToolResult", "variant": "emphasis", "labelDy": -24 },
+    { "id": "f-append", "from": "persist", "to": "log", "label": "append_event_sync", "classification": "写序 == 执行序", "variant": "emphasis", "labelAt": [370, 270] },
+    { "id": "f-migrate", "from": "legacy", "to": "log", "label": "append_events_atomic", "classification": "tmp + rename", "variant": "dashed", "labelDx": -96 },
+    { "id": "f-load", "from": "log", "to": "derive", "label": "load_events", "classification": "fail-closed", "variant": "default", "labelDy": -24 },
+    { "id": "f-full", "from": "derive", "to": "compact", "label": "全量消息列表", "classification": "每轮现派生", "variant": "default", "labelAt": [520, 270] },
+    { "id": "f-feed", "from": "compact", "to": "llm", "label": "工作内存(可能压缩)", "classification": "喂给模型", "variant": "emphasis", "labelAt": [640, 330] },
+    { "id": "f-rest", "from": "log", "to": "rest", "label": "按需投影", "variant": "dashed", "fromSide": "bottom", "toSide": "left", "via": [[315, 500], [405, 500], [405, 613]], "labelAt": [450, 545] },
+    { "id": "f-transcript", "from": "rest", "to": "fe", "label": "转录 JSON", "classification": "恢复会话", "variant": "default" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "追加即真相",
+      "items": [
+        "磁盘 events.jsonl 是唯一真相源,内存不持有 transcript",
+        "每个副作用在发生时就落盘,崩溃轮次保留已发生事实",
+        "迁移经 tmp+rename 原子安装,成功后才删旧文件"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "投影无状态",
+      "items": [
+        "derive_messages 是纯函数:事件日志 → 模型可见消息",
+        "压缩只作用于工作内存,日志永远完整",
+        "torn-tail 自愈丢崩溃截断行;中段损坏 fail-closed 报行号"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "两个消费面",
+      "items": [
+        "LLM 每轮消费压缩后的工作内存",
+        "GET /api/sessions/{key}/messages 按需从磁盘派生转录",
+        "前端不缓存会话,CLI 恢复读同一份日志"
+      ]
+    }
+  ]
+}

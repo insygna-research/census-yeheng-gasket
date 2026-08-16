@@ -11,16 +11,11 @@ description = "A lightweight personal AI assistant framework"
 [workspace]
 resolver = "2"
 members = [
-    "types",
-    "storage",
-    "embedding",
-    "broker",
-    "engine",
-    "cli",
-    "providers",
-    "channels",
-    "sandbox",
-    "command",
+    "gasket-core",
+    "gasket-host",
+    "gasket-cli",
+    "gasket-ext",
+    "gasket-gateway",
 ]
 
 [profile.release]
@@ -28,18 +23,22 @@ opt-level = "z"
 lto = "fat"
 strip = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 debug = false
 incremental = false
 
 [workspace.dependencies]
+# Internal crates
+gasket-core = { path = "gasket-core" }
+gasket-host = { path = "gasket-host" }
+gasket-ext = { path = "gasket-ext" }
+
 # Async runtime
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "sync", "time",
     "fs", "io-util", "net", "process", "signal",
 ] }
 tokio-util = { version = "0.7", features = ["rt", "codec"] }
-async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3.32"
 
@@ -48,7 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # HTTP client
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
 
@@ -59,34 +58,17 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# OpenTelemetry
-opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.29", default-features = false, features = ["trace", "http-json", "reqwest-client"] }
-tracing-opentelemetry = "0.30"
-
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # Configuration
 dirs = "6"
-directories = "5"
+directories = "6"
+dotenvy = "0.15"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-
-# Telegram
-teloxide = { version = "0.17", features = ["rustls"] }
-
-# Discord
-serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "model", "client"] }
-
-# WebSocket (for Slack)
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-
-# Token counting
-tiktoken-rs = "0.11"
 
 # File watcher
 notify = "8"
@@ -94,48 +76,21 @@ notify = "8"
 # YAML
 serde_yaml = "0.9"
 
-# Cron
-cron = "0.15"
-
 # UUID
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-
-# Internal crates
-gasket-types = { path = "types" }
-gasket-storage = { path = "storage" }
-gasket-embedding = { path = "embedding" }
-gasket-providers = { path = "providers" }
-gasket-channels = { path = "channels" }
-gasket-sandbox = { path = "sandbox" }
-gasket-broker = { path = "broker" }
-gasket-engine = { path = "engine" }
-
-# Async channel primitives
-async-channel = "2"
-
-# Markdown rendering
-termimad = "0.34.1"
 
 # HTTP server (for webhooks)
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
-
-# Terminal
-colored = "3"
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 
 # REPL
-reedline = "0.45"
+reedline = "0.49"
 nu-ansi-term = "0.50"
-
-# Interactive CLI
-dialoguer = "0.11"
-
-# HTML content extraction (Readability algorithm)
-readability = "0.3"
 
 # Concurrent data structures
 dashmap = "6"
+parking_lot = "0.12"
 
 # Test utilities
 tempfile = "3"

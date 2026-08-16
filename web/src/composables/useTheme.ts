@@ -1,11 +1,12 @@
 import { computed, ref, watch } from 'vue'
+import { readJSON, readString, storageKeys, writeJSON } from '@/lib/storage'
 
-const STORAGE_KEY = 'gasket_theme_v2'
+const STORAGE_KEY = storageKeys.theme
 const LEGACY_KEY = 'gasket_theme'
 
 export type ThemeMode = 'light' | 'dark'
 export type ThemeHue = 'zinc' | 'blue' | 'rose' | 'emerald' | 'amber' | 'violet'
-export type MarkdownStyle = 'classic' | 'github' | 'hope' | 'fancy' | 'journal' | 'geek' | 'vlook-hope' | 'vlook-fancy' | 'vlook-geek' | 'vlook-joint' | 'vlook-solaris' | 'vlook-thinking'
+export type MarkdownStyle = 'classic' | 'github'
 
 export interface ThemeState {
   mode: ThemeMode
@@ -14,36 +15,23 @@ export interface ThemeState {
 }
 
 const HUES: ThemeHue[] = ['zinc', 'blue', 'rose', 'emerald', 'amber', 'violet']
-const MARKDOWN_STYLES: MarkdownStyle[] = ['classic', 'github', 'hope', 'fancy', 'journal', 'geek', 'vlook-hope', 'vlook-fancy', 'vlook-geek', 'vlook-joint', 'vlook-solaris', 'vlook-thinking']
+const MARKDOWN_STYLES: MarkdownStyle[] = ['classic', 'github']
 
-// Migrate legacy markdown style names to new VLOOK-inspired names
+// Migrate legacy/removed markdown style names to the current set
 function migrateMarkdownStyle(old: string | undefined): MarkdownStyle {
-  const map: Record<string, MarkdownStyle> = {
-    default: 'classic',
-    minimal: 'hope',
-    elegant: 'fancy',
-    serif: 'journal',
-    monospace: 'geek',
-  }
-  const migrated = old && map[old] ? map[old] : old
-  return MARKDOWN_STYLES.includes(migrated as MarkdownStyle) ? (migrated as MarkdownStyle) : 'classic'
+  return old === 'github' ? 'github' : 'classic'
 }
 
 function getInitialState(): ThemeState {
   // Try new format first
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
-      const parsed = JSON.parse(stored)
-      if (parsed.mode && parsed.hue && HUES.includes(parsed.hue)) {
-        const md: MarkdownStyle = migrateMarkdownStyle(parsed.markdownStyle)
-        return { mode: parsed.mode, hue: parsed.hue, markdownStyle: md }
-      }
-    }
-  } catch { /* ignore */ }
+  const parsed = readJSON<Partial<ThemeState> | null>(STORAGE_KEY, null)
+  if (parsed && parsed.mode && parsed.hue && HUES.includes(parsed.hue)) {
+    const md: MarkdownStyle = migrateMarkdownStyle(parsed.markdownStyle)
+    return { mode: parsed.mode, hue: parsed.hue, markdownStyle: md }
+  }
 
   // Migrate from legacy single-value theme
-  const legacy = localStorage.getItem(LEGACY_KEY) as ThemeMode | null
+  const legacy = readString(LEGACY_KEY) as ThemeMode | ''
   if (legacy === 'light' || legacy === 'dark') {
     return { mode: legacy, hue: 'zinc', markdownStyle: 'classic' }
   }
@@ -65,7 +53,7 @@ const applyTheme = (s: ThemeState) => {
   }
   root.setAttribute('data-hue', s.hue)
   root.setAttribute('data-md-style', s.markdownStyle)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(s))
+  writeJSON(STORAGE_KEY, s)
 }
 
 applyTheme(_state.value)
