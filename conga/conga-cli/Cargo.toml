@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 conga-host = { workspace = true }
-conga = { workspace = true }
+conga = { workspace = true, features = ["built-in-tools"] }
 conga-ext = { workspace = true, optional = true }
 reedline = { workspace = true }
 tokio = { workspace = true }

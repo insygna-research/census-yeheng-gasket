@@ -10,7 +10,7 @@ name = "conga-gateway"
 path = "src/main.rs"
 
 [dependencies]
-conga = { workspace = true }
+conga = { workspace = true, features = ["built-in-tools"] }
 conga-host = { workspace = true, features = ["session-index"] }
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }

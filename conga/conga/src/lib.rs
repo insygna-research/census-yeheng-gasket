@@ -12,6 +12,7 @@ pub mod providers;
 pub mod proxy;
 pub mod storage;
 pub mod subagent;
+#[cfg(feature = "built-in-tools")]
 pub mod tools;
 pub mod types;
 
@@ -26,6 +27,7 @@ pub use storage::{is_valid_session_id, EventStorage, JsonlStorage, SessionMeta};
 pub use subagent::{
     NoopSubagentSpawner, SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner,
 };
+#[cfg(feature = "built-in-tools")]
 pub use tools::built_in_tools;
 pub use types::context::{
     AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,
