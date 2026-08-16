@@ -175,31 +175,37 @@ gasket 本就自称 "pi-style"（`gasket-core/src/lib.rs:1`）。裁决原则：
 
 ### T4 依赖审计：core 产品重力清单（P2）
 
-- **目标**：产出基于引用事实的模块归属表：core 每个 pub 项 →「底座必需 / host 专属 / 待裁决」。
-- **方法**：`cargo tree` + 跨 crate 引用统计（host/cli/gateway/ext 各 import 什么）。
-  「待裁决」项列移动成本与建议。
-- **产出**：文档合入 `docs/`。**审计期间不改代码。**
+> **已完成（2026-08-16，scout subagent）**：产出 `docs/core-module-audit.md`（176 行，
+> 31 个 pub 模块全量 file:line 证据）。结论：**20 core-required / 11 host-only（全部是
+> tools/，已由 T6 gate）/ 0 待裁决**。关键证据：proxy.rs 被 conga-ext（search.rs:539）
+> 与 desktop（src-tauri/lib.rs:135）引用——ext 在 host 下层，不能反向依赖 host，
+> 留守 core 正确；subagent trait 被 `AgentContext.spawner`（types/context.rs:25）与
+> `ToolContext.spawner`（types/tool.rs:86）引用——类型契约，留守。意外收获：
+> `anyhow` 是死依赖（src/ 零 import）；`uuid` 仅 example 使用。
 
 ### T5 core 瘦身：产品重力移出（P2，R10 的兑现）
 
-- **目标**：`gasket-core` 只留 loop、types、providers（`StreamFn` + OpenAI 兼容 + Anthropic）、
-  storage（`EventStorage`）、extension API。`subagent`/`proxy`/`tools/sandbox` 按 T4 结论
-  移入 `gasket-host`（R8：**不拆新 crate**）。
-- **方案**：纯移动 + 可见性调整，不改逻辑。内部仓库无外部用户，调用方直接改干净，
-  不留 re-export 过渡层。
-- **验收**：`cargo build -p gasket-core --no-default-features` 独立编译通过；
-  `cargo tree -p gasket-core` 无纯产品重力依赖；全量测试绿。
-- **红线**：纯移动重构，禁止顺手改逻辑/重命名 pub 符号；`HookChain` 留在 core
-  （loop 的接缝，不是产品重力）；`EventStorage::open_or_migrate` 保留（保护已有磁盘数据）。
+> **已完成（2026-08-16，subagent，commit f048ba7）**。审计改写了任务范围：**0 个模块
+> 可移**——proxy/subagent-trait 留守有 file:line 证据（见 T4），原案的「移入 host」
+> 会在 ext 层级上造成循环依赖、在类型契约上造成 API 破坏。实际执行收敛为底座依赖面
+> 卫生：删除死依赖 `anyhow`（workspace 表保留，gateway 在用）；`uuid` 降为 dev-dep
+> （仅 cli_host example 使用）。验收：`--no-default-features` 依赖树（normal+build 边）
+> anyhow/uuid/ignore/glob/regex/dom_query **零出现**；318 tests（all-features）+
+> 111（默认面）绿；reviewer 0 findings。原案「`cargo build --no-default-features`
+> 通过 + 依赖树最小」验收由 T5+T6 联合达成。原案红线全部遵守
+> （零逻辑改动、零 pub 重命名、HookChain/EventStorage 原样）。
 
 ### T6 内置工具集降级为参考层（P2）
 
-- **目标**：core 默认编译面 = loop + types + providers + storage；8 个内置工具
-  （约 3,400 行）收进 `built-in-tools` feature，host 开启。
-- **方案**：`gasket-core` `default = []`；`ignore`/`glob`/`regex` 等重依赖挂 feature 下；
-  留一个 ~20 行 mock 工具作文档示例。
-- **验收**：无 feature 的 core 编译通过且依赖树最小；host/cli/gateway 行为零变化。
-- **红线**：不删任何工具实现，只改归属；不改 `ToolDefinition` pub API。
+> **已完成（2026-08-16，subagent，commit 5f1b09e）**：`tools/` 全模块（10 文件，
+> 含 sandbox/spawn_subagents/mod helpers）+ `built_in_tools` re-export 挂
+> `#[cfg(feature = "built-in-tools")]`；`default = []`；5 个 tools 专属依赖
+> （`ignore`/`glob`/`regex`/`dom_query`/`url`）转 optional 并入 feature；
+> conga-host/conga-cli/conga-gateway 显式启用（ext 不需要——自注册工具）；
+> cli_host example 挂 `required-features`。零行为变化（reviewer 判定 correct，
+> 逐条独立复核）。遗留 Minor：`sandbox-landlock` feature 不隐含 built-in-tools
+> （既有定义，informational，park）；plugin-tutorial.md 未提 feature（转最终
+> review/文档任务）。~20 行 mock 工具示例一项并入 T7 示例集执行。
 
 ### T7 双示例（P3）——发布部分已冻结（D4，2026-08-16）
 
