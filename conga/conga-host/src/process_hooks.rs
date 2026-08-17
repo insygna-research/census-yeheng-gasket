@@ -62,16 +62,6 @@ struct CommandHook {
     timeout: u64,
 }
 
-impl Default for CommandHook {
-    fn default() -> Self {
-        Self {
-            r#type: String::new(),
-            command: String::new(),
-            timeout: DEFAULT_TIMEOUT_SECS,
-        }
-    }
-}
-
 fn parse_matcher(raw: &str) -> ToolMatcher {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == "*" || normalized == "all" {
@@ -101,7 +91,13 @@ pub fn load_process_hooks(global_root: &Path, project_dir: &Path) -> Vec<Process
 fn load_file(path: &Path, out: &mut Vec<ProcessHook>) {
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
-        Err(_) => return, // no file = no hooks; not an error
+        // No file = no hooks; not an error. Anything else (EACCES, EISDIR,
+        // …) is loud: silently disabling the user's hooks is a trap.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "hooks.json unreadable; skipping file");
+            return;
+        }
     };
     let file: HooksFile = match serde_json::from_str(&raw) {
         Ok(f) => f,
@@ -232,6 +228,26 @@ mod tests {
         )
         .unwrap();
         // Bad global skipped; good project file still loads.
+        let hooks = load_process_hooks(g.path(), p.path());
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].command, "ok");
+    }
+
+    #[test]
+    fn unreadable_global_file_skips_loudly_but_project_loads() {
+        let g = tempfile::tempdir().unwrap();
+        let p = tempfile::tempdir().unwrap();
+        // A directory named hooks.json: read_to_string fails with EISDIR
+        // (on some platforms EACCES) — an IO error that is NOT NotFound.
+        // Must skip the file (warn, fail-open) without panicking, and the
+        // project file must still load.
+        std::fs::create_dir_all(g.path().join("hooks.json")).unwrap();
+        std::fs::create_dir_all(p.path().join(".conga")).unwrap();
+        std::fs::write(
+            p.path().join(".conga/hooks.json"),
+            hook_json(r#"{"hooks": [{"command": "ok"}]}"#),
+        )
+        .unwrap();
         let hooks = load_process_hooks(g.path(), p.path());
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].command, "ok");
