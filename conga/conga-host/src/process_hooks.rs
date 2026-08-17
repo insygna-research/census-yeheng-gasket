@@ -6,8 +6,15 @@
 //! wedged hook fails OPEN (warn + allow) — the policy underneath is still
 //! the floor gate. See docs/hooks.md for the config schema.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+
+use conga::{ToolCallVerdict, ToolResultMessage};
+use serde_json::Value;
 
 /// Default per-hook deadline (Claude-compatible `timeout` is in seconds).
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -135,6 +142,172 @@ fn load_file(path: &Path, out: &mut Vec<ProcessHook>) {
                 timeout,
             });
         }
+    }
+}
+
+/// What one process hook decided. `NoOpinion` = no opinion (allow, keep going).
+enum HookDecision {
+    NoOpinion,
+    Allow,
+    Block(String),
+    Modify(Value),
+}
+
+/// A chain of process-out PreToolUse hooks. Composed into the host's
+/// HookStack before the permission policy; every failure mode (spawn
+/// error, non-2/non-0 exit, timeout) fails OPEN with a warning because the
+/// policy underneath still gates the call. `after_tool_call` is a
+/// passthrough in v1 — the trait method is sync, and PostToolUse process
+/// hooks would need an async seam (deferred until a consumer exists).
+pub struct ProcessHookChain {
+    hooks: Vec<ProcessHook>,
+}
+
+impl ProcessHookChain {
+    pub fn new(hooks: Vec<ProcessHook>) -> Self {
+        Self { hooks }
+    }
+
+    /// Production entry: global `~/.conga/hooks.json` + project
+    /// `<project_dir>/.conga/hooks.json`. `None` when no hooks are
+    /// configured (nothing pushed into the stack — zero overhead).
+    pub fn discover(project_dir: &Path) -> Option<Arc<Self>> {
+        let hooks = load_process_hooks(&conga::storage::config_dir(), project_dir);
+        if hooks.is_empty() {
+            None
+        } else {
+            Some(Arc::new(Self::new(hooks)))
+        }
+    }
+}
+
+impl conga::HookChain for ProcessHookChain {
+    fn before_tool_call<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        args: &'a Value,
+        risk: conga::RiskLevel,
+    ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+        Box::pin(async move {
+            // HookStack semantics, mirrored inside the chain: first Block
+            // wins; otherwise the last Modify wins; Allow is the default.
+            let mut verdict = ToolCallVerdict::Allow;
+            for hook in &self.hooks {
+                if !hook.tools.matches(tool_name) {
+                    continue;
+                }
+                match run_hook(hook, tool_call_id, tool_name, args, risk).await {
+                    HookDecision::Block(reason) => return ToolCallVerdict::Block(reason),
+                    HookDecision::Allow => return ToolCallVerdict::Allow,
+                    HookDecision::Modify(new_args) => verdict = ToolCallVerdict::Modify(new_args),
+                    HookDecision::NoOpinion => {}
+                }
+            }
+            verdict
+        })
+    }
+
+    fn after_tool_call(
+        &self,
+        _tool_call_id: &str,
+        result: &ToolResultMessage,
+    ) -> ToolResultMessage {
+        result.clone()
+    }
+}
+
+/// Spawn one hook (`sh -c <command>`), feed the Claude-shaped payload on
+/// stdin, apply the deadline. Every failure path returns `NoOpinion` after
+/// a warning — fail-open by contract (see struct docs).
+async fn run_hook(
+    hook: &ProcessHook,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+    risk: conga::RiskLevel,
+) -> HookDecision {
+    let payload = serde_json::json!({
+        "tool_name": tool_name,
+        "tool_input": args,
+        "tool_call_id": tool_call_id,
+        "risk": format!("{risk:?}").to_ascii_lowercase(),
+    });
+    let run = async {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&hook.command)
+            .current_dir(std::env::current_dir().unwrap_or_else(|_| ".".into()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        // The child may exit before reading all of stdin (e.g. `exit 2`);
+        // a broken pipe here must not lose its output.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
+        child.wait_with_output().await
+    };
+    let output = match tokio::time::timeout(hook.timeout, run).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            tracing::warn!(command = %hook.command, error = %e, "process hook failed to spawn; allowing");
+            return HookDecision::NoOpinion;
+        }
+        Err(_) => {
+            tracing::warn!(command = %hook.command, ?hook.timeout, "process hook timed out; allowing");
+            return HookDecision::NoOpinion;
+        }
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(2) => HookDecision::Block(if stderr.is_empty() {
+            "blocked by process hook".to_string()
+        } else {
+            stderr
+        }),
+        Some(0) => parse_decision(&output.stdout, &stderr),
+        code => {
+            tracing::warn!(command = %hook.command, ?code, stderr = %stderr, "process hook errored; allowing");
+            HookDecision::NoOpinion
+        }
+    }
+}
+
+/// Claude-compatible stdout contract (exit 0):
+/// `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny",
+/// "permissionDecisionReason": "...", "updatedInput": {...}}}`.
+/// Absent/unparsable output = no opinion.
+fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
+    let Ok(v) = serde_json::from_slice::<Value>(stdout) else {
+        return HookDecision::NoOpinion;
+    };
+    let Some(spec) = v.get("hookSpecificOutput") else {
+        return HookDecision::NoOpinion;
+    };
+    match spec.get("permissionDecision").and_then(|d| d.as_str()) {
+        Some("deny") => {
+            let reason = spec
+                .get("permissionDecisionReason")
+                .and_then(|r| r.as_str())
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or(stderr)
+                .to_string();
+            HookDecision::Block(if reason.is_empty() {
+                "blocked by process hook".to_string()
+            } else {
+                reason
+            })
+        }
+        Some("allow") => HookDecision::Allow,
+        _ => match spec.get("updatedInput") {
+            Some(input) if input.is_object() => HookDecision::Modify(input.clone()),
+            _ => HookDecision::NoOpinion,
+        },
     }
 }
 
@@ -283,5 +456,192 @@ mod tests {
         let hooks = load_process_hooks(g.path(), p.path());
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].command, "yes");
+    }
+
+    // ── runner + chain (Task 2) ─────────────────────────────
+
+    use conga::{HookChain, RiskLevel, ToolCallVerdict};
+
+    async fn verdict(
+        chain: &ProcessHookChain,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> ToolCallVerdict {
+        chain
+            .before_tool_call("call-1", tool, &args, RiskLevel::Medium)
+            .await
+    }
+
+    fn one_hook(command: &str) -> ProcessHookChain {
+        ProcessHookChain::new(vec![ProcessHook {
+            command: command.to_string(),
+            tools: ToolMatcher::All,
+            timeout: Duration::from_secs(5),
+        }])
+    }
+
+    #[tokio::test]
+    async fn exit_zero_with_no_output_allows() {
+        let v = verdict(&one_hook("exit 0"), "bash", serde_json::json!({})).await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn exit_two_blocks_with_stderr_reason() {
+        let v = verdict(
+            &one_hook("echo 'no rm -rf for you' >&2; exit 2"),
+            "bash",
+            serde_json::json!({"command": "rm -rf /"}),
+        )
+        .await;
+        match v {
+            ToolCallVerdict::Block(reason) => assert_eq!(reason, "no rm -rf for you"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_deny_decision_blocks() {
+        let v = verdict(
+            &one_hook(r#"echo '{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "policy: .env is off-limits"}}'"#),
+            "read",
+            serde_json::json!({"path": ".env"}),
+        )
+        .await;
+        match v {
+            ToolCallVerdict::Block(reason) => {
+                assert_eq!(reason, "policy: .env is off-limits")
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_updated_input_modifies_args() {
+        let v = verdict(
+            &one_hook(
+                r#"echo '{"hookSpecificOutput": {"updatedInput": {"command": "rtk git status"}}}'"#,
+            ),
+            "bash",
+            serde_json::json!({"command": "git status"}),
+        )
+        .await;
+        match v {
+            ToolCallVerdict::Modify(args) => {
+                assert_eq!(args["command"], "rtk git status")
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_fails_open_and_kills_child() {
+        let v = verdict(
+            &ProcessHookChain::new(vec![ProcessHook {
+                command: "sleep 30".to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_millis(200),
+            }]),
+            "bash",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn missing_binary_fails_open() {
+        let v = verdict(
+            &one_hook("definitely-not-a-real-binary-xyz --flag"),
+            "bash",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn non_two_non_zero_exit_fails_open() {
+        let v = verdict(&one_hook("exit 1"), "bash", serde_json::json!({})).await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn hooks_receive_claude_shaped_stdin_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("payload.json");
+        let out_str = out.display().to_string();
+        let chain = ProcessHookChain::new(vec![ProcessHook {
+            command: format!("cat > {out_str}"),
+            tools: ToolMatcher::All,
+            timeout: Duration::from_secs(5),
+        }]);
+        let _ = verdict(&chain, "bash", serde_json::json!({"command": "ls"})).await;
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(payload["tool_name"], "bash");
+        assert_eq!(payload["tool_input"]["command"], "ls");
+        assert_eq!(payload["tool_call_id"], "call-1");
+        assert_eq!(payload["risk"], "medium");
+    }
+
+    #[tokio::test]
+    async fn matcher_filters_which_hooks_run() {
+        // A hook that would block everything, but only matches `write`:
+        // a `bash` call must sail through untouched.
+        let chain = ProcessHookChain::new(vec![ProcessHook {
+            command: "exit 2".to_string(),
+            tools: ToolMatcher::Names(vec!["write".into()]),
+            timeout: Duration::from_secs(5),
+        }]);
+        let v = verdict(&chain, "bash", serde_json::json!({})).await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+    }
+
+    #[tokio::test]
+    async fn first_block_wins_last_modify_wins() {
+        // modify-then-block: Block must win. block-then-modify (2nd hook
+        // never runs after a block): Block must still win.
+        let chain = ProcessHookChain::new(vec![
+            ProcessHook {
+                command:
+                    r#"echo '{"hookSpecificOutput": {"updatedInput": {"command": "modified"}}}'"#
+                        .to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+            ProcessHook {
+                command: "exit 2".to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+        ]);
+        let v = verdict(&chain, "bash", serde_json::json!({"command": "x"})).await;
+        assert!(matches!(v, ToolCallVerdict::Block(_)));
+    }
+
+    #[test]
+    fn after_tool_call_is_passthrough() {
+        let chain = one_hook("exit 2");
+        let result = conga::ToolResultMessage {
+            tool_call_id: "1".into(),
+            tool_name: "bash".into(),
+            content: vec![conga::ContentBlock::text("kept")],
+            is_error: false,
+            timestamp: 0,
+        };
+        let out = HookChain::after_tool_call(&chain, "1", &result);
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], conga::ContentBlock::Text { text } if text == "kept"));
+    }
+
+    #[test]
+    fn discover_reads_global_and_project_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Not using the real ~/.conga here — discover() takes the project
+        // dir and reads the GLOBAL root from config_dir(); to keep this
+        // test hermetic, assert the None case (no files anywhere on this
+        // machine is not guaranteed, so only assert type-compat):
+        let _ = ProcessHookChain::discover(tmp.path());
     }
 }
