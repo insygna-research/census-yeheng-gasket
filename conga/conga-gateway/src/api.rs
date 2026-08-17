@@ -99,6 +99,27 @@ pub(crate) async fn get_messages(
     }
 }
 
+// ── Web-UI LLM env settings (file-backed, applied per LLM call) ──────────
+
+/// The masked settings view: raw API keys never cross this API (the
+/// gateway listens on 0.0.0.0 with open CORS). See
+/// `conga_host::settings::settings_to_masked_json`.
+pub(crate) async fn get_settings() -> Json<Value> {
+    Json(conga_host::settings::settings_to_masked_json(
+        &conga_host::settings::load_settings(),
+    ))
+}
+
+/// Validate → merge (blank `apiKey` keeps the stored one) → persist
+/// atomically. The next LLM call picks the new provider up (the host
+/// re-resolves the provider from this file every turn).
+pub(crate) async fn put_settings(Json(payload): Json<Value>) -> Response {
+    match conga_host::settings::put_settings(&payload) {
+        Ok(masked) => Json(masked).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
 /// List all sessions on disk (id, msg_count, mtime, name). Does NOT depend
 /// on active WS connections — reads the JSONL store directly. Used by the
 /// frontend to discover sessions created by the CLI or other devices.

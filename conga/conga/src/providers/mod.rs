@@ -60,6 +60,29 @@ impl ProviderConfig {
         Self::from_env_with(&|k: &str| std::env::var(k))
     }
 
+    /// Build a provider from explicit parts, applying the env proxy knobs
+    /// (`CONGA_LLM_PROXY*`) for egress — the same precedence as
+    /// [`from_env`](Self::from_env). Used by the host's settings file (the
+    /// web UI persists LLM env overrides to `~/.conga/settings.json`).
+    pub fn from_parts(
+        api: ProviderApi,
+        base_url: String,
+        api_key: String,
+        model: String,
+    ) -> Result<Self, ConfigError> {
+        let generic_proxy = std::env::var("CONGA_LLM_PROXY").ok();
+        let http_proxy = std::env::var("CONGA_LLM_HTTP_PROXY").ok();
+        let https_proxy = std::env::var("CONGA_LLM_HTTPS_PROXY").ok();
+        let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
+        Ok(Self {
+            api,
+            base_url,
+            api_key,
+            model,
+            client,
+        })
+    }
+
     /// Read a prefixed provider config, e.g. prefix `CONGA_FAST_LLM` reads
     /// `CONGA_FAST_LLM_BASE_URL` / `_KEY` / `_MODEL` / `_API`. Used for the
     /// sub-agent "fast model" override; proxies fall back to the main

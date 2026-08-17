@@ -1,0 +1,373 @@
+//! Web-UI LLM env settings, persisted at `<config_dir>/settings.json`.
+//!
+//! Precedence: the file OVERRIDES process env — an explicit UI choice beats
+//! ambient `.env` config. [`Host::run_turn`](crate::Host::run_turn)
+//! re-resolves the provider from this file EVERY turn, so a UI save reaches
+//! the very next LLM call; sub-agent fast routing re-reads it at session
+//! assembly. The API never returns the raw key — only a mask — and a PUT
+//! with a blank `apiKey` means "keep the stored one".
+
+use std::path::{Path, PathBuf};
+
+use conga::ProviderConfig;
+
+/// One LLM connection group (the `CONGA_LLM_*` / `CONGA_FAST_LLM_*` vars a
+/// user would set in a shell, now editable in the web UI). All fields are
+/// plain strings; validation happens in [`LlmGroup::validate`].
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LlmGroup {
+    pub base_url: String,
+    /// Write-only over the API: GET responses carry a mask instead, PUT
+    /// with an empty string keeps the stored key.
+    pub api_key: String,
+    pub model: String,
+    /// `openai` (default) or `anthropic`.
+    pub api: String,
+}
+
+/// The whole settings file.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EnvSettings {
+    /// Main-agent LLM; `None` = use process env.
+    pub llm: Option<LlmGroup>,
+    /// Sub-agent fast model; `None` = main model / env prefix.
+    pub fast_llm: Option<LlmGroup>,
+}
+
+impl LlmGroup {
+    /// Validate one group: non-empty http(s) base URL, non-empty model,
+    /// api in {openai, anthropic}. `api_key` presence is checked at merge
+    /// time (it may be inherited from the stored group).
+    pub fn validate(&self) -> Result<(), String> {
+        let base = self.base_url.trim();
+        if base.is_empty() {
+            return Err("base_url is required".into());
+        }
+        if !base.starts_with("http://") && !base.starts_with("https://") {
+            return Err(format!(
+                "base_url must start with http:// or https://: {base}"
+            ));
+        }
+        if self.model.trim().is_empty() {
+            return Err("model is required".into());
+        }
+        match self.api.trim() {
+            "" | "openai" | "anthropic" => Ok(()),
+            other => Err(format!("api must be openai or anthropic, got: {other}")),
+        }
+    }
+
+    /// Build a provider; egress proxies fall back to `CONGA_LLM_PROXY*`.
+    pub fn to_provider(&self) -> Result<ProviderConfig, conga::ConfigError> {
+        let api = match self.api.trim() {
+            "anthropic" => conga::ProviderApi::Anthropic,
+            _ => conga::ProviderApi::OpenAiCompat,
+        };
+        ProviderConfig::from_parts(
+            api,
+            self.base_url.trim().to_string(),
+            self.api_key.clone(),
+            self.model.trim().to_string(),
+        )
+    }
+}
+
+/// `~/.conga/settings.json`.
+pub fn settings_path() -> PathBuf {
+    conga::storage::config_dir().join("settings.json")
+}
+
+/// Load from an explicit path. Missing file → empty settings; a corrupt
+/// file warns and degrades to empty (the process env still provides a
+/// working provider — a hand-mangled file must not brick the app).
+pub fn load_settings_at(path: &Path) -> EnvSettings {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<EnvSettings>(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("{}: corrupt settings file ignored: {e}", path.display());
+                EnvSettings::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => EnvSettings::default(),
+        Err(e) => {
+            tracing::warn!("{}: settings file unreadable, ignored: {e}", path.display());
+            EnvSettings::default()
+        }
+    }
+}
+
+pub fn load_settings() -> EnvSettings {
+    load_settings_at(&settings_path())
+}
+
+/// Validate then atomically persist (tmp + rename). A crash can never
+/// leave a torn file shadowing an intact one.
+pub fn save_settings_at(path: &Path, s: &EnvSettings) -> Result<(), String> {
+    if let Some(g) = &s.llm {
+        g.validate().map_err(|e| format!("llm: {e}"))?;
+    }
+    if let Some(g) = &s.fast_llm {
+        g.validate().map_err(|e| format!("fastLlm: {e}"))?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn save_settings(s: &EnvSettings) -> Result<(), String> {
+    save_settings_at(&settings_path(), s)
+}
+
+/// The provider the main agent should use this turn: the settings file's
+/// `llm` group wins over the process env. `None` = keep env config.
+pub fn effective_provider(s: &EnvSettings) -> Option<ProviderConfig> {
+    let g = s.llm.as_ref()?;
+    match g.to_provider() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("settings llm group invalid, falling back to env: {e}");
+            None
+        }
+    }
+}
+
+/// Same for the sub-agent fast model.
+pub fn effective_fast_provider(s: &EnvSettings) -> Option<ProviderConfig> {
+    let g = s.fast_llm.as_ref()?;
+    match g.to_provider() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("settings fastLlm group invalid, ignoring: {e}");
+            None
+        }
+    }
+}
+
+/// Mask a stored key for display: `sk-…ab12`. Short keys mask entirely.
+pub fn mask_key(key: &str) -> String {
+    let k = key.trim();
+    if k.is_empty() {
+        return String::new();
+    }
+    if k.len() <= 8 {
+        return "…".to_string();
+    }
+    format!("{}…{}", &k[..3], &k[k.len() - 4..])
+}
+
+/// The GET view: same shape as [`EnvSettings`] but the raw `api_key` is
+/// replaced by `apiKeySet` + `apiKeyHint` — the secret never crosses the
+/// API (the gateway listens on 0.0.0.0; CORS is open).
+pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
+    fn group(g: &Option<LlmGroup>) -> serde_json::Value {
+        match g {
+            None => serde_json::Value::Null,
+            Some(g) => serde_json::json!({
+                "baseUrl": g.base_url,
+                "model": g.model,
+                "api": if g.api.trim().is_empty() { "openai" } else { g.api.trim() },
+                "apiKeySet": !g.api_key.trim().is_empty(),
+                "apiKeyHint": mask_key(&g.api_key),
+            }),
+        }
+    }
+    serde_json::json!({ "llm": group(&s.llm), "fastLlm": group(&s.fast_llm) })
+}
+
+/// Full PUT flow: parse the payload, merge (blank `apiKey` = keep stored),
+/// validate, persist, and return the new masked view. One code path for
+/// the gateway REST route and the desktop Tauri command.
+pub fn put_settings(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let incoming: EnvSettings = serde_json::from_value(payload.clone())
+        .map_err(|e| format!("invalid settings payload: {e}"))?;
+    let merged = merge_put(&load_settings(), incoming)?;
+    save_settings(&merged)?;
+    Ok(settings_to_masked_json(&merged))
+}
+
+/// Merge a PUT payload into the current settings. A `None` group clears
+/// it (back to env); a present group replaces it, except a blank
+/// `api_key` inherits the stored key (which must then exist).
+fn merge_put(current: &EnvSettings, incoming: EnvSettings) -> Result<EnvSettings, String> {
+    let merge_group = |name: &str,
+                       new: Option<LlmGroup>,
+                       old: &Option<LlmGroup>|
+     -> Result<Option<LlmGroup>, String> {
+        let Some(mut g) = new else {
+            return Ok(None); // cleared: env config applies again
+        };
+        if g.api_key.trim().is_empty() {
+            let stored = old
+                .as_ref()
+                .map(|o| o.api_key.clone())
+                .filter(|k| !k.trim().is_empty());
+            g.api_key = stored
+                .ok_or_else(|| format!("{name}: apiKey is required (no stored key to keep)"))?;
+        }
+        g.validate().map_err(|e| format!("{name}: {e}"))?;
+        Ok(Some(g))
+    };
+    Ok(EnvSettings {
+        llm: merge_group("llm", incoming.llm, &current.llm)?,
+        fast_llm: merge_group("fastLlm", incoming.fast_llm, &current.fast_llm)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(base: &str, key: &str, model: &str, api: &str) -> LlmGroup {
+        LlmGroup {
+            base_url: base.into(),
+            api_key: key.into(),
+            model: model.into(),
+            api: api.into(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = EnvSettings {
+            llm: Some(group("https://a.x/v1", "sk-1", "m1", "openai")),
+            fast_llm: Some(group("https://b.x/v1", "sk-2", "m2", "anthropic")),
+        };
+        save_settings_at(&path, &s).unwrap();
+        assert_eq!(load_settings_at(&path), s);
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_settings_at(&dir.path().join("nope.json")),
+            EnvSettings::default()
+        );
+    }
+
+    #[test]
+    fn corrupt_file_degrades_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(load_settings_at(&path), EnvSettings::default());
+    }
+
+    #[test]
+    fn masked_view_never_leaks_the_key() {
+        let s = EnvSettings {
+            llm: Some(group("https://a.x/v1", "sk-secret-key-1234", "m1", "")),
+            fast_llm: None,
+        };
+        let v = settings_to_masked_json(&s).to_string();
+        assert!(!v.contains("sk-secret-key-1234"), "raw key leaked: {v}");
+        assert!(v.contains("apiKeySet"));
+        assert!(v.contains("sk-…1234"));
+        assert!(
+            v.contains("\"api\":\"openai\""),
+            "blank api defaults to openai"
+        );
+    }
+
+    #[test]
+    fn mask_shapes() {
+        assert_eq!(mask_key(""), "");
+        assert_eq!(mask_key("short"), "…");
+        assert_eq!(mask_key("sk-abcdefgh"), "sk-…efgh");
+    }
+
+    #[test]
+    fn validate_rejects_bad_groups() {
+        assert!(group("", "k", "m", "").validate().is_err());
+        assert!(group("ftp://x", "k", "m", "").validate().is_err());
+        assert!(group("https://x", "k", "", "").validate().is_err());
+        assert!(group("https://x", "k", "m", "bogus").validate().is_err());
+        assert!(group("https://x", "k", "m", "anthropic").validate().is_ok());
+        assert!(group("https://x", "k", "m", "").validate().is_ok());
+    }
+
+    #[test]
+    fn effective_provider_builds_from_group() {
+        let s = EnvSettings {
+            llm: Some(group("https://a.x/v1", "sk-1", "m1", "anthropic")),
+            fast_llm: None,
+        };
+        let p = effective_provider(&s).unwrap();
+        assert_eq!(p.base_url, "https://a.x/v1");
+        assert_eq!(p.model, "m1");
+        assert_eq!(p.api, conga::ProviderApi::Anthropic);
+        assert!(effective_fast_provider(&s).is_none());
+    }
+
+    #[test]
+    fn merge_blank_key_inherits_stored() {
+        let current = EnvSettings {
+            llm: Some(group("https://old.x", "sk-stored", "old-model", "")),
+            fast_llm: None,
+        };
+        let incoming = EnvSettings {
+            llm: Some(group("https://new.x", "", "new-model", "")),
+            fast_llm: None,
+        };
+        let merged = merge_put(&current, incoming).unwrap();
+        let g = merged.llm.unwrap();
+        assert_eq!(g.base_url, "https://new.x");
+        assert_eq!(g.model, "new-model");
+        assert_eq!(
+            g.api_key, "sk-stored",
+            "blank key must inherit the stored one"
+        );
+    }
+
+    #[test]
+    fn merge_blank_key_without_stored_errors() {
+        let incoming = EnvSettings {
+            llm: Some(group("https://new.x", "", "m", "")),
+            fast_llm: None,
+        };
+        let err = merge_put(&EnvSettings::default(), incoming).unwrap_err();
+        assert!(err.contains("apiKey is required"), "{err}");
+    }
+
+    #[test]
+    fn merge_none_group_clears() {
+        let current = EnvSettings {
+            llm: Some(group("https://old.x", "sk", "m", "")),
+            fast_llm: Some(group("https://f.x", "sk", "m", "")),
+        };
+        let merged = merge_put(&current, EnvSettings::default()).unwrap();
+        assert!(merged.llm.is_none() && merged.fast_llm.is_none());
+    }
+
+    #[test]
+    fn merge_validates_and_isolates_groups() {
+        let current = EnvSettings::default();
+        // bad scheme on fast group must not pass, and the error names it
+        let incoming = EnvSettings {
+            llm: None,
+            fast_llm: Some(group("notaurl", "sk", "m", "")),
+        };
+        let err = merge_put(&current, incoming).unwrap_err();
+        assert!(err.starts_with("fastLlm:"), "{err}");
+    }
+
+    #[test]
+    fn put_settings_full_flow_via_temp_path() {
+        // put_settings uses the real settings_path(); exercise the merge +
+        // validation + masked-view logic through it would touch ~/.conga.
+        // The merge/save/view pieces are covered above; here we only check
+        // payload parsing errors surface as strings.
+        let err = put_settings(&serde_json::json!({"llm": 42})).unwrap_err();
+        assert!(err.contains("invalid settings payload"), "{err}");
+    }
+}

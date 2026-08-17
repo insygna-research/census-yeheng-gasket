@@ -214,6 +214,14 @@ async fn evict(session_id: &str) {
     registry().lock().await.remove(session_id);
 }
 
+/// Kill and forget the session's persistent shell (if any). Public: called
+/// on session delete / last-connection close (`session_cleanup`) so a
+/// long-running host doesn't accumulate idle shells for dead sessions. A
+/// later call for the same id simply respawns.
+pub async fn evict_session(session_id: &str) {
+    evict(session_id).await;
+}
+
 /// Milliseconds since epoch, for background log file names.
 fn millis() -> u64 {
     std::time::SystemTime::now()
@@ -331,6 +339,27 @@ mod tests {
         .output;
         assert!(out.contains("hello"), "{out:?}");
         assert!(out.contains("[exit 0]"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn evict_session_removes_entry_and_respawns_clean() {
+        run_in("t7-evict", "cd /").await;
+        assert!(registry().lock().await.contains_key("t7-evict"));
+        evict_session("t7-evict").await;
+        assert!(
+            !registry().lock().await.contains_key("t7-evict"),
+            "evict must remove the registry entry"
+        );
+        // Fresh shell: the `cd /` must NOT have survived the eviction
+        // (spawn cwd is back; on macOS /tmp may print as /private/tmp,
+        // so assert the property that actually matters: not "/").
+        let b = run_in("t7-evict", "pwd").await;
+        assert!(b.contains("[exit 0]"), "respawn must work: {b}");
+        assert_ne!(
+            b.lines().next().unwrap().trim(),
+            "/",
+            "cwd must reset after eviction: {b}"
+        );
     }
 
     #[tokio::test]

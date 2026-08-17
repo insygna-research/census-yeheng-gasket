@@ -145,6 +145,20 @@ fn validate_proxy(url: String) -> Result<(), String> {
   conga_host::validate_tool_proxy(url)
 }
 
+/// The masked LLM env settings (raw keys never leave the process). See
+#[tauri::command]
+fn get_env_settings() -> serde_json::Value {
+  conga_host::settings::settings_to_masked_json(&conga_host::settings::load_settings())
+}
+
+/// Validate → merge (blank `apiKey` keeps the stored one) → persist
+/// atomically. The in-process Host re-resolves its provider from this file
+/// every turn, so the next LLM call uses the new settings.
+#[tauri::command]
+fn set_env_settings(payload: serde_json::Value) -> Result<serde_json::Value, String> {
+  conga_host::settings::put_settings(&payload)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let _ = dotenvy::dotenv();
@@ -168,14 +182,11 @@ pub fn run() {
       get_session_messages,
       rename_session,
       search_sessions,
-      delete_session,
-      chat::send_message,
-      chat::cancel_turn,
-      chat::approval_response,
-      chat::get_context,
       get_app_config,
       set_app_config,
       validate_proxy,
+      get_env_settings,
+      set_env_settings,
     ])
     .setup(|app| {
       if let Ok(Some(config)) = get_app_config() {

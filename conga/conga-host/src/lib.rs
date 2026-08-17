@@ -25,8 +25,10 @@ pub mod prompt;
 pub mod proxy;
 pub mod session;
 pub mod session_api;
+pub mod session_cleanup;
 #[cfg(feature = "session-index")]
 pub mod session_index;
+pub mod settings;
 pub mod skills;
 pub mod subagent;
 pub mod subagent_types;
@@ -51,6 +53,7 @@ pub use session_api::{
     delete_session, list_sessions, rename_session, session_messages, SessionApiError,
     SessionListItem,
 };
+pub use session_cleanup::{cleanup_session_resources, register_hook, run_hooks};
 pub use skills::append_skills;
 pub use subagent::HostSubagentSpawner;
 pub use subagent_types::{
@@ -94,8 +97,12 @@ pub struct Host {
     session: SessionManager,
     policy: Arc<PermissionPolicy>,
     hooks: Arc<dyn conga::HookChain>,
-    signal: CancelSignal,
     stream_fn: Arc<dyn StreamFn>,
+    /// Set by [`with_stream_fn`](Self::with_stream_fn): an explicitly
+    /// injected provider (tests, custom wiring) is exempt from the
+    /// per-turn settings override in [`resolve_turn_provider`].
+    stream_fn_overridden: bool,
+    signal: CancelSignal,
     system_prompt: String,
     tools: Vec<ToolDefinition>,
     cwd: PathBuf,
@@ -141,6 +148,7 @@ impl Host {
             cwd,
             signal: CancelSignal::new(),
             stream_fn: cfg.provider_stream_fn(),
+            stream_fn_overridden: false,
             max_turns: cfg.tunables.max_turns,
             budget: ContextBudget::from_env(),
             steer: conga::SteerQueue::new(),
@@ -162,9 +170,36 @@ impl Host {
     }
 
     /// Replace the provider stream_fn with a fake (tests) or custom one.
+    /// An explicitly injected provider is exempt from the per-turn
+    /// settings-file override (see [`resolve_turn_provider`]).
     pub fn with_stream_fn(mut self, stream_fn: Arc<dyn StreamFn>) -> Self {
         self.stream_fn = stream_fn;
+        self.stream_fn_overridden = true;
         self
+    }
+
+    /// Resolve this turn's config + stream_fn: the web UI's settings file
+    /// (`~/.conga/settings.json`, see [`crate::settings`]) OVERRIDES the
+    /// env-derived config, re-read every turn so a UI save reaches the
+    /// very next LLM call. Hosts with an injected stream_fn keep theirs.
+    pub fn resolve_turn_provider(
+        &self,
+        settings: &crate::settings::EnvSettings,
+    ) -> (HostConfig, Arc<dyn StreamFn>) {
+        if self.stream_fn_overridden {
+            return (self.cfg.clone(), self.stream_fn.clone());
+        }
+        match crate::settings::effective_provider(settings) {
+            Some(pc) => {
+                let cfg = HostConfig {
+                    provider: pc,
+                    tunables: self.cfg.tunables.clone(),
+                };
+                let stream_fn = cfg.provider_stream_fn();
+                (cfg, stream_fn)
+            }
+            None => (self.cfg.clone(), self.stream_fn.clone()),
+        }
     }
 
     /// Override the compaction budget (tests inject knobs without touching
@@ -321,8 +356,14 @@ impl Host {
                 self.system_prompt, snapshot
             )
         };
+        // Per-turn LLM settings: the web UI persists env overrides to
+        // ~/.conga/settings.json; re-resolve the provider EVERY turn so a
+        // UI save reaches the very next LLM call (model id + stream_fn
+        // together — a half-applied switch would be worse than none).
+        let (turn_cfg, turn_stream_fn) =
+            self.resolve_turn_provider(&crate::settings::load_settings());
 
-        let (context, mut config) = self.cfg.prepare_turn(
+        let (context, mut config) = turn_cfg.prepare_turn(
             TurnInputs {
                 system_prompt: &turn_prompt,
                 history: &history,
@@ -330,9 +371,9 @@ impl Host {
                 cwd: &self.cwd,
                 session_id: &sid,
             },
-            &self.signal,
+            self.signal(),
             self.hooks.clone(),
-            self.stream_fn.clone(),
+            turn_stream_fn,
             self.max_turns,
             Some(self.session.persist_fn()),
         );
@@ -354,7 +395,7 @@ impl Host {
                 message: e.to_string(),
             },
             Ok(msgs) => {
-                if self.signal.is_cancelled() {
+                if self.signal().is_cancelled() {
                     TurnEndReason::Aborted {
                         cause: Some(CancelCause::User),
                     }
@@ -487,6 +528,57 @@ mod tests {
             .with_stream_fn(Arc::new(FakeProvider))
             .with_max_turns(1);
     }
+
+    /// The settings file OVERRIDES the env-derived provider for hosts that
+    /// did NOT inject their own stream_fn; injected providers are exempt
+    /// (a fake would otherwise be swapped for a real one mid-test).
+    #[test]
+    fn resolve_turn_provider_settings_override_and_exemption() {
+        use crate::settings::{EnvSettings, LlmGroup};
+        let make_host = |overridden: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let host = Host::new(
+                test_cfg(),
+                SessionManager::with_root(tmp.path().to_path_buf()),
+                Arc::new(PermissionPolicy::new(
+                    Mode::FullAuto,
+                    Arc::new(|_, _| Box::pin(async { true })),
+                )),
+                "sys".into(),
+                vec![],
+            );
+            if overridden {
+                host.with_stream_fn(Arc::new(FakeProvider))
+            } else {
+                host
+            }
+        };
+        let settings = EnvSettings {
+            llm: Some(LlmGroup {
+                base_url: "https://settings.example/v1".into(),
+                api_key: "sk-settings".into(),
+                model: "settings-model".into(),
+                api: "openai".into(),
+            }),
+            fast_llm: None,
+        };
+
+        // No injection → settings win (provider + stream_fn swapped).
+        let (cfg, _) = make_host(false).resolve_turn_provider(&settings);
+        assert_eq!(cfg.provider.base_url, "https://settings.example/v1");
+        assert_eq!(cfg.provider.model, "settings-model");
+
+        // Injected provider → settings ignored, config unchanged.
+        let plain = make_host(true);
+        let base_model = plain.cfg.provider.model.clone();
+        let (cfg, _) = plain.resolve_turn_provider(&settings);
+        assert_eq!(cfg.provider.model, base_model);
+
+        // Empty settings → env config kept either way.
+        let (cfg, _) = make_host(false).resolve_turn_provider(&EnvSettings::default());
+        assert_eq!(cfg.provider.model, base_model);
+    }
+
     #[test]
     fn host_error_from_agent_error() {
         let e: HostError = conga::AgentError::ToolNotFound("x".into()).into();

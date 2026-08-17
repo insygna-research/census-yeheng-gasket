@@ -290,6 +290,27 @@ impl SessionAssembly {
 }
 
 /// The one Host assembly shared by every caller of this module:
+/// Swap a sub-agent loop config onto a fast provider (model id + stream_fn
+/// together — a half-applied switch would be worse than none). Tunables
+/// (max_tokens, thinking) stay the parent's.
+fn apply_fast_provider(
+    loop_config: &mut conga::AgentLoopConfig,
+    fast: &conga::ProviderConfig,
+    tunables: &conga::AgentTunables,
+) {
+    loop_config.model = conga::ModelSpec {
+        id: fast.model.clone(),
+        api: fast.api,
+        max_tokens: tunables.max_tokens,
+        supports_thinking: tunables.thinking_level != conga::ThinkingLevel::Off,
+    };
+    loop_config.stream_fn = match fast.api {
+        conga::ProviderApi::OpenAiCompat => Arc::new(conga::OpenAiCompat::from_config(fast)),
+        conga::ProviderApi::Anthropic => Arc::new(conga::AnthropicProvider::from_config(fast)),
+    };
+}
+
+/// The one Host assembly shared by every caller of this module:
 /// skills prompt -> hook stack (`extra_hooks` first, policy last) -> signal
 /// wiring -> sub-agent spawner. Sub-agents get the built-in set minus
 /// `spawn_subagents` (nesting disabled; shared MCP/external servers are not
@@ -335,35 +356,29 @@ async fn assemble_host(
     let spawner_signal = host.signal().clone();
     let spawner_stream_fn = cfg.provider_stream_fn();
     let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(HookStack::new(vec![policy]));
-    // Fast-model routing: a complete `CONGA_FAST_LLM_*` set moves the
-    // sub-agents to a cheaper model (same tunables otherwise). Partial sets
-    // fail loud at startup — a typo must not silently keep the main model.
+    // Fast-model routing, precedence: the web UI's settings file
+    // (`fastLlm` group) wins, then a complete `CONGA_FAST_LLM_*` env set.
+    // Same tunables otherwise; a partial env set fails loud at startup —
+    // a typo must not silently keep the main model.
     let mut loop_config = cfg.build_loop_config(
         cfg.tunables.max_turns,
         Some(spawner_signal.clone()),
         None,
         spawner_stream_fn,
     );
-    match conga::ProviderConfig::from_env_prefixed("CONGA_FAST_LLM", &|k: &str| std::env::var(k)) {
-        Ok(Some(fast)) => {
-            loop_config.model = conga::ModelSpec {
-                id: fast.model.clone(),
-                api: fast.api,
-                max_tokens: cfg.tunables.max_tokens,
-                supports_thinking: cfg.tunables.thinking_level != conga::ThinkingLevel::Off,
-            };
-            loop_config.stream_fn = match fast.api {
-                conga::ProviderApi::OpenAiCompat => {
-                    Arc::new(conga::OpenAiCompat::from_config(&fast))
+    let settings_fast = crate::settings::effective_fast_provider(&crate::settings::load_settings());
+    match settings_fast {
+        Some(fast) => apply_fast_provider(&mut loop_config, &fast, &cfg.tunables),
+        None => {
+            match conga::ProviderConfig::from_env_prefixed("CONGA_FAST_LLM", &|k: &str| {
+                std::env::var(k)
+            }) {
+                Ok(Some(fast)) => apply_fast_provider(&mut loop_config, &fast, &cfg.tunables),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("(warning: CONGA_FAST_LLM_* incomplete, sub-agents keep the main model: {e})");
                 }
-                conga::ProviderApi::Anthropic => {
-                    Arc::new(conga::AnthropicProvider::from_config(&fast))
-                }
-            };
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("(warning: CONGA_FAST_LLM_* incomplete, sub-agents keep the main model: {e})")
+            }
         }
     }
     // Sub-agent runs persist under the parent session's `sub/` directory:

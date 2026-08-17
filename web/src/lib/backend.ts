@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { isTauri } from '@/lib/platform';
-import type { Message, ToolCall } from '@/types';
+import type { Message, ToolCall, EnvSettingsView, EnvSettingsPayload } from '@/types';
 
 /**
  * Session storage access layer.
@@ -50,6 +50,52 @@ export async function renameSession(chatId: string, name: string): Promise<boole
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+// ── LLM env settings (settings.json on the backend) ──────────────────────
+
+/** Masked settings view (raw keys never cross this boundary). */
+export async function fetchEnvSettings(): Promise<EnvSettingsView | null> {
+  try {
+    if (isTauri) {
+      return await invoke<EnvSettingsView>('get_env_settings');
+    }
+    const res = await fetch(`${backendBaseUrl()}/api/settings`);
+    if (!res.ok) return null;
+    return (await res.json()) as EnvSettingsView;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist settings. A group's blank `apiKey` keeps the stored key; a
+ * `null` group clears it (env config applies again). The next LLM call
+ * uses the new provider — the backend re-resolves it every turn.
+ * Returns the updated masked view, or null on validation/transport error
+ * (callers surface the error text via the dialog).
+ */
+export async function saveEnvSettings(
+  payload: EnvSettingsPayload
+): Promise<{ view: EnvSettingsView } | { error: string }> {
+  try {
+    if (isTauri) {
+      const view = await invoke<EnvSettingsView>('set_env_settings', { payload });
+      return { view };
+    }
+    const res = await fetch(`${backendBaseUrl()}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      return { error: body?.error || `save failed (HTTP ${res.status})` };
+    }
+    return { view: (await res.json()) as EnvSettingsView };
+  } catch (e) {
+    return { error: String(e) };
   }
 }
 

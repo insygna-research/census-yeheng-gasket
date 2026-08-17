@@ -342,6 +342,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `event_map.rs` | `AgentEvent` → `OutgoingEvent`(WS JSON)映射,含 10 种 `SubagentEvent` 转发 | `event_to_ws` / `subagent_event_to_ws` |
 | `approval.rs` | 审批登记(`ApprovalRegistry`):在途审批 + "remember" 缓存,三路 select 等待决策 | `ApprovalRegistry` |
 | `subagent.rs` | 子 agent 编排:`spawn_subagents` 工具的 host 侧 spawner(子日志持久化、全文结果提取) | `HostSubagentSpawner` |
+| `settings.rs` | **web UI LLM 设置**:`~/.conga/settings.json` 读写(原子写、组校验、key 掩码、PUT 合并);`run_turn` 每轮经 `effective_provider` 重解析,fast 路由优先读它 | `EnvSettings` / `put_settings` / `load_settings` |
 
 ### 6.3 `install_ctrl_c`(`lib.rs:328`)
 
@@ -363,9 +364,9 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `/ws` | GET(升级 WS) | WebSocket 连接入口,每连接一会话 |
 | `/api/sessions` | GET | 列出磁盘上所有会话(id / 消息数 / mtime),不依赖活跃 WS 连接 |
 | `/api/commands` | GET | 斜杠命令列表(供前端补全) |
+| `/api/settings` | GET / PUT | **web UI LLM 设置**(读写 `~/.conga/settings.json`):GET 返回掩码视图(key 只给 `apiKeySet`+`apiKeyHint`),PUT 走校验→合并(空 `apiKey`=保留旧值,`null` 组=清除)→原子写;下一次 LLM 调用即生效 |
 | `/api/sessions/{key}/context` | GET | 上下文统计(token 占用、压缩标志、水印) |
 | `/api/sessions/{key}/context/compact` | POST | 手动触发压缩(现已在 `run_turn` 内每轮从日志现算,此端点保留为前端兼容,返回最新统计) |
-| `/api/sessions/{key}/messages` | GET | **后端真相端点(D3)**:对磁盘 `events.jsonl` 跑 `derive_messages`(必要时迁移旧文件);未知 key→404,损坏日志→500 |
 | `/api/sessions/{key}/name` | PUT | 重命名会话(原子写 `meta.json` 侧车) |
 | `/api/sessions/{key}` | DELETE | 删除会话 |
 | *(fallback)* | — | 托管 `web/dist` 静态资源,SPA 回退到 `index.html` |

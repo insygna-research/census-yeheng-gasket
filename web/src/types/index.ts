@@ -202,12 +202,34 @@ export interface ApprovalRequest {
   tool_name: string;
   description: string;
   arguments?: string;
-  /** Human-readable diff preview for file-mutating tools (edit/write). */
   preview?: string;
 }
 
-export interface ApprovalResponse {
-  request_id: string;
-  approved: boolean;
-  remember?: boolean;
+// ── LLM env settings (web UI ↔ settings.json) ─────────────────────────────
+/** Group as returned by GET (key masked) and accepted by PUT (blank
+ *  apiKey = keep the stored key; `null` clears the group back to env). */
+export interface LlmSettingsGroup {
+  baseUrl: string;
+  model: string;
+  api: string; // 'openai' | 'anthropic'
+  apiKey: string; // write-only over the API
+}
+
+export interface LlmSettingsGroupView {
+  baseUrl: string;
+  model: string;
+  api: string;
+  apiKeySet: boolean;
+  apiKeyHint: string;
+}
+
+export interface EnvSettingsView {
+  llm: LlmSettingsGroupView | null;
+  fastLlm: LlmSettingsGroupView | null;
+}
+
+/** PUT body: `null` group clears it (env config applies again). */
+export interface EnvSettingsPayload {
+  llm: LlmSettingsGroup | null;
+  fastLlm: LlmSettingsGroup | null;
 }

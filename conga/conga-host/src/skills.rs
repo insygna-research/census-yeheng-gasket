@@ -131,7 +131,8 @@ fn parse_value(v: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) ->
     let block_scalar = matches!(v.as_bytes().first(), Some(b'|') | Some(b'>'))
         && v[1..].bytes().all(|b| b == b'-' || b == b'+');
     if !block_scalar {
-        return (!v.is_empty()).then(|| v.to_string());
+        let scalar = unquote(v);
+        return (!scalar.is_empty()).then(|| scalar.to_string());
     }
     let mut parts: Vec<&str> = Vec::new();
     while let Some(l) = lines.peek() {
@@ -148,6 +149,23 @@ fn parse_value(v: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) ->
         }
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Strip one balanced pair of surrounding quotes from a plain scalar
+/// (`"my-skill"` / `'my-skill'`): editors and project templates routinely
+/// emit quoted frontmatter, and the quotes would otherwise pollute the
+/// catalog line (and the tool name the model matches against). Only a
+/// matching pair at both ends is removed - a bare quote mid-value stays
+/// part of the scalar.
+fn unquote(v: &str) -> &str {
+    let b = v.as_bytes();
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +286,38 @@ mod tests {
                 g.path().join("skills/glob.md").display()
             )),
             "global source should stay absolute"
+        );
+    }
+
+    #[test]
+    fn quoted_scalars_are_unquoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        skill_file(
+            tmp.path(),
+            "quoted.md",
+            "---\nname: \"code-review\"\ndescription: 'Review diffs for bugs'\n---\nbody\n",
+        );
+        let out = append_skills_in("BASE", Path::new("/nope"), tmp.path());
+        assert!(
+            // (em dash separator - matches the catalog format above)
+            out.contains("- name: code-review — Review diffs for bugs"),
+            "quotes must be stripped for both keys, got: {out}"
+        );
+    }
+
+    #[test]
+    fn unbalanced_quotes_stay_part_of_scalar() {
+        let tmp = tempfile::tempdir().unwrap();
+        skill_file(
+            tmp.path(),
+            "odd.md",
+            "---\nname: it's-fine\ndescription: say \"hi\" now\n---\n",
+        );
+        let out = append_skills_in("BASE", Path::new("/nope"), tmp.path());
+        assert!(
+            // (em dash separator - matches the catalog format above)
+            out.contains("- name: it's-fine — say \"hi\" now"),
+            "mid-value quotes must survive, got: {out}"
         );
     }
 

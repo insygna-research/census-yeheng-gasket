@@ -43,14 +43,18 @@ fn line_diff(a: &str, b: &str) -> String {
     let b_lines: Vec<&str> = b.lines().take(MAX_LINES).collect();
     let (n, m) = (a_lines.len(), b_lines.len());
 
-    // LCS table (u16 to keep the O(n*m) allocation tame for the cap).
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    // LCS table as ONE flat allocation (u32 cells, single heap alloc):
+    // the old `vec![vec![..]]` layout spent n+1 separate allocations and
+    // scattered rows across the heap, hurting cache locality at the cap.
+    let w = m + 1;
+    let mut lcs = vec![0u32; (n + 1) * w];
     for i in (0..n).rev() {
+        let (row, below) = (i * w, (i + 1) * w);
         for j in (0..m).rev() {
-            lcs[i][j] = if a_lines[i] == b_lines[j] {
-                lcs[i + 1][j + 1] + 1
+            lcs[row + j] = if a_lines[i] == b_lines[j] {
+                lcs[below + j + 1] + 1
             } else {
-                lcs[i][j + 1].max(lcs[i + 1][j])
+                lcs[row + j + 1].max(lcs[below + j])
             };
         }
     }
@@ -64,7 +68,7 @@ fn line_diff(a: &str, b: &str) -> String {
             out.push('\n');
             i += 1;
             j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+        } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
             out.push_str("- ");
             out.push_str(a_lines[i]);
             out.push('\n');
@@ -220,5 +224,85 @@ mod tests {
         let args = serde_json::json!({"path": "f.txt", "content": "same\n"});
         let p = write_preview(&args, tmp.path()).unwrap();
         assert!(p.contains("(no changes)"));
+    }
+
+    #[test]
+    fn line_diff_lockstep_semantics() {
+        // Locks the diff semantics the flat LCS must preserve exactly:
+        // deletions first on ties, context lines kept, tail drained.
+        let a = "alpha\nkeep\nbeta\ntail\n";
+        let b = "keep\ngamma\ntail\n";
+        assert_eq!(
+            line_diff(a, b),
+            "- alpha\n  keep\n- beta\n+ gamma\n  tail\n"
+        );
+        // Fully disjoint inputs still drain both sides.
+        assert_eq!(line_diff("x\n", "y\n"), "- x\n+ y\n");
+        // One side empty = pure add/remove.
+        assert_eq!(line_diff("", "y\n"), "+ y\n");
+        assert_eq!(line_diff("x\n", ""), "- x\n");
+    }
+
+    #[test]
+    fn line_diff_matches_lcs_bruteforce_reference() {
+        // Cross-check the flat table against an independent naive 2D
+        // reference on pseudo-random inputs - guards against indexing
+        // regressions from the flattening (off-by-one at row boundaries).
+        fn reference(a: &str, b: &str) -> String {
+            let al: Vec<&str> = a.lines().collect();
+            let bl: Vec<&str> = b.lines().collect();
+            let (n, m) = (al.len(), bl.len());
+            let mut t = vec![vec![0u32; m + 1]; n + 1];
+            for i in (0..n).rev() {
+                for j in (0..m).rev() {
+                    t[i][j] = if al[i] == bl[j] {
+                        t[i + 1][j + 1] + 1
+                    } else {
+                        t[i][j + 1].max(t[i + 1][j])
+                    };
+                }
+            }
+            let mut out = String::new();
+            let (mut i, mut j) = (0, 0);
+            while i < n && j < m {
+                if al[i] == bl[j] {
+                    out.push_str(&format!("  {}\n", al[i]));
+                    i += 1;
+                    j += 1;
+                } else if t[i + 1][j] >= t[i][j + 1] {
+                    out.push_str(&format!("- {}\n", al[i]));
+                    i += 1;
+                } else {
+                    out.push_str(&format!("+ {}\n", bl[j]));
+                    j += 1;
+                }
+            }
+            while i < n {
+                out.push_str(&format!("- {}\n", al[i]));
+                i += 1;
+            }
+            while j < m {
+                out.push_str(&format!("+ {}\n", bl[j]));
+                j += 1;
+            }
+            out
+        }
+        // Deterministic LCG so failures are reproducible.
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..50 {
+            let mut a = String::new();
+            let mut b = String::new();
+            for _ in 0..12 {
+                a.push_str(&format!("line{}\n", next() % 8));
+                b.push_str(&format!("line{}\n", next() % 8));
+            }
+            assert_eq!(line_diff(&a, &b), reference(&a, &b));
+        }
     }
 }

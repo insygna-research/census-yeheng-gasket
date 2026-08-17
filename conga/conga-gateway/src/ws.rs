@@ -475,6 +475,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
 
     info!("session {session_id}: ended");
     state.sessions.remove(&session_id);
+    // Last connection gone: the session's process-global tool state (its
+    // persistent shell; extension PTYs via cleanup hooks) must die with it,
+    // not linger for the lifetime of the gateway. A reconnecting client
+    // transparently gets a fresh shell on next use.
+    conga_host::cleanup_session_resources(&session_id).await;
 }
 
 // ── WS send helper ─────────────────────────────────────────────

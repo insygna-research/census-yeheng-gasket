@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use conga::{
     ContentBlock, ExtensionApi, RiskLevel, ToolCallCtx, ToolDefinition, ToolError, ToolResult,
@@ -97,6 +97,14 @@ static REGISTRY: LazyLock<RwLock<HashMap<String, Arc<Mutex<PtySession>>>>> =
 
 /// Same registration shape as `search.rs::register`.
 pub fn register(api: &mut dyn ExtensionApi) {
+    // The registry is process-global, so its cleanup must ride the host's
+    // process-global hook too (idempotent, once per process): session
+    // delete / last-connection-close kills this session's PTYs instead of
+    // waiting for a passive `read`/`run` sweep that may never come.
+    static CLEANUP_HOOK: OnceLock<()> = OnceLock::new();
+    if CLEANUP_HOOK.set(()).is_ok() {
+        conga_host::session_cleanup::register_hook(Arc::new(evict_session_terminals));
+    }
     api.register_tool(ToolDefinition {
         name: "terminal".into(),
         label: "Terminal".into(),
@@ -322,6 +330,30 @@ fn reap_dead_sessions() {
         if dead {
             remove_if_current(&key, &sess);
         }
+    }
+}
+
+/// Kill and remove EVERY PTY session belonging to `session_id` (registry
+/// keys are `<session_id>/<name>`; ids cannot contain `/`, so the prefix
+/// match is exact). Public: hosts call it (directly or via
+/// `conga_host::session_cleanup`) when the session is deleted or its last
+/// connection closes - dead children and their 64KiB rings must not linger
+/// in a long-running host process.
+pub fn evict_session_terminals(session_id: &str) {
+    let prefix = format!("{session_id}/");
+    let victims: Vec<Arc<Mutex<PtySession>>> = {
+        let mut reg = REGISTRY.write();
+        let keys: Vec<String> = reg
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        keys.iter().filter_map(|k| reg.remove(k)).collect()
+    };
+    for v in victims {
+        let mut s = v.lock();
+        let _ = s.child.kill();
+        let _ = s.child.wait();
     }
 }
 
@@ -646,6 +678,63 @@ mod tests {
         // A read after the reap is the honest "no active session" answer.
         let r = exec(serde_json::json!({"action": "read"}), tmp.path(), &s).await;
         assert_eq!(text(&r), "no active session");
+    }
+
+    #[tokio::test]
+    async fn evict_session_terminals_removes_only_that_session() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = format!("evict-a-{}", std::process::id());
+        let b = format!("evict-b-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "read x; echo $x"}),
+            tmp.path(),
+            &a,
+        )
+        .await;
+        assert!(!r.is_error);
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "read x; echo $x"}),
+            tmp.path(),
+            &b,
+        )
+        .await;
+        assert!(!r.is_error);
+        assert!(REGISTRY.read().contains_key(&format!("{a}/default")));
+
+        evict_session_terminals(&a);
+
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{a}/default")),
+            "evicted session's PTY must be removed"
+        );
+        assert!(
+            REGISTRY.read().contains_key(&format!("{b}/default")),
+            "other sessions must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_wires_ptys_into_host_session_cleanup() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = format!("hook-cleanup-{}", std::process::id());
+        let r = exec(
+            serde_json::json!({"action": "run", "command": "read x; echo $x"}),
+            tmp.path(),
+            &s,
+        )
+        .await;
+        assert!(!r.is_error);
+        assert!(REGISTRY.read().contains_key(&format!("{s}/default")));
+
+        // The hook `register()` installed must kill this session's PTY when
+        // the host runs session cleanup (delete / last-connection-close).
+        conga_host::session_cleanup::run_hooks(&s);
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{s}/default")),
+            "session cleanup must evict the session's PTYs"
+        );
     }
 
     #[tokio::test]

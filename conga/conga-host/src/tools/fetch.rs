@@ -45,14 +45,15 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     // SSRF guard: the model must not reach private/loopback/link-local
     // targets (cloud metadata endpoints, internal services) through us.
     // Opt out with CONGA_FETCH_ALLOW_PRIVATE_NET=1 (self-hosted LAN use).
-    if let Err(msg) = ssrf_guard(url).await {
-        return Ok(ToolResult::error(msg));
-    }
+    // For hostname URLs the guard also returns a DNS pin - every address it
+    // validated - which is locked into the client below so reqwest can never
+    // re-resolve the name (the classic DNS-rebinding TOCTOU).
+    let pin = match ssrf_guard(url).await {
+        Ok(pin) => pin,
+        Err(msg) => return Ok(ToolResult::error(msg)),
+    };
 
-    let client = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .user_agent("conga-fetch/1.0")
-        .build()
+    let client = build_client(pin.as_ref())
         .map_err(|e| conga::error::ToolError::Message(format!("client build failed: {e}")))?;
 
     let resp = client
@@ -93,16 +94,26 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     })
 }
 
+/// A guard-validated DNS answer: the URL's host plus every address it
+/// resolved to (all verified public). Pinned into the client via
+/// `resolve_to_addrs`, closing the gap where a rebinding DNS server answers
+/// the guard with a public IP and the actual request with 169.254.169.254.
+struct SsrfPin {
+    host: String,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
 /// Reject URLs whose host resolves (or literals point) into non-public
-/// address space. Skipped entirely when a tool proxy is configured — the
-/// proxy decides where traffic may go — or when the operator opted out.
-async fn ssrf_guard(url: &str) -> Result<(), String> {
+/// address space, returning the validated DNS pin for hostname URLs.
+/// Skipped entirely when a tool proxy is configured - the proxy decides
+/// where traffic may go - or when the operator opted out.
+async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
     if crate::proxy::tool_proxy().is_some() {
-        return Ok(());
+        return Ok(None);
     }
     if let Ok(v) = std::env::var("CONGA_FETCH_ALLOW_PRIVATE_NET") {
         if v == "1" || v.eq_ignore_ascii_case("true") {
-            return Ok(());
+            return Ok(None);
         }
     }
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
@@ -110,7 +121,8 @@ async fn ssrf_guard(url: &str) -> Result<(), String> {
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
 
-    // Fast path: IP literal — check directly, no DNS.
+    // Fast path: IP literal - check directly, no DNS, nothing to pin (the
+    // connection can only go to the literal itself).
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return if is_non_public_ip(ip) {
             Err(format!(
@@ -118,30 +130,57 @@ async fn ssrf_guard(url: &str) -> Result<(), String> {
                  set CONGA_FETCH_ALLOW_PRIVATE_NET=1 to allow)"
             ))
         } else {
-            Ok(())
+            Ok(None)
         };
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
     let addr = format!("{host}:{port}");
 
-    // Hostname: resolve and reject if ANY answer is non-public (a public
-    // name that rebinds to an internal IP must not slip through). Resolution
-    // failure stays fail-open — the request itself will surface the DNS error.
-    if let Ok(Ok(addrs)) =
-        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr)).await
-    {
-        for a in addrs {
-            if is_non_public_ip(a.ip()) {
+    // Hostname: resolve once and reject if ANY answer is non-public (a
+    // public name that rebinds to an internal IP must not slip through).
+    // Resolution failure fails CLOSED: without a validated address there is
+    // nothing to pin, and proceeding unpinned would hand the destination
+    // choice back to whatever a rebinding DNS answers next.
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr)).await {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(_)) | Err(_) => {
                 return Err(format!(
-                    "host {host} resolves to non-public address {} (SSRF guard; \
-                     set CONGA_FETCH_ALLOW_PRIVATE_NET=1 to allow)",
-                    a.ip()
-                ));
+                    "DNS resolution for {host} failed (SSRF guard requires a validated address)"
+                ))
             }
+        };
+    if addrs.is_empty() {
+        return Err(format!("host {host} resolved to no addresses (SSRF guard)"));
+    }
+    for a in &addrs {
+        if is_non_public_ip(a.ip()) {
+            return Err(format!(
+                "host {host} resolves to non-public address {} (SSRF guard; \
+                 set CONGA_FETCH_ALLOW_PRIVATE_NET=1 to allow)",
+                a.ip()
+            ));
         }
     }
-    Ok(())
+    // Lowercased to match reqwest's override key normalization.
+    Ok(Some(SsrfPin {
+        host: host.to_ascii_lowercase(),
+        addrs,
+    }))
+}
+
+/// Build the fetch client. A DNS pin (guard-validated addresses only) is
+/// bound via `resolve_to_addrs`, so the TCP connection is guaranteed to go
+/// to an address the SSRF guard has seen - reqwest never re-resolves.
+fn build_client(pin: Option<&SsrfPin>) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .user_agent("conga-fetch/1.0");
+    if let Some(pin) = pin {
+        builder = builder.resolve_to_addrs(&pin.host, &pin.addrs);
+    }
+    builder.build()
 }
 
 /// Whether `ip` is anything other than a globally routable unicast address.
@@ -331,6 +370,89 @@ mod tests {
         };
         let result = execute(ctx).await.unwrap();
         assert!(result.is_error, "localhost must be blocked: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_unresolvable_host_closed() {
+        // With pinning, a hostname the guard cannot resolve must fail CLOSED:
+        // proceeding unpinned would hand destination choice back to DNS.
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let ctx = ToolCallCtx {
+            tool_call_id: "t5".into(),
+            args: serde_json::json!({"url": "http://definitely-not-a-real-host.invalid/"}),
+            signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: conga::ToolContext {
+                cwd: ".".into(),
+                env: std::collections::HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+            },
+        };
+        let result = execute(ctx).await.unwrap();
+        assert!(
+            result.is_error,
+            "unresolvable host must never yield a successful fetch"
+        );
+        // On a normal resolver the guard itself refuses (fail-closed: no
+        // validated address, no pin, no request). On wildcard-DNS networks
+        // the request still fails - either way nothing is fetched.
+    }
+
+    /// The anti-rebinding core: a client built with a DNS pin must connect
+    /// to the PINNED address, never re-resolve the name. A local listener
+    /// plays the pinned target; `rebind.test` has no real DNS record, so the
+    /// request can only arrive if the pin (not DNS) decides the destination.
+    /// Without pinning this fails with a DNS error, not a served response.
+    #[tokio::test]
+    async fn pinned_client_connects_to_pinned_address_not_dns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // build_client consults the global tool-proxy override; hold the
+        // same lock as the proxy tests so a concurrent override can't
+        // reroute this client.
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "pinned-content";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            buf
+        });
+
+        // In production the pin only ever carries guard-validated public
+        // addresses; here a loopback addr stands in as the pinned target to
+        // prove the connection layer honors the pin verbatim.
+        let pin = SsrfPin {
+            host: "rebind.test".into(),
+            addrs: vec![addr],
+        };
+        let client = build_client(Some(&pin)).unwrap();
+        let resp = client.get("http://rebind.test/").send().await.unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(resp.text().await.unwrap(), "pinned-content");
+
+        let head = server.await.unwrap();
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("GET /"), "pinned server saw: {head}");
     }
     #[tokio::test]
     async fn fetch_rejects_non_http_scheme() {

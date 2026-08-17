@@ -63,6 +63,15 @@ cd web && pnpm install && pnpm dev
 | `CONGA_LLM_MODEL` | 模型 id | `deepseek-chat` |
 | `CONGA_LLM_API` | 协议族:`openai`(默认)或 `anthropic` | `openai` |
 
+### 3.1.1 Web 端运行时覆盖(图形界面配置方式)
+
+ChatHeader 的齿轮按钮(**Model Settings**)可以不碰 `.env` 直接配置 LLM:设置持久化到 `~/.conga/settings.json`(原子写),**每次 LLM 调用前重读**——保存后下一条消息即生效,无需重启。
+
+- **优先级**:`settings.json` > 进程 env(`.env`)。浏览器端走 `GET/PUT /api/settings`,桌面端走 Tauri IPC,同一份文件。
+- **安全**:API key 从不回传——GET 只返回 `apiKeySet`/`apiKeyHint`(`sk-…ab12` 掩码);PUT 留空 key 表示"保留已存的"。
+- **组语义**:取消勾选 Main/Fast = 清除该组(env 配置重新生效);Fast 组控制子代理模型,同样优先于 `CONGA_FAST_LLM_*`。
+- 手动编辑文件也可,格式:`{"llm":{"baseUrl":...,"apiKey":...,"model":...,"api":"openai"},"fastLlm":{...}}`;损坏文件会被忽略并回退 env(告警在日志)。
+
 ### 3.2 Provider 选择
 
 - **OpenAI 兼容(`openai`,默认)**:DeepSeek、智谱 GLM、xAI、Groq、Ollama、vLLM 等任填 base_url + key + model 即可。
@@ -75,8 +84,6 @@ cd web && pnpm install && pnpm dev
 | `CONGA_LLM_PROXY` | http 与 https 通吃的代理(fallback) |
 | `CONGA_LLM_HTTP_PROXY` | 仅 http(覆盖上面的 http 部分) |
 | `CONGA_LLM_HTTPS_PROXY` | 仅 https(覆盖上面的 https 部分) |
-
-代理优先级:按 scheme 的专用代理(`CONGA_LLM_HTTP_PROXY`/`CONGA_LLM_HTTPS_PROXY`)最高;`CONGA_LLM_PROXY` 填补缺失的那个 scheme。不读取标准的 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量。
 
 **工具代理(fetch / web_search)**:设置 `CONGA_TOOL_PROXY` 可让 `fetch` 与 `web_search` 工具的出站流量走代理,支持 `http` / `https` / `socks5` / `socks5h`(带认证的代理把 `user:pass` 写进 URL 即可):
 

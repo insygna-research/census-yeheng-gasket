@@ -10,10 +10,11 @@ import {
   DropdownMenuTrigger,
 } from 'radix-vue';
 import { computed, ref } from 'vue';
-import { Cpu, Globe, Loader2, Moon, MoreVertical, Palette, RotateCcw, Sun, Trash2, Check } from 'lucide-vue-next';
+import { Cpu, Globe, Loader2, Moon, MoreVertical, Palette, RotateCcw, Settings, Sun, Trash2, Check } from 'lucide-vue-next';
 import NetworkProxyDialog from './NetworkProxyDialog.vue';
+import SettingsDialog from './SettingsDialog.vue';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
-import type { ContextStats } from '../types';
+import type { ContextStats } from '@/types';
 
 const props = defineProps<{
   chatTitle: string;
@@ -63,6 +64,7 @@ const menuLabelClass =
   'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider';
 
 const showProxyDialog = ref(false);
+const showSettingsDialog = ref(false);
 </script>
 
 <template>
@@ -132,7 +134,15 @@ const showProxyDialog = ref(false);
       >
         <Globe class="w-4 h-4" />
       </button>
-      <!-- Appearance -->
+
+      <!-- Model settings (LLM env overrides, persisted backend-side) -->
+      <button
+        class="p-2 rounded-md th-hover th-text-muted hover:th-text transition-colors"
+        title="Model settings"
+        @click="showSettingsDialog = true"
+      >
+        <Settings class="w-4 h-4" />
+      </button>
       <DropdownMenuRoot>
         <DropdownMenuTrigger as-child>
           <button class="p-2 rounded-md th-hover th-text-muted hover:th-text transition-colors" title="Appearance">
@@ -170,6 +180,7 @@ const showProxyDialog = ref(false);
       </DropdownMenuRoot>
 
       <NetworkProxyDialog :open="showProxyDialog" @close="showProxyDialog = false" />
+      <SettingsDialog :open="showSettingsDialog" @close="showSettingsDialog = false" />
     </div>
   </header>
 </template>

@@ -115,17 +115,26 @@ pub async fn rename_session(
 }
 
 /// Delete a session's on-disk data wholesale (event log + meta sidecar +
-/// per-tool state). `Ok(false)` = never existed (`NotFound` is the caller's
-/// choice of framing; this returns the fact). Transports that track live
-/// connections refuse the delete themselves BEFORE calling this.
+/// per-tool state) and kill its process-global tool state (persistent
+/// shell, extension PTYs via cleanup hooks). `Ok(false)` = never existed
+/// (`NotFound` is the caller's choice of framing; this returns the fact).
+/// Transports that track live connections refuse the delete themselves
+/// BEFORE calling this.
 pub async fn delete_session(store_root: &Path, session_id: &str) -> Result<bool, SessionApiError> {
     if !conga::is_valid_session_id(session_id) {
         return Err(SessionApiError::BadRequest("invalid session id".into()));
     }
-    EventStorage::new(store_root.to_path_buf())
+    let removed = EventStorage::new(store_root.to_path_buf())
         .remove_session(session_id)
         .await
-        .map_err(|e| SessionApiError::Internal(e.to_string()))
+        .map_err(|e| SessionApiError::Internal(e.to_string()))?;
+    if removed {
+        // The session is gone; its shell/PTYs must not linger in the
+        // host process. Only on actual removal - a failed delete leaves
+        // the session (and its state) intact for a retry.
+        crate::session_cleanup::cleanup_session_resources(session_id).await;
+    }
+    Ok(removed)
 }
 
 /// Full-text search across all session event logs (FTS5 sidecar index).
@@ -209,5 +218,23 @@ mod tests {
         assert!(delete_session(tmp.path(), "sess-1").await.unwrap());
         assert!(!delete_session(tmp.path(), "sess-1").await.unwrap());
         assert!(!EventStorage::new(tmp.path().to_path_buf()).has_events("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn delete_runs_cleanup_hooks_for_removed_session() {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        crate::session_cleanup::register_hook(std::sync::Arc::new(|sid| {
+            SEEN.lock().unwrap().push(sid.to_string())
+        }));
+        let tmp = tempfile::tempdir().unwrap();
+        EventStorage::new(tmp.path().to_path_buf())
+            .append_event("sess-hook", &user_event("x"))
+            .await
+            .unwrap();
+        delete_session(tmp.path(), "sess-hook").await.unwrap();
+        assert!(
+            SEEN.lock().unwrap().contains(&"sess-hook".to_string()),
+            "delete must run cleanup hooks for the removed session"
+        );
     }
 }
