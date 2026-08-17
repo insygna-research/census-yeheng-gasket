@@ -310,9 +310,9 @@ async fn run_hook(
 /// Claude-compatible stdout contract (exit 0):
 /// `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny",
 /// "permissionDecisionReason": "...", "updatedInput": {...}}}`.
-/// Precedence: an `updatedInput` object wins → Modify (a rewrite paired
-/// with any decision is meaningful and must not be dropped); then "deny" →
-/// Block; then "allow" → Allow. Absent/unparsable output = no opinion.
+/// Precedence: "deny" → Block first (fail-closed); then an `updatedInput`
+/// object → Modify (a rewrite paired with "allow" or no decision must not
+/// be dropped); then "allow" → Allow. Absent/unparsable output = no opinion.
 fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
     let Ok(v) = serde_json::from_slice::<Value>(stdout) else {
         return HookDecision::NoOpinion;
@@ -320,23 +320,26 @@ fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
     let Some(spec) = v.get("hookSpecificOutput") else {
         return HookDecision::NoOpinion;
     };
+    // "deny" wins over everything (fail-closed); then an `updatedInput`
+    // rewrite paired with "allow" or an absent decision → Modify; then a
+    // plain "allow" → Allow.
+    if spec.get("permissionDecision").and_then(|d| d.as_str()) == Some("deny") {
+        let reason = spec
+            .get("permissionDecisionReason")
+            .and_then(|r| r.as_str())
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or(stderr)
+            .to_string();
+        return HookDecision::Block(if reason.is_empty() {
+            "blocked by process hook".to_string()
+        } else {
+            reason
+        });
+    }
     if let Some(input) = spec.get("updatedInput").filter(|i| i.is_object()) {
         return HookDecision::Modify(input.clone());
     }
     match spec.get("permissionDecision").and_then(|d| d.as_str()) {
-        Some("deny") => {
-            let reason = spec
-                .get("permissionDecisionReason")
-                .and_then(|r| r.as_str())
-                .filter(|r| !r.trim().is_empty())
-                .unwrap_or(stderr)
-                .to_string();
-            HookDecision::Block(if reason.is_empty() {
-                "blocked by process hook".to_string()
-            } else {
-                reason
-            })
-        }
         Some("allow") => HookDecision::Allow,
         _ => HookDecision::NoOpinion,
     }
@@ -719,6 +722,21 @@ mod tests {
             ToolCallVerdict::Modify(args) => assert_eq!(args["command"], "rewritten"),
             other => panic!("expected Modify, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn deny_with_updated_input_still_blocks() {
+        // "deny" wins over updatedInput — fail-closed: a hook that wants
+        // rewrite-only omits permissionDecision; allow+rewrite emits "allow".
+        let v = verdict(
+            &one_hook(
+                r#"echo '{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "no", "updatedInput": {"command": "x"}}}'"#,
+            ),
+            "bash",
+            serde_json::json!({"command": "original"}),
+        )
+        .await;
+        assert!(matches!(v, ToolCallVerdict::Block(r) if r == "no"));
     }
 
     #[tokio::test]
