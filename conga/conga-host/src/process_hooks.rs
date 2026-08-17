@@ -7,7 +7,7 @@
 //! the floor gate. See docs/hooks.md for the config schema.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -161,11 +161,15 @@ enum HookDecision {
 /// hooks would need an async seam (deferred until a consumer exists).
 pub struct ProcessHookChain {
     hooks: Vec<ProcessHook>,
+    /// Working dir for hook commands. `discover()` pins it to the project
+    /// dir so project hooks like `./scripts/check.sh` work no matter where
+    /// the host process runs; `new()` leaves it unset (process cwd).
+    cwd: Option<PathBuf>,
 }
 
 impl ProcessHookChain {
     pub fn new(hooks: Vec<ProcessHook>) -> Self {
-        Self { hooks }
+        Self { hooks, cwd: None }
     }
 
     /// Production entry: global `~/.conga/hooks.json` + project
@@ -176,7 +180,10 @@ impl ProcessHookChain {
         if hooks.is_empty() {
             None
         } else {
-            Some(Arc::new(Self::new(hooks)))
+            Some(Arc::new(Self {
+                hooks,
+                cwd: Some(project_dir.to_path_buf()),
+            }))
         }
     }
 }
@@ -190,21 +197,41 @@ impl conga::HookChain for ProcessHookChain {
         risk: conga::RiskLevel,
     ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
         Box::pin(async move {
-            // HookStack semantics, mirrored inside the chain: first Block
-            // wins; otherwise the last Modify wins; Allow is the default.
-            let mut verdict = ToolCallVerdict::Allow;
+            // HookStack semantics, mirrored inside the chain (hooks.rs):
+            // first Block wins and stops the run; an explicit stdout
+            // "allow" short-circuits the remaining hooks too. Otherwise
+            // each Modify feeds the NEXT hook (hooks compose on the
+            // rewritten args) and the last Modify wins; Allow is default.
+            let mut current = args.clone();
+            let mut modified = false;
             for hook in &self.hooks {
                 if !hook.tools.matches(tool_name) {
                     continue;
                 }
-                match run_hook(hook, tool_call_id, tool_name, args, risk).await {
+                match run_hook(
+                    self.cwd.as_deref(),
+                    hook,
+                    tool_call_id,
+                    tool_name,
+                    &current,
+                    risk,
+                )
+                .await
+                {
                     HookDecision::Block(reason) => return ToolCallVerdict::Block(reason),
                     HookDecision::Allow => return ToolCallVerdict::Allow,
-                    HookDecision::Modify(new_args) => verdict = ToolCallVerdict::Modify(new_args),
+                    HookDecision::Modify(new_args) => {
+                        current = new_args;
+                        modified = true;
+                    }
                     HookDecision::NoOpinion => {}
                 }
             }
-            verdict
+            if modified {
+                ToolCallVerdict::Modify(current)
+            } else {
+                ToolCallVerdict::Allow
+            }
         })
     }
 
@@ -221,6 +248,7 @@ impl conga::HookChain for ProcessHookChain {
 /// stdin, apply the deadline. Every failure path returns `NoOpinion` after
 /// a warning — fail-open by contract (see struct docs).
 async fn run_hook(
+    cwd: Option<&Path>,
     hook: &ProcessHook,
     tool_call_id: &str,
     tool_name: &str,
@@ -233,11 +261,12 @@ async fn run_hook(
         "tool_call_id": tool_call_id,
         "risk": format!("{risk:?}").to_ascii_lowercase(),
     });
+    let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let run = async {
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&hook.command)
-            .current_dir(std::env::current_dir().unwrap_or_else(|_| ".".into()))
+            .current_dir(cwd.unwrap_or(&fallback))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -281,7 +310,9 @@ async fn run_hook(
 /// Claude-compatible stdout contract (exit 0):
 /// `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny",
 /// "permissionDecisionReason": "...", "updatedInput": {...}}}`.
-/// Absent/unparsable output = no opinion.
+/// Precedence: an `updatedInput` object wins → Modify (a rewrite paired
+/// with any decision is meaningful and must not be dropped); then "deny" →
+/// Block; then "allow" → Allow. Absent/unparsable output = no opinion.
 fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
     let Ok(v) = serde_json::from_slice::<Value>(stdout) else {
         return HookDecision::NoOpinion;
@@ -289,6 +320,9 @@ fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
     let Some(spec) = v.get("hookSpecificOutput") else {
         return HookDecision::NoOpinion;
     };
+    if let Some(input) = spec.get("updatedInput").filter(|i| i.is_object()) {
+        return HookDecision::Modify(input.clone());
+    }
     match spec.get("permissionDecision").and_then(|d| d.as_str()) {
         Some("deny") => {
             let reason = spec
@@ -304,10 +338,7 @@ fn parse_decision(stdout: &[u8], stderr: &str) -> HookDecision {
             })
         }
         Some("allow") => HookDecision::Allow,
-        _ => match spec.get("updatedInput") {
-            Some(input) if input.is_object() => HookDecision::Modify(input.clone()),
-            _ => HookDecision::NoOpinion,
-        },
+        _ => HookDecision::NoOpinion,
     }
 }
 
@@ -643,5 +674,74 @@ mod tests {
         // test hermetic, assert the None case (no files anywhere on this
         // machine is not guaranteed, so only assert type-compat):
         let _ = ProcessHookChain::discover(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn modify_then_modify_composes() {
+        // Hook 2 only rewrites when its stdin contains hook 1's marker —
+        // proving hooks compose on the REWRITTEN args, not the originals.
+        // (Broken composition: hook 2 sees "git status", grep fails, and
+        // the verdict would be hook 1's unmodified rewrite instead.)
+        let chain = ProcessHookChain::new(vec![
+            ProcessHook {
+                command: r#"echo '{"hookSpecificOutput": {"updatedInput": {"command": "rtk git status"}}}'"#
+                    .to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+            ProcessHook {
+                command: r#"grep -q rtk && echo '{"hookSpecificOutput": {"updatedInput": {"command": "hook2-saw-rtk"}}}'"#
+                    .to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+        ]);
+        let v = verdict(&chain, "bash", serde_json::json!({"command": "git status"})).await;
+        match v {
+            ToolCallVerdict::Modify(args) => assert_eq!(args["command"], "hook2-saw-rtk"),
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_with_updated_input_is_modify() {
+        // A rewrite accompanying an "allow" decision is meaningful; the
+        // updatedInput wins instead of being silently dropped.
+        let v = verdict(
+            &one_hook(
+                r#"echo '{"hookSpecificOutput": {"permissionDecision": "allow", "updatedInput": {"command": "rewritten"}}}'"#,
+            ),
+            "bash",
+            serde_json::json!({"command": "original"}),
+        )
+        .await;
+        match v {
+            ToolCallVerdict::Modify(args) => assert_eq!(args["command"], "rewritten"),
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_short_circuits_later_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ran = tmp.path().join("hook2-ran");
+        let ran_str = ran.display().to_string();
+        let chain = ProcessHookChain::new(vec![
+            ProcessHook {
+                command: r#"echo '{"hookSpecificOutput": {"permissionDecision": "allow"}}'"#
+                    .to_string(),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+            ProcessHook {
+                command: format!("touch {ran_str}; exit 2"),
+                tools: ToolMatcher::All,
+                timeout: Duration::from_secs(5),
+            },
+        ]);
+        let v = verdict(&chain, "bash", serde_json::json!({})).await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+        // Hook 2 never ran after the explicit allow: no side-effect file.
+        assert!(!ran.exists());
     }
 }
