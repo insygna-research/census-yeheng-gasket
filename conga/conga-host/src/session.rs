@@ -63,6 +63,46 @@ fn count_messages(raw: &str, is_events: bool) -> usize {
         })
 }
 
+/// `msg_count` cache keys stored in the session's `meta.json` sidecar.
+/// Additive — core's `SessionMeta` reader ignores unknown fields, so the
+/// display name written by rename flows keeps working. `msg_count` is the
+/// model-visible message count; `msg_count_bytes` is the `events.jsonl`
+/// size it was computed at (the freshness check: appends grow the file).
+const META_MSG_COUNT: &str = "msg_count";
+const META_MSG_COUNT_BYTES: &str = "msg_count_bytes";
+
+/// Read the cached `(msg_count, events_bytes)` pair from a `meta.json`.
+/// `None` when the sidecar is missing, unreadable, or predates the cache.
+async fn read_msg_count_cache(meta_path: &std::path::Path) -> Option<(usize, u64)> {
+    let raw = tokio::fs::read(meta_path).await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    Some((
+        v.get(META_MSG_COUNT)?.as_u64()? as usize,
+        v.get(META_MSG_COUNT_BYTES)?.as_u64()?,
+    ))
+}
+
+/// Merge the cache pair into `meta.json`, preserving every other field
+/// (e.g. the display name). Atomic (tmp + rename), best effort — a failed
+/// write never fails `list`.
+async fn write_msg_count_cache(meta_path: &std::path::Path, count: usize, events_len: u64) {
+    let write = async {
+        let mut v: serde_json::Value = match tokio::fs::read(meta_path).await {
+            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if let Some(map) = v.as_object_mut() {
+            map.insert(META_MSG_COUNT.into(), count.into());
+            map.insert(META_MSG_COUNT_BYTES.into(), events_len.into());
+        }
+        let tmp = meta_path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, v.to_string()).await?;
+        tokio::fs::rename(&tmp, meta_path).await?;
+        Ok::<(), std::io::Error>(())
+    };
+    let _ = write.await;
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::with_root(JsonlStorage::default_root().base_dir_clone())
@@ -197,18 +237,23 @@ impl SessionManager {
             } else {
                 self.storage.messages_path(&id)
             };
-            let mtime = tokio::fs::metadata(&path)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let (mtime, events_len) = match tokio::fs::metadata(&path).await {
+                Ok(m) => (m.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH), m.len()),
+                Err(_) => (SystemTime::UNIX_EPOCH, 0),
+            };
             // Count model-visible messages, not raw event lines: the event
             // log carries TurnStart/TurnEnd marker rows that
             // derive_messages projects away. A legacy messages.jsonl
             // (pre-migration) still holds one message per non-empty line.
-            let msg_count = match tokio::fs::read_to_string(&path).await {
-                Ok(s) => count_messages(&s, is_events),
-                Err(_) => 0,
+            // Event sessions consult the msg_count cache in the meta.json
+            // sidecar first; only a missing/stale cache pays the full read.
+            let msg_count = if is_events {
+                self.cached_or_count_messages(&id, &path, events_len).await
+            } else {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => count_messages(&s, false),
+                    Err(_) => 0,
+                }
             };
             out.push(SessionInfo {
                 id: id.clone(),
@@ -218,6 +263,31 @@ impl SessionManager {
             });
         }
         Ok(out)
+    }
+
+    /// `list` fast path: reuse the `msg_count` cached in the session's
+    /// `meta.json` sidecar while `events.jsonl`'s size still matches the
+    /// size recorded with it (`msg_count_bytes`); a missing or stale cache
+    /// (events were appended since) falls back to one full read for THIS
+    /// session only and refreshes the cache. Best effort: a failed
+    /// cache write just costs the next `list` a full read.
+    async fn cached_or_count_messages(
+        &self,
+        id: &str,
+        events_path: &std::path::Path,
+        events_len: u64,
+    ) -> usize {
+        if let Some((count, cached_len)) = read_msg_count_cache(&self.storage.meta_path(id)).await {
+            if cached_len == events_len {
+                return count;
+            }
+        }
+        let count = match tokio::fs::read_to_string(events_path).await {
+            Ok(s) => count_messages(&s, true),
+            Err(_) => 0,
+        };
+        write_msg_count_cache(&self.storage.meta_path(id), count, events_len).await;
+        count
     }
 
     /// Mark the conversation cleared — the unified `/clear` semantics for
@@ -479,5 +549,78 @@ mod tests {
             dir.join("messages.jsonl").exists(),
             "the leftover legacy is inert cleanup, deliberately not deleted here"
         );
+    }
+
+    /// `list` caches msg_count in the meta.json sidecar; a later append
+    /// changes events.jsonl's size, the stale cache is detected, and the
+    /// full read self-heals the count for that session.
+    #[tokio::test]
+    async fn list_after_append_recaches_and_self_heals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cache-count".to_string();
+        *sm.current_id.lock() = id.clone();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&assistant_event("b")).await.unwrap();
+
+        let find =
+            |info: Vec<SessionInfo>| info.into_iter().find(|i| i.id == "cache-count").unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 2);
+
+        // The first list wrote the cache into the sidecar.
+        let meta_path = tmp.path().join(&id).join("meta.json");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta[META_MSG_COUNT], 2, "cache must land in meta.json");
+        let bytes = std::fs::metadata(tmp.path().join(&id).join("events.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(meta[META_MSG_COUNT_BYTES].as_u64(), Some(bytes));
+
+        // Append: the recorded size no longer matches the file — list must
+        // fall back to the full read and report the NEW count.
+        sm.append_event(&user_event("c")).await.unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 3);
+
+        // And the refreshed cache is written back (new size recorded).
+        let meta2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let bytes2 = std::fs::metadata(tmp.path().join(&id).join("events.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(meta2[META_MSG_COUNT], 3);
+        assert_eq!(meta2[META_MSG_COUNT_BYTES].as_u64(), Some(bytes2));
+    }
+
+    /// While events.jsonl is unchanged, list serves the cached count (no
+    /// full read): a tampered-but-size-matched cache value is what comes
+    /// back. The next append self-heals.
+    #[tokio::test]
+    async fn list_serves_cached_count_while_events_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cache-hit".to_string();
+        *sm.current_id.lock() = id.clone();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&user_event("b")).await.unwrap();
+        let find = |info: Vec<SessionInfo>| info.into_iter().find(|i| i.id == "cache-hit").unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 2); // seeds cache
+
+        // Tamper ONLY the count; keep the recorded size — the cache is
+        // fresh by the bytes check, so this value must be served as-is.
+        let meta_path = tmp.path().join(&id).join("meta.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta[META_MSG_COUNT] = 99.into();
+        std::fs::write(&meta_path, meta.to_string()).unwrap();
+        assert_eq!(
+            find(sm.list().await.unwrap()).msg_count,
+            99,
+            "fresh cache must be served without a full read"
+        );
+
+        // Appending invalidates the tampered cache; the count self-heals.
+        sm.append_event(&user_event("c")).await.unwrap();
+        assert_eq!(find(sm.list().await.unwrap()).msg_count, 3);
     }
 }

@@ -71,6 +71,14 @@ impl ApprovalRegistry {
     pub fn clear_pending(&mut self) {
         self.pending.clear();
     }
+
+    /// Drop the remember cache. Called on permission-mode changes: a
+    /// downgrade (e.g. full-auto -> auto-edit) must not keep honoring a
+    /// decision remembered under the looser mode — those tools need human
+    /// approval again.
+    pub fn clear_memory(&mut self) {
+        self.memory.clear();
+    }
 }
 
 /// 等待审批决策：oneshot 响应 / cancel 通知 / 超时 三路，任一先到即返回。
@@ -147,6 +155,32 @@ mod tests {
         r.clear_pending();
         // tokio 1.53 的 RecvError 是无公开构造函数的单元结构体，
         // 只能断言收端以 Err（通道关闭）返回。
+        assert!(rx.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn clear_memory_drops_remembered_decisions() {
+        let mut r = ApprovalRegistry::new();
+        let RegisterOutcome::Pending { request_id, .. } = r.register("bash") else {
+            panic!();
+        };
+        r.respond(&request_id, true, true); // remember allow
+        assert!(matches!(
+            r.register("bash"),
+            RegisterOutcome::Remembered(true)
+        ));
+        // Mode change: remembered approvals must not outlive the switch —
+        // the same tool asks for approval again.
+        r.clear_memory();
+        assert!(matches!(
+            r.register("bash"),
+            RegisterOutcome::Pending { .. }
+        ));
+        // Pending tracking is untouched by clear_memory.
+        let RegisterOutcome::Pending { rx, .. } = r.register("write") else {
+            panic!();
+        };
+        r.clear_pending();
         assert!(rx.blocking_recv().is_err());
     }
 

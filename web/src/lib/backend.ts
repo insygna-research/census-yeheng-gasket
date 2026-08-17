@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { isTauri } from '@/lib/platform';
+import { readString, storageKeys } from '@/lib/storage';
 import type { Message, ToolCall, EnvSettingsView, EnvSettingsPayload } from '@/types';
 
 /**
@@ -17,6 +18,24 @@ import type { Message, ToolCall, EnvSettingsView, EnvSettingsPayload } from '@/t
 export const backendBaseUrl = (): string =>
   import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
+/** The stored gateway token (empty = none entered yet). Browser mode only;
+ * the desktop shell talks IPC and never needs it. */
+export function gatewayToken(): string {
+  return readString(storageKeys.gatewayToken, '');
+}
+
+/** fetch() against the gateway with the auth token attached (Bearer header).
+ * Every browser-mode REST call must go through this — the gateway rejects
+ * unauthenticated /api/* requests with 401. */
+export function gatewayFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  const token = gatewayToken();
+  if (token && !headers.has('authorization')) {
+    headers.set('authorization', `Bearer ${token}`);
+  }
+  return fetch(`${backendBaseUrl()}${path}`, { ...init, headers });
+}
+
 export interface BackendSessionInfo {
   id: string;
   msg_count: number;
@@ -29,7 +48,7 @@ export async function fetchSessionList(): Promise<BackendSessionInfo[]> {
   if (isTauri) {
     return invoke<BackendSessionInfo[]>('list_sessions');
   }
-  const res = await fetch(`${backendBaseUrl()}/api/sessions`);
+  const res = await gatewayFetch(`/api/sessions`);
   if (!res.ok) return [];
   const data = await res.json();
   return data.sessions || [];
@@ -42,7 +61,7 @@ export async function renameSession(chatId: string, name: string): Promise<boole
       await invoke('rename_session', { id: chatId, name });
       return true;
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}/name`, {
+    const res = await gatewayFetch(`/api/sessions/${encodeURIComponent(chatId)}/name`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -61,7 +80,7 @@ export async function fetchEnvSettings(): Promise<EnvSettingsView | null> {
     if (isTauri) {
       return await invoke<EnvSettingsView>('get_env_settings');
     }
-    const res = await fetch(`${backendBaseUrl()}/api/settings`);
+    const res = await gatewayFetch(`/api/settings`);
     if (!res.ok) return null;
     return (await res.json()) as EnvSettingsView;
   } catch {
@@ -84,7 +103,7 @@ export async function saveEnvSettings(
       const view = await invoke<EnvSettingsView>('set_env_settings', { payload });
       return { view };
     }
-    const res = await fetch(`${backendBaseUrl()}/api/settings`, {
+    const res = await gatewayFetch(`/api/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -105,7 +124,7 @@ export async function deleteSession(chatId: string): Promise<boolean> {
     if (isTauri) {
       return await invoke<boolean>('delete_session', { id: chatId });
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}`, {
+    const res = await gatewayFetch(`/api/sessions/${encodeURIComponent(chatId)}`, {
       method: 'DELETE',
     });
     return res.ok;
@@ -211,7 +230,7 @@ export async function fetchSessionMessages(chatId: string): Promise<Message[] | 
       if (!list || list.length === 0) return null;
       return mapBackendMessages(list as Parameters<typeof mapBackendMessages>[0]);
     }
-    const res = await fetch(`${backendBaseUrl()}/api/sessions/${encodeURIComponent(chatId)}/messages`);
+    const res = await gatewayFetch(`/api/sessions/${encodeURIComponent(chatId)}/messages`);
     if (!res.ok) return null;
     const list = await res.json();
     if (!Array.isArray(list) || list.length === 0) return null;
@@ -238,9 +257,7 @@ export async function searchSessions(q: string): Promise<SessionHit[]> {
     if (isTauri) {
       return await invoke<SessionHit[]>('search_sessions', { query: q });
     }
-    const res = await fetch(
-      `${backendBaseUrl()}/api/sessions/search?q=${encodeURIComponent(q)}`,
-    );
+    const res = await gatewayFetch(`/api/sessions/search?q=${encodeURIComponent(q)}`);
     if (!res.ok) return [];
     const data = await res.json();
     return data.hits || [];

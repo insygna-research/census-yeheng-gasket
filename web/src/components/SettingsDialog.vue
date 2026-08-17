@@ -6,6 +6,8 @@ import { Input } from '@/components/ui/input';
 import SettingsProxyTab from './SettingsProxyTab.vue';
 import { renderMarkdownBlock } from '@/lib/markdown';
 import { fetchEnvSettings, saveEnvSettings } from '@/lib/backend';
+import { isTauri } from '@/lib/platform';
+import { readString, storageKeys, writeString } from '@/lib/storage';
 import type { EnvSettingsView, LlmSettingsGroup } from '@/types';
 
 const props = defineProps<{ open: boolean }>();
@@ -15,9 +17,22 @@ const tabs = [
   { id: 'model', label: 'Model', icon: Cpu },
   { id: 'prompt', label: 'Prompt', icon: FileText },
   { id: 'proxy', label: 'Proxy', icon: Globe },
+  { id: 'connection', label: 'Connection', icon: Settings },
 ] as const;
 type TabId = (typeof tabs)[number]['id'];
 const activeTab = ref<TabId>('model');
+
+// Browser mode only: the token the gateway requires (see ~/.conga/gateway_token
+// on the machine running conga-gateway). The desktop shell uses IPC and never
+// connects to a gateway.
+const gatewayTokenValue = ref(readString(storageKeys.gatewayToken, ''));
+const saveToken = () => {
+  const t = gatewayTokenValue.value.trim();
+  writeString(storageKeys.gatewayToken, t);
+  // Reconnect with the new credentials: the WS URL and REST headers both
+  // derive from the stored token at connect time.
+  window.location.reload();
+};
 
 /** One editable group; `enabled` maps to null (cleared) vs present. */
 interface EditableGroup {
@@ -43,6 +58,7 @@ const emptyGroup = (): EditableGroup => ({
 const llm = ref<EditableGroup>(emptyGroup());
 const fast = ref<EditableGroup>(emptyGroup());
 const systemPrompt = ref('');
+const maxTokens = ref('');
 const previewing = ref(false);
 const previewHtml = ref('');
 const error = ref('');
@@ -63,6 +79,7 @@ const adopt = (view: EnvSettingsView | null) => {
   llm.value = fromView(view?.llm ?? null);
   fast.value = fromView(view?.fastLlm ?? null);
   systemPrompt.value = view?.systemPrompt ?? '';
+  maxTokens.value = view?.maxTokens != null ? String(view.maxTokens) : '';
 };
 
 // Reload the stored (masked) view each time the dialog opens.
@@ -81,6 +98,7 @@ watch(
         llm.value = emptyGroup();
         fast.value = emptyGroup();
         systemPrompt.value = '';
+        maxTokens.value = '';
       }
     }
   }
@@ -90,6 +108,12 @@ const toPayloadGroup = (g: EditableGroup): LlmSettingsGroup | null =>
   g.enabled
     ? { baseUrl: g.baseUrl.trim(), apiKey: g.apiKey.trim(), model: g.model.trim(), api: g.api }
     : null;
+
+/** Blank input clears the override (null); a filled one is the new ceiling. */
+const parsedMaxTokens = (): number | null => {
+  const t = maxTokens.value.trim();
+  return t ? Number(t) : null;
+};
 
 const validate = (): string => {
   const check = (name: string, g: EditableGroup): string => {
@@ -109,6 +133,12 @@ const validate = (): string => {
     const e = check('Fast model', fast.value);
     if (e) return e;
   }
+  const mt = maxTokens.value.trim();
+  if (mt) {
+    const n = Number(mt);
+    if (!Number.isInteger(n) || n < 1024 || n > 2_000_000)
+      return 'Max tokens: must be an integer between 1,024 and 2,000,000';
+  }
   return '';
 };
 
@@ -120,6 +150,7 @@ const save = async () => {
     llm: toPayloadGroup(llm.value),
     fastLlm: toPayloadGroup(fast.value),
     systemPrompt: systemPrompt.value.trim(),
+    maxTokens: parsedMaxTokens(),
   });
   saving.value = false;
   if ('error' in result) {
@@ -129,6 +160,7 @@ const save = async () => {
   adopt(result.view);
   emit('close');
 };
+
 
 // Toggle Edit/Preview; the preview re-renders on every toggle.
 const togglePreview = () => {
@@ -243,6 +275,26 @@ const togglePreview = () => {
                 />
               </template>
             </div>
+
+            <!-- Max tokens (context budget) -->
+            <div class="space-y-2 rounded-xl border border-border p-3">
+              <div>
+                <label for="max-tokens" class="text-xs font-medium text-foreground">Max tokens</label>
+                <p class="mt-0.5 text-[11px] text-muted-foreground leading-relaxed">
+                  Context budget ceiling (1024–2,000,000). Overrides CONGA_CONTEXT_WINDOW; blank = env/default.
+                </p>
+              </div>
+              <Input
+                id="max-tokens"
+                v-model="maxTokens"
+                type="number"
+                min="1024"
+                max="2000000"
+                step="1024"
+                placeholder="128000"
+                class="text-xs"
+              />
+            </div>
           </template>
 
           <!-- Prompt tab -->
@@ -291,10 +343,37 @@ const togglePreview = () => {
             </p>
           </div>
 
-          <!-- Proxy tab: self-contained, owns its own actions -->
-          <SettingsProxyTab v-else @close="emit('close')" />
 
-          <template v-if="activeTab !== 'proxy'">
+          <!-- Proxy tab: self-contained, owns its own actions -->
+          <SettingsProxyTab v-else-if="activeTab === 'proxy'" @close="emit('close')" />
+          <!-- Connection tab: gateway token (browser mode only) -->
+          <div v-else-if="activeTab === 'connection'" class="space-y-3 rounded-xl border border-border p-3">
+            <p v-if="isTauri" class="text-xs text-muted-foreground">
+              Desktop app uses in-process IPC — no gateway token needed.
+            </p>
+            <template v-else>
+              <div>
+                <label class="text-xs font-medium th-text">Gateway token</label>
+                <p class="mt-1 text-[11px] text-muted-foreground leading-relaxed">
+                  Required by conga-gateway for WebSocket and API access. Find it in
+                  <code class="px-1 py-0.5 rounded bg-muted font-mono text-[10px]">~/.conga/gateway_token</code>
+                  on the machine running the gateway (or set
+                  <code class="px-1 py-0.5 rounded bg-muted font-mono text-[10px]">CONGA_GATEWAY_TOKEN</code>).
+                </p>
+              </div>
+              <Input
+                v-model="gatewayTokenValue"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Paste gateway token"
+                class="font-mono text-xs h-8"
+              />
+              <Button class="h-8 text-xs" @click="saveToken">Save &amp; reconnect</Button>
+            </template>
+          </div>
+
+          <template v-if="activeTab !== 'proxy' && activeTab !== 'connection'">
             <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
 
             <!-- Actions -->

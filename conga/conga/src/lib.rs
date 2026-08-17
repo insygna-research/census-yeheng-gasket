@@ -27,7 +27,7 @@ pub use storage::{is_valid_session_id, EventStorage, JsonlStorage, SessionMeta};
 
 pub use types::context::{
     AgentContext, AgentLoopConfig, AgentTunables, ModelSpec, ProviderApi, RetryPolicy, StreamChunk,
-    StreamFn, ThinkingLevel,
+    StreamFn,
 };
 pub use types::event::{AgentEvent, ContentDelta};
 pub use types::message::{

@@ -1,4 +1,6 @@
-# Logs
+# Local env (may carry real API keys) — never commit
+.env
+
 logs
 *.log
 npm-debug.log*

@@ -131,6 +131,8 @@ mod tests {
             subagent_event_to_ws(&SubagentEvent::Usage {
                 input_tokens: 1,
                 output_tokens: 2,
+                cache_read: 3,
+                cache_write: 4,
             })
             .is_none(),
             "Usage is internal accounting and must never reach the socket"

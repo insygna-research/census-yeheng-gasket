@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useSidebar } from '@/composables/useSidebar';
 import { isMacOverlay } from '@/lib/platform';
+import { searchSessions, type SessionHit } from '@/lib/backend';
 import { useChatStore } from '@/stores/chatStore';
 import type { Chat } from '@/types';
 import {
@@ -15,7 +16,7 @@ import {
   Search,
   X,
 } from 'lucide-vue-next';
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue';
 
 const chatStore = useChatStore();
 const { sidebarWidth, isCollapsed, isResizing, onResizeStart, toggleSidebar } = useSidebar();
@@ -25,12 +26,63 @@ const { sidebarWidth, isCollapsed, isResizing, onResizeStart, toggleSidebar } = 
 const searchQuery = ref('');
 const searchInputRef = ref<HTMLInputElement | null>(null);
 
+// Backend full-text hits (FTS5 over message content) for the current query.
+// Empty when the query is blank, still in flight, or produced no hits —
+// in every one of those cases the list falls back to the client-side
+// name filter alone.
+const remoteHits = ref<SessionHit[]>([]);
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+let searchSeq = 0;
+
+watch(searchQuery, q => {
+  if (searchTimer) clearTimeout(searchTimer);
+  const query = q.trim();
+  if (!query) {
+    searchSeq++; // invalidate any in-flight response
+    remoteHits.value = [];
+    return;
+  }
+  const seq = ++searchSeq;
+  searchTimer = setTimeout(async () => {
+    // searchSessions resolves to [] on error as well — the client filter
+    // stays the fallback for both no-hits and failed requests.
+    const hits = await searchSessions(query);
+    if (seq === searchSeq) remoteHits.value = hits;
+  }, 300);
+});
+
+onUnmounted(() => {
+  if (searchTimer) clearTimeout(searchTimer);
+});
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Union of the name-filtered local chats and the backend full-text hits:
+ * content matches surface sessions whose NAME doesn't contain the query.
+ * Hits for sessions not yet in the local list (created on another device
+ * after sync) join as minimal entries — activating one hydrates it from
+ * the backend store. */
+const mergeRemoteHits = (byName: Chat[]): Chat[] => {
+  if (remoteHits.value.length === 0) return byName;
+  const merged = [...byName];
+  const seen = new Set(merged.map(c => c.id));
+  for (const hit of remoteHits.value) {
+    if (seen.has(hit.session_id)) continue;
+    const existing = chatStore.chats.find(c => c.id === hit.session_id);
+    if (existing) {
+      merged.push(existing);
+      seen.add(existing.id);
+    } else {
+      merged.push({ id: hit.session_id, name: hit.name || 'Session', messages: [], updatedAt: 0 });
+      seen.add(hit.session_id);
+    }
+  }
+  return merged;
+};
 
 const groupedChats = computed(() => {
   const q = searchQuery.value.trim().toLowerCase();
   const sorted = [...chatStore.chats].sort((a, b) => b.updatedAt - a.updatedAt);
-  const list = q ? sorted.filter(c => c.name.toLowerCase().includes(q)) : sorted;
+  const list = q ? mergeRemoteHits(sorted.filter(c => c.name.toLowerCase().includes(q))) : sorted;
 
   const startOfToday = new Date().setHours(0, 0, 0, 0);
   const groups: { label: string; chats: Chat[] }[] = [

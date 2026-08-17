@@ -256,6 +256,13 @@ pub type ModelId = String;
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's cache. `None` when the
+    /// provider didn't report cache stats (old logs stay parseable).
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written into the provider's cache this call.
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[cfg(test)]
@@ -372,5 +379,38 @@ mod tests {
         );
         let back: AssistantMessage = serde_json::from_value(json).unwrap();
         assert_eq!(back.content, m.content);
+    }
+
+    #[test]
+    fn usage_old_log_json_parses_with_absent_cache_fields() {
+        // Old events.jsonl lines carry only input/output; the cache fields
+        // must default to None (absent = not reported), never fail.
+        let u: Usage = serde_json::from_str(r#"{"input_tokens":5,"output_tokens":3}"#).unwrap();
+        assert_eq!(u.input_tokens, 5);
+        assert_eq!(u.output_tokens, 3);
+        assert_eq!(u.cache_read_tokens, None);
+        assert_eq!(u.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn usage_cache_fields_round_trip() {
+        let u = Usage {
+            input_tokens: 5,
+            output_tokens: 3,
+            cache_read_tokens: Some(7),
+            cache_write_tokens: Some(11),
+        };
+        let json = serde_json::to_value(u).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "cache_read_tokens": 7,
+                "cache_write_tokens": 11,
+            })
+        );
+        let back: Usage = serde_json::from_value(json).unwrap();
+        assert_eq!(back, u);
     }
 }

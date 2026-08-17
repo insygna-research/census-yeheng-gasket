@@ -16,6 +16,11 @@ use conga::ProviderConfig;
 /// built-in text, but a runaway paste must not eat the context window.
 const MAX_CUSTOM_PROMPT_BYTES: usize = 64 * 1024;
 
+/// Bounds for the user-configured context window (`maxTokens`). Below 1024
+/// the window is unusably small; above 2M no current model qualifies.
+pub const MIN_MAX_TOKENS: u64 = 1024;
+pub const MAX_MAX_TOKENS: u64 = 2_000_000;
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LlmGroup {
@@ -40,6 +45,10 @@ pub struct EnvSettings {
     /// `CODING_AGENT_PROMPT` prefix while project doc / skills / env
     /// snapshot stay appended. `None` or blank = built-in prompt.
     pub system_prompt: Option<String>,
+    /// User-configured context window (tokens): overrides
+    /// `CONGA_CONTEXT_WINDOW` for compaction and the context-stats
+    /// percentage. `None` = env applies. See [`effective_max_tokens`].
+    pub max_tokens: Option<u64>,
 }
 
 impl LlmGroup {
@@ -109,6 +118,31 @@ pub fn load_settings() -> EnvSettings {
     load_settings_at(&settings_path())
 }
 
+/// Async variant of [`load_settings_at`] for callers already on the Tokio
+/// runtime (`Host::run_turn` re-reads the file every turn): `tokio::fs`
+/// keeps the read off the worker thread's synchronous path. Same
+/// degrade-to-empty semantics as the sync loader.
+pub async fn load_settings_at_async(path: &Path) -> EnvSettings {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => match serde_json::from_slice::<EnvSettings>(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("{}: corrupt settings file ignored: {e}", path.display());
+                EnvSettings::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => EnvSettings::default(),
+        Err(e) => {
+            tracing::warn!("{}: settings file unreadable, ignored: {e}", path.display());
+            EnvSettings::default()
+        }
+    }
+}
+
+pub async fn load_settings_async() -> EnvSettings {
+    load_settings_at_async(&settings_path()).await
+}
+
 /// Validate then atomically persist (tmp + rename). A crash can never
 /// leave a torn file shadowing an intact one.
 pub fn save_settings_at(path: &Path, s: &EnvSettings) -> Result<(), String> {
@@ -118,6 +152,7 @@ pub fn save_settings_at(path: &Path, s: &EnvSettings) -> Result<(), String> {
     if let Some(g) = &s.fast_llm {
         g.validate().map_err(|e| format!("fastLlm: {e}"))?;
     }
+    validate_max_tokens(s.max_tokens).map_err(|e| format!("maxTokens: {e}"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -157,6 +192,43 @@ pub fn effective_fast_provider(s: &EnvSettings) -> Option<ProviderConfig> {
     }
 }
 
+/// The context window this process should assume: the settings file's
+/// `maxTokens` wins over `CONGA_CONTEXT_WINDOW`, else the 128k default.
+/// Stateless — reads the file on each call, so a UI save reaches the next
+/// stats request without a restart (`run_turn` feeds the same settings
+/// re-read into the compaction budget).
+pub fn effective_max_tokens() -> u64 {
+    resolve_max_tokens(load_settings().max_tokens, &|k| std::env::var(k))
+}
+
+/// Testable core of [`effective_max_tokens`]; the env comes from the
+/// process in production. Missing / unparsable env falls to the 128k
+/// default (same tolerance as `ContextBudget::from_env`).
+fn resolve_max_tokens(
+    settings: Option<u64>,
+    lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> u64 {
+    settings.unwrap_or_else(|| {
+        lookup("CONGA_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128_000)
+    })
+}
+
+/// Bounds check for the stored `maxTokens` (error without prefix; callers
+/// add the `maxTokens:` context). `None` (no override) is always valid.
+fn validate_max_tokens(n: Option<u64>) -> Result<(), String> {
+    if let Some(n) = n {
+        if !(MIN_MAX_TOKENS..=MAX_MAX_TOKENS).contains(&n) {
+            return Err(format!(
+                "must be an integer between {MIN_MAX_TOKENS} and {MAX_MAX_TOKENS} (got {n})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Mask a stored key for display: `sk-…ab12`. Short keys mask entirely.
 pub fn mask_key(key: &str) -> String {
     let k = key.trim();
@@ -172,7 +244,7 @@ pub fn mask_key(key: &str) -> String {
 /// The GET view: same shape as [`EnvSettings`] but the raw `api_key` is
 /// replaced by `apiKeySet` + `apiKeyHint` - the secret never crosses the
 /// API (the gateway listens on 0.0.0.0; CORS is open). `systemPrompt` is
-/// not a secret and round-trips verbatim.
+/// not a secret and round-trips verbatim; `maxTokens` is a number or null.
 pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
     fn group(g: &Option<LlmGroup>) -> serde_json::Value {
         match g {
@@ -190,6 +262,7 @@ pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
         "llm": group(&s.llm),
         "fastLlm": group(&s.fast_llm),
         "systemPrompt": s.system_prompt.as_deref().unwrap_or(""),
+        "maxTokens": s.max_tokens,
     })
 }
 
@@ -199,7 +272,14 @@ pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
 pub fn put_settings(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
     let incoming: EnvSettings = serde_json::from_value(payload.clone())
         .map_err(|e| format!("invalid settings payload: {e}"))?;
-    let merged = merge_put(&load_settings(), incoming)?;
+    // `maxTokens` needs presence info beyond the parsed struct: an explicit
+    // JSON null CLEARS the override (env applies again) while an absent key
+    // keeps the stored one — serde cannot tell the two apart in Option<u64>.
+    let merged = merge_put(
+        &load_settings(),
+        incoming,
+        payload.get("maxTokens").is_some(),
+    )?;
     save_settings(&merged)?;
     Ok(settings_to_masked_json(&merged))
 }
@@ -208,7 +288,13 @@ pub fn put_settings(payload: &serde_json::Value) -> Result<serde_json::Value, St
 /// it (back to env); a present group replaces it, except a blank
 /// `api_key` inherits the stored key (which must then exist). The custom
 /// prompt is stored trimmed; blank clears it (built-in prompt back).
-fn merge_put(current: &EnvSettings, incoming: EnvSettings) -> Result<EnvSettings, String> {
+/// `maxTokens` mirrors that merge shape: present number overrides
+/// (validated), explicit null clears, absent key keeps the stored value.
+fn merge_put(
+    current: &EnvSettings,
+    incoming: EnvSettings,
+    max_tokens_in_payload: bool,
+) -> Result<EnvSettings, String> {
     let merge_group = |name: &str,
                        new: Option<LlmGroup>,
                        old: &Option<LlmGroup>|
@@ -244,10 +330,22 @@ fn merge_put(current: &EnvSettings, incoming: EnvSettings) -> Result<EnvSettings
             }
         }
     };
+    let max_tokens = if max_tokens_in_payload {
+        match incoming.max_tokens {
+            Some(n) => {
+                validate_max_tokens(Some(n)).map_err(|e| format!("maxTokens: {e}"))?;
+                Some(n)
+            }
+            None => None, // explicit null clears: env window applies again
+        }
+    } else {
+        current.max_tokens // absent key: keep stored
+    };
     Ok(EnvSettings {
         llm: merge_group("llm", incoming.llm, &current.llm)?,
         fast_llm: merge_group("fastLlm", incoming.fast_llm, &current.fast_llm)?,
         system_prompt,
+        max_tokens,
     })
 }
 
@@ -264,6 +362,14 @@ mod tests {
         }
     }
 
+    fn env_ok(v: &'static str) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |_| Ok(v.to_string())
+    }
+
+    fn env_missing() -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |_| Err(std::env::VarError::NotPresent)
+    }
+
     #[test]
     fn roundtrip_save_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -272,9 +378,36 @@ mod tests {
             llm: Some(group("https://a.x/v1", "sk-1", "m1", "openai")),
             fast_llm: Some(group("https://b.x/v1", "sk-2", "m2", "anthropic")),
             system_prompt: None,
+            max_tokens: Some(200_000),
         };
         save_settings_at(&path, &s).unwrap();
         assert_eq!(load_settings_at(&path), s);
+    }
+
+    #[tokio::test]
+    async fn async_roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = EnvSettings {
+            llm: Some(group("https://a.x/v1", "sk-1", "m1", "openai")),
+            fast_llm: None,
+            system_prompt: None,
+            max_tokens: None,
+        };
+        save_settings_at(&path, &s).unwrap();
+        assert_eq!(load_settings_at_async(&path).await, s);
+    }
+
+    #[tokio::test]
+    async fn async_missing_and_corrupt_files_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_settings_at_async(&dir.path().join("nope.json")).await,
+            EnvSettings::default()
+        );
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(load_settings_at_async(&path).await, EnvSettings::default());
     }
 
     #[test]
@@ -300,6 +433,7 @@ mod tests {
             llm: Some(group("https://a.x/v1", "sk-secret-key-1234", "m1", "")),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
         let v = settings_to_masked_json(&s).to_string();
         assert!(!v.contains("sk-secret-key-1234"), "raw key leaked: {v}");
@@ -334,6 +468,7 @@ mod tests {
             llm: Some(group("https://a.x/v1", "sk-1", "m1", "anthropic")),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
         let p = effective_provider(&s).unwrap();
         assert_eq!(p.base_url, "https://a.x/v1");
@@ -348,13 +483,15 @@ mod tests {
             llm: Some(group("https://old.x", "sk-stored", "old-model", "")),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
         let incoming = EnvSettings {
             llm: Some(group("https://new.x", "", "new-model", "")),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
-        let merged = merge_put(&current, incoming).unwrap();
+        let merged = merge_put(&current, incoming, false).unwrap();
         let g = merged.llm.unwrap();
         assert_eq!(g.base_url, "https://new.x");
         assert_eq!(g.model, "new-model");
@@ -370,8 +507,9 @@ mod tests {
             llm: Some(group("https://new.x", "", "m", "")),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
-        let err = merge_put(&EnvSettings::default(), incoming).unwrap_err();
+        let err = merge_put(&EnvSettings::default(), incoming, false).unwrap_err();
         assert!(err.contains("apiKey is required"), "{err}");
     }
 
@@ -381,8 +519,9 @@ mod tests {
             llm: Some(group("https://old.x", "sk", "m", "")),
             fast_llm: Some(group("https://f.x", "sk", "m", "")),
             system_prompt: None,
+            max_tokens: None,
         };
-        let merged = merge_put(&current, EnvSettings::default()).unwrap();
+        let merged = merge_put(&current, EnvSettings::default(), false).unwrap();
         assert!(merged.llm.is_none() && merged.fast_llm.is_none());
     }
 
@@ -394,8 +533,9 @@ mod tests {
             llm: None,
             fast_llm: Some(group("notaurl", "sk", "m", "")),
             system_prompt: None,
+            max_tokens: None,
         };
-        let err = merge_put(&current, incoming).unwrap_err();
+        let err = merge_put(&current, incoming, false).unwrap_err();
         assert!(err.starts_with("fastLlm:"), "{err}");
     }
 
@@ -415,7 +555,7 @@ mod tests {
             system_prompt: Some("  You are a pirate.  ".into()),
             ..EnvSettings::default()
         };
-        let merged = merge_put(&EnvSettings::default(), incoming).unwrap();
+        let merged = merge_put(&EnvSettings::default(), incoming, false).unwrap();
         assert_eq!(merged.system_prompt.as_deref(), Some("You are a pirate."));
     }
 
@@ -432,6 +572,7 @@ mod tests {
                 system_prompt: Some("   ".into()),
                 ..EnvSettings::default()
             },
+            false,
         )
         .unwrap();
         assert!(merged.system_prompt.is_none());
@@ -442,6 +583,7 @@ mod tests {
                 system_prompt: None,
                 ..EnvSettings::default()
             },
+            false,
         )
         .unwrap();
         assert_eq!(merged.system_prompt.as_deref(), Some("stored"));
@@ -455,6 +597,7 @@ mod tests {
                 system_prompt: Some("x".repeat(MAX_CUSTOM_PROMPT_BYTES + 1)),
                 ..EnvSettings::default()
             },
+            false,
         )
         .unwrap_err();
         assert!(err.starts_with("systemPrompt:"), "{err}");
@@ -472,5 +615,83 @@ mod tests {
         // absent -> empty string (not null) so the frontend stays simple
         let empty = settings_to_masked_json(&EnvSettings::default()).to_string();
         assert!(empty.contains("\"systemPrompt\":\"\""), "{empty}");
+    }
+
+    #[test]
+    fn max_tokens_round_trips_and_masks() {
+        // Some(n) serializes as a number, None as null — both survive a
+        // save/load cycle and the masked view exposes them verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = EnvSettings {
+            max_tokens: Some(200_000),
+            ..EnvSettings::default()
+        };
+        save_settings_at(&path, &s).unwrap();
+        assert_eq!(load_settings_at(&path), s);
+        assert_eq!(settings_to_masked_json(&s)["maxTokens"], 200_000);
+        assert_eq!(
+            settings_to_masked_json(&EnvSettings::default())["maxTokens"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn merge_max_tokens_overrides_clears_and_keeps() {
+        let current = EnvSettings {
+            max_tokens: Some(200_000),
+            ..EnvSettings::default()
+        };
+        // absent key keeps the stored value (an older client's PUT must
+        // not silently wipe the user's window)
+        let merged = merge_put(&current, EnvSettings::default(), false).unwrap();
+        assert_eq!(merged.max_tokens, Some(200_000));
+        // present number overrides
+        let merged = merge_put(
+            &current,
+            EnvSettings {
+                max_tokens: Some(64_000),
+                ..EnvSettings::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(merged.max_tokens, Some(64_000));
+        // explicit null clears: the env window applies again
+        let merged = merge_put(&current, EnvSettings::default(), true).unwrap();
+        assert_eq!(merged.max_tokens, None);
+    }
+
+    #[test]
+    fn merge_max_tokens_validates_bounds() {
+        let incoming = |n: u64| EnvSettings {
+            max_tokens: Some(n),
+            ..EnvSettings::default()
+        };
+        for bad in [0u64, 1023, 2_000_001] {
+            let err = merge_put(&EnvSettings::default(), incoming(bad), true).unwrap_err();
+            assert!(err.starts_with("maxTokens:"), "n={bad}: {err}");
+        }
+        for good in [1024u64, 128_000, 2_000_000] {
+            assert!(
+                merge_put(&EnvSettings::default(), incoming(good), true).is_ok(),
+                "n={good} must be accepted"
+            );
+        }
+        // the save path validates too (a hand-edited file must not persist)
+        let err =
+            save_settings_at(Path::new("/nonexistent/settings.json"), &incoming(0)).unwrap_err();
+        assert!(err.starts_with("maxTokens:"), "{err}");
+    }
+
+    #[test]
+    fn effective_max_tokens_precedence() {
+        // settings.json value > CONGA_CONTEXT_WINDOW > 128k default.
+        // Injectable lookup: no process-env mutation, safe under parallel
+        // tests.
+        assert_eq!(resolve_max_tokens(Some(200_000), &env_missing()), 200_000);
+        assert_eq!(resolve_max_tokens(None, &env_ok("50000")), 50_000);
+        assert_eq!(resolve_max_tokens(None, &env_missing()), 128_000);
+        assert_eq!(resolve_max_tokens(None, &env_ok("not-a-number")), 128_000);
     }
 }

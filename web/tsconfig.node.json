@@ -17,7 +17,10 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    // Never emit vite.config.js/.d.ts next to the source — the stray .js
+    // shadowed vite.config.ts (Vite resolves .js before .ts) after builds.
+    "noEmit": true
   },
   "include": ["vite.config.ts"]
 }

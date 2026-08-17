@@ -9,7 +9,6 @@
 //!   CONGA_LLM_MODEL    - model id
 //!   CONGA_LLM_API      - "openai" (default) or "anthropic"
 //!   CONGA_MAX_TURNS / CONGA_MAX_TOOL_CALLS / CONGA_MAX_TOKENS - loop knobs
-//!   CONGA_THINKING     - off|low|medium|high
 //!   CONGA_RETRY_*      - retry policy (max / initial_ms / max_ms)
 //!
 //! Without CONGA_LLM_KEY this prints a canned reply (smoke test of plumbing).
@@ -18,7 +17,7 @@ use std::sync::Arc;
 
 use conga::{
     agent_loop, AgentContext, AgentMessage, AgentTunables, AnthropicProvider, ContentBlock,
-    ModelSpec, OpenAiCompat, ProviderApi, StreamChunk, StreamFn, ThinkingLevel, UserMessage,
+    ModelSpec, OpenAiCompat, ProviderApi, StreamChunk, StreamFn, UserMessage,
 };
 use futures_util::Stream;
 
@@ -62,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: cfg.model.clone(),
                 api: cfg.api,
                 max_tokens: tunables.max_tokens,
-                supports_thinking: tunables.thinking_level != ThinkingLevel::Off,
             };
             (model, stream)
         }
@@ -73,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     id: "mock".into(),
                     api: ProviderApi::OpenAiCompat,
                     max_tokens: tunables.max_tokens,
-                    supports_thinking: false,
                 },
                 Arc::new(MockStream),
             )
@@ -88,9 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persist_sid = session_id.clone();
     let config = conga::AgentLoopConfig {
         model,
-        thinking_level: tunables.thinking_level,
         max_turns: tunables.max_turns,
         max_tool_calls_per_turn: tunables.max_tool_calls_per_turn,
+        tool_timeout: tunables
+            .tool_timeout_secs
+            .map(std::time::Duration::from_secs),
         signal: Some(conga::CancelSignal::new()),
         stream_fn,
         hooks: None,

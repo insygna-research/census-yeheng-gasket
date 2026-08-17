@@ -54,6 +54,10 @@ const statusText = computed(() => {
   return 'Online';
 });
 
+/** Compact token count: 950 → "950", 4500 → "4.5k", 128000 → "128k". */
+const formatTokens = (n: number): string =>
+  n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+
 const menuContentClass =
   'z-30 w-44 rounded-lg bg-popover border border-border shadow-lg py-1 will-change-[transform,opacity] ' +
   'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95';
@@ -86,13 +90,35 @@ const showSettingsDialog = ref(false);
     </div>
 
     <div class="flex items-center gap-2">
-      <!-- Context stats inline -->
-      <div v-if="contextStats" class="hidden md:flex items-center gap-2 mr-1">
-        <div class="text-[11px] th-text-secondary font-medium whitespace-nowrap">
+      <!-- Context stats inline: occupancy bar + hover detail popover -->
+      <div v-if="contextStats" class="hidden md:flex items-center gap-2 mr-1 group relative">
+        <div class="text-[11px] th-text-secondary font-medium whitespace-nowrap cursor-default">
           Context: {{ contextStats.usage_percent.toFixed(1) }}%
+          <span v-if="contextStats.max_tokens != null" class="th-text-dim">
+            · {{ formatTokens(contextStats.current_tokens) }} / {{ formatTokens(contextStats.max_tokens) }}
+          </span>
         </div>
         <div class="w-20 lg:w-28 h-1.5 bg-muted rounded-full overflow-hidden">
           <div class="h-full rounded-full transition-all duration-500" :class="usageColor" :style="{ width: Math.min(contextStats.usage_percent, 100) + '%' }" />
+        </div>
+
+        <!-- Cumulative session usage (hover) -->
+        <div
+          class="opacity-0 group-hover:opacity-100 transition-opacity absolute top-full right-0 mt-1.5 z-30 w-40 rounded-lg bg-popover border border-border shadow-lg py-1.5 px-3 text-[11px] space-y-1 whitespace-nowrap pointer-events-none"
+        >
+          <div class="font-semibold th-text-muted uppercase tracking-wider">Session tokens</div>
+          <div class="flex justify-between gap-3 th-text-secondary">
+            <span>In</span><span>{{ contextStats.cumulative_in.toLocaleString() }}</span>
+          </div>
+          <div class="flex justify-between gap-3 th-text-secondary">
+            <span>Out</span><span>{{ contextStats.cumulative_out.toLocaleString() }}</span>
+          </div>
+          <div v-if="contextStats.cache_read_tokens != null" class="flex justify-between gap-3 th-text-secondary">
+            <span>Cache read</span><span>{{ contextStats.cache_read_tokens.toLocaleString() }}</span>
+          </div>
+          <div v-if="contextStats.cache_write_tokens != null" class="flex justify-between gap-3 th-text-secondary">
+            <span>Cache write</span><span>{{ contextStats.cache_write_tokens.toLocaleString() }}</span>
+          </div>
         </div>
       </div>
 

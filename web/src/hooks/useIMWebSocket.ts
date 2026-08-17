@@ -1,9 +1,10 @@
+import { readString, storageKeys } from '@/lib/storage';
 import { onUnmounted, ref, watch, type Ref } from 'vue';
 
 
 export function useIMWebSocket(
   chatId: Ref<string>,
-  onMessage: (data: string) => void
+  onMessage: (data: string, sessionId: string) => void
 ) {
   const ws = ref<WebSocket | null>(null);
   const isConnected = ref(false);
@@ -34,7 +35,8 @@ export function useIMWebSocket(
     }
     isConnected.value = false;
 
-    const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:3000'}/ws?user_id=${encodeURIComponent(chatId.value)}`;
+    const token = readString(storageKeys.gatewayToken, '');
+    const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:3000'}/ws?user_id=${encodeURIComponent(chatId.value)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
     ws.value = new WebSocket(wsUrl);
 
     ws.value.onopen = () => {
@@ -45,7 +47,9 @@ export function useIMWebSocket(
     };
 
     ws.value.onmessage = (event) => {
-      onMessage(event.data);
+      // The socket is bound to the session it connected with (user_id
+      // query param), so every frame on it belongs to chatId.value.
+      onMessage(event.data, chatId.value);
     };
 
     ws.value.onclose = () => {
@@ -81,7 +85,12 @@ export function useIMWebSocket(
     connect();
   };
 
-  const send = (data: string): boolean => {
+  // `targetSessionId` is accepted for interface parity with useTauriChat but
+  // cannot be honored here: the socket is bound to the session it connected
+  // with, so a cross-session cancel cannot ride it. (In browser mode
+  // switching chats closes the old socket and the gateway cancels that
+  // turn server-side, so no background turn ever needs targeting.)
+  const send = (data: string, _targetSessionId?: string): boolean => {
     if (ws.value?.readyState === WebSocket.OPEN) {
       ws.value.send(data);
       return true;

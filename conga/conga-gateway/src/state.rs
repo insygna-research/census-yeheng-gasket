@@ -18,6 +18,8 @@ pub(crate) struct AppState {
     /// a tempdir path). Reindex is an incremental high-water check run per
     /// search request (see `conga_host::session_api::search_sessions`).
     pub(crate) index_db: PathBuf,
+    /// Gateway auth token (see `auth.rs`). Required for `/ws` and `/api/*`.
+    pub(crate) auth_token: Arc<String>,
 }
 
 /// Per-connection state. The transcript itself is NOT kept here - the
@@ -31,6 +33,10 @@ pub(crate) struct WsSession {
     /// `AfterProviderResponse` events in the forwarder).
     pub(crate) usage_in: u64,
     pub(crate) usage_out: u64,
+    /// Cumulative prompt-cache tokens (read/write) across turns; 0 while
+    /// the provider reports no cache breakdown.
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
     /// Most recent provider-reported input-token count for this turn (current
     /// window occupancy). Distinct from `usage_in/out` which accumulate cost.
     pub(crate) last_input_tokens: u64,

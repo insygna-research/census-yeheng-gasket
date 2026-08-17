@@ -463,6 +463,8 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 `ContextBudget::compact` 在超阈值时,按 `target = messages.len() * target_pct / 100` 算出保留消息数,复用 `compact_by_count`(贪心保留最新整组 + 前置提示)。**一套算法,两个触发器**:token 感知(主)和条数兜底。无 tokenizer,不假装建模 per-message token 成本。
 
+窗口取值优先级:**settings.json 的 `maxTokens` > `CONGA_CONTEXT_WINDOW` > 默认 128000**(`run_turn` 每轮重读设置并 `set_window`,保存即下一轮生效,无需重启)。
+
 ### 9.3 数据来源:从日志恢复预算
 
 `usage.input_tokens` 随 `SessionEvent::Assistant { usage }` **持久化进事件日志**。`run_turn` 每轮从日志尾部恢复预算(最后一条 `Assistant` 事件的 `usage.input_tokens`,经 `ContextBudget::record_input_tokens` 喂入),再对 `derive_messages` 出的 `history` 跑 `compact`。因此 token 感知压缩**跨重启存活**——重启不再丢失 usage、退化成条数兜底。预算计数本身不留在 `Host`(见 §6.1)。这正是 commit `0ba96fc` 计划文档 "context-compaction" 的延伸:用 provider 真实 usage 替代估算,且让该 usage 持久化。

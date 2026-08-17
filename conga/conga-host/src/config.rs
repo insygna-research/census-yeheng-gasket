@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use conga::{
     AgentContext, AgentError, AgentLoopConfig, AgentMessage, AgentTunables, CancelSignal,
@@ -66,11 +67,10 @@ impl HostConfig {
                 id: self.provider.model.clone(),
                 api: self.provider.api,
                 max_tokens: self.tunables.max_tokens,
-                supports_thinking: self.tunables.thinking_level != conga::ThinkingLevel::Off,
             },
-            thinking_level: self.tunables.thinking_level,
             max_turns,
             max_tool_calls_per_turn: self.tunables.max_tool_calls_per_turn,
+            tool_timeout: self.tunables.tool_timeout_secs.map(Duration::from_secs),
             signal,
             stream_fn,
             hooks,

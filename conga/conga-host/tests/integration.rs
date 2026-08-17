@@ -236,6 +236,8 @@ async fn success_path_log_equals_legacy_messages() {
             StreamChunk::Usage {
                 input: 10,
                 output: 2,
+                cache_read: 0,
+                cache_write: 0,
             },
             StreamChunk::Done,
         ],

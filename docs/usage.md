@@ -71,7 +71,8 @@ ChatHeader 的齿轮按钮(**Model Settings**)可以不碰 `.env` 直接配置 L
 - **安全**:API key 从不回传——GET 只返回 `apiKeySet`/`apiKeyHint`(`sk-…ab12` 掩码);PUT 留空 key 表示"保留已存的"。
 - **组语义**:取消勾选 Main/Fast = 清除该组(env 配置重新生效);Fast 组控制子代理模型,同样优先于 `CONGA_FAST_LLM_*`。
 - **System prompt**:同一对话框下方的 **System prompt** 编辑器(markdown)替换内置基础指令(`CODING_AGENT_PROMPT`);AGENTS.md/CLAUDE.md 项目文档、技能目录、`<environment>` 快照仍然自动附加。Preview 按钮实时预览 markdown 渲染,Reset 清空回到内置。留空 = 内置;上限 64 KB。子代理不受影响(保持内置纪律 prompt)。
-- 手动编辑文件也可,格式:`{"llm":{"baseUrl":...,"apiKey":...,"model":...,"api":"openai"},"fastLlm":{...},"systemPrompt":"# 自定义指令\n..."}`;损坏文件会被忽略并回退 env(告警在日志)。
+- **Max tokens**:同一对话框可设上下文窗口 `maxTokens`(整数 1024–2000000;`null`/留空 = 跟随 `CONGA_CONTEXT_WINDOW`)。优先级 `maxTokens` > `CONGA_CONTEXT_WINDOW` > 128000,保存后下一轮压缩与统计即用新窗口。
+- 手动编辑文件也可,格式:`{"llm":{"baseUrl":...,"apiKey":...,"model":...,"api":"openai"},"fastLlm":{...},"systemPrompt":"# 自定义指令\n...","maxTokens":200000}`;损坏文件会被忽略并回退 env(告警在日志)。
 
 ### 3.2 Provider 选择
 
@@ -118,6 +119,14 @@ cargo run --release --bin conga-gateway
 ```
 
 - 默认监听 `0.0.0.0:3000`(`CONGA_GATEWAY_PORT` 可改)。
+
+**鉴权(必读)**:网关驱动的是一个带 `bash` 工具的完整 agent,任何能连上端口的人都能以你的身份执行代码。因此 `/ws` 与全部 `/api/*` 都要求携带网关 token(`Authorization: Bearer <token>` 或 `?token=<token>`,浏览器 WebSocket 无法带 header 故两者皆可);静态资源(SP 页面本身)豁免。token 解析顺序:
+
+1. `CONGA_GATEWAY_TOKEN` 环境变量(设置即用,不落盘);
+2. `~/.conga/gateway_token`——首次启动自动生成(64 位十六进制,`0600` 权限),稳定复用。
+
+浏览器前端在 **Settings → Connection** 粘贴 token(保存在本机,桌面端走 IPC 不需要)。
+
 - 自动托管 `web/dist` 静态资源(`CONGA_GATEWAY_STATIC_DIR` 可改,默认 `../web/dist`)——**先 `pnpm build` 出 dist,网关就能直接serve 整个 Web 应用**(无需单独跑前端服务器)。
 - 暴露:WebSocket `/ws`、REST `/api/commands`、`/api/sessions`、`GET /api/sessions/search?q=…`(FTS5 跨会话全文检索;每进程首个请求先增量重建 `~/.conga/index.db` 索引)、`/api/sessions/{key}/context`、`/api/sessions/{key}/context/compact`、`/api/sessions/{key}/messages`(后端真相端点:对磁盘 `events.jsonl` 跑 `derive_messages`,未知 key→404、损坏日志→500)。
 - **会话存储**:每个会话是 `~/.conga/sessions/<id>/events.jsonl` 的一份**崩溃安全事件日志**——一轮里每个已发生的事实(助手消息、工具结果)在它发生时就落盘,而非等到整轮成功才追加;崩溃 / 失败 / 中断的轮次仍保有其已经发生的全部副作用。旧 `messages.jsonl` 会话首次打开时自动迁移并删除旧文件(不可逆)。详见 [架构 §5.5](./architecture.md) 与 [ADR 0001](./adr/0001-event-sourced-session-log.md)。
@@ -250,7 +259,7 @@ docker run -d -p 3000:3000 \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CONGA_CONTEXT_WINDOW` | `128000` | 模型上下文窗口(token) |
+| `CONGA_CONTEXT_WINDOW` | `128000` | 模型上下文窗口(token);设置对话框的 **Max tokens**(settings.json `maxTokens`)优先于它 |
 | `CONGA_COMPACT_THRESHOLD_PCT` | `80` | 占用超过窗口的该百分比时触发压缩 |
 | `CONGA_COMPACT_TARGET_PCT` | `50` | 压缩后目标占窗口的百分比(带滞后,防抖) |
 | `CONGA_COMPACT_MAX_MESSAGES` | `80` | 无 provider usage 数据时,按消息条数兜底的阈值;`0` 表示不压缩 |
@@ -398,17 +407,16 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 | `CONGA_MAX_TURNS` | `50` | 外层循环最大轮数 |
 | `CONGA_MAX_TOOL_CALLS` | `20` | 单轮内工具调用上限 |
 | `CONGA_MAX_TOKENS` | `4096` | 模型输出 token 上限 |
-| `CONGA_THINKING` | `off` | `off`/`low`/`medium`/`high`(模型不支持时无效) |
+| `CONGA_THINKING` | — | 已移除:该变量从未生效(没有任何 provider 读取),设置它不会有任何效果,可安全删除。 |
 | `CONGA_RETRY_MAX` | `2` | LLM 调用最大重试次数(仅流前失败) |
 | `CONGA_RETRY_MAX_MS` | `8000` | 退避上限(ms) |
 
 ### 网关服务器
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
 | `CONGA_GATEWAY_PORT` | `3000` | 监听端口 |
 | `CONGA_GATEWAY_STATIC_DIR` | `../web/dist` | 前端静态资源目录 |
 | `CONGA_GATEWAY_MODE` | `auto-edit` | 审批模式 `suggest`/`auto-edit`/`full-auto` |
+| `CONGA_GATEWAY_TOKEN` | 自动生成 | 网关鉴权 token;未设置时首次启动生成 `~/.conga/gateway_token`(0600)。`/ws` 与 `/api/*` 必须携带(Bearer header 或 `?token=`) |
 | `CONGA_APPROVAL_TIMEOUT_S` | `300` | 审批等待超时(秒) |
 | `CONGA_PROJECT_DIR` | 进程 cwd | 项目根:工具沙箱边界与 `<dir>/.conga/skills` 项目技能扫描根(服务器宿主用,见 §9.7) |
 
@@ -416,7 +424,7 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CONGA_CONTEXT_WINDOW` | `128000` | 模型上下文窗口 |
+| `CONGA_CONTEXT_WINDOW` | `128000` | 模型上下文窗口;settings.json `maxTokens` 优先于它 |
 | `CONGA_COMPACT_THRESHOLD_PCT` | `80` | 触发压缩阈值(%) |
 | `CONGA_COMPACT_TARGET_PCT` | `50` | 压缩后目标(%) |
 | `CONGA_COMPACT_MAX_MESSAGES` | `80` | 条数兜底(`0`=不压缩) |
@@ -449,7 +457,7 @@ Write commit titles as `type(scope): summary`, lowercase, imperative mood...
 | Web/桌面端用不了项目技能 | 服务器宿主的项目根由 `CONGA_PROJECT_DIR` 决定(不设 = 进程 cwd,通常不是你的项目)。在 gateway/桌面端的 `.env` 设 `CONGA_PROJECT_DIR=<项目根>`,并确认 `<项目根>/.conga/skills/*.md` 的 frontmatter 有 `name` 和 `description`。 |
 | 端口 3000 被占用 | 用 `CONGA_GATEWAY_PORT=<其它端口>` 改网关端口,并把前端 `VITE_WS_URL`/`VITE_API_URL` 同步改掉。 |
 | 报 `orphan tool_call` / 工具结果错乱 | 通常与压缩有关;确认没有手动设异常小的 `CONGA_COMPACT_MAX_MESSAGES`。正常情况下原子组会保护 tool_call↔result。 |
-| 模型不支持 thinking | `CONGA_THINKING` 设了 `low/medium/high` 但模型不支持时自动无效化;`ModelSpec.supports_thinking` 控制是否发送 thinking 参数。 |
+| 设了 `CONGA_THINKING` 没效果 | 正常:该变量已移除,从未有 provider 读取它(extended thinking 相关链路已整体删除)。从 `.env` 里删掉即可。 |
 | 桌面端打不开/不响应 | 确认 LLM API key 已配置(环境变量或 `conga/.env`);桌面端通过进程内 Host 做 IPC 推理,不需要独立 gateway。 |
 | 想用 Claude(Anthropic) | `CONGA_LLM_API=anthropic`,`CONGA_LLM_BASE_URL=https://api.anthropic.com/v1`,`CONGA_LLM_MODEL=claude-...`。 |
 | 想接本地 Ollama/vLLM | `CONGA_LLM_API=openai`(默认),`CONGA_LLM_BASE_URL=http://localhost:11434/v1`(Ollama 示例),key 随意填。 |

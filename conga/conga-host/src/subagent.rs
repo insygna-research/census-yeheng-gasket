@@ -110,16 +110,12 @@ impl SubagentSpawner for HostSubagentSpawner {
         Box::pin(async move {
             emit(SubagentEvent::AllStarted { count });
 
-            // Sub-agent tasks live behind a drop guard: if this future is
-            // dropped mid-flight (turn cancelled, connection closed), every
-            // still-running task is aborted instead of executing tools and
-            // emitting events into a dead session. abort() on a completed
-            // task is a no-op, so the guard is harmless on the happy path.
-            // AbortHandles stay tracked for the WHOLE function (including
-            // the collection loop below), so a drop at any await point stops
-            // everything — including the handle currently being awaited.
-            let mut guard = AbortOnDrop::default();
-            let mut pending: Vec<SubagentTask> = Vec::with_capacity(count);
+            // Sub-agent tasks live in a JoinSet: dropping this future
+            // mid-flight (turn cancelled, connection closed) drops the set
+            // with it, aborting every still-running task at whatever await
+            // point it sits — including the one being collected below. No
+            // hand-rolled AbortHandle tracking to get right.
+            let mut set: tokio::task::JoinSet<SubagentResult> = tokio::task::JoinSet::new();
 
             for (i, task) in tasks.into_iter().enumerate() {
                 let id = uuid::Uuid::new_v4().to_string();
@@ -198,38 +194,83 @@ impl SubagentSpawner for HostSubagentSpawner {
                 let run_task = task_clone.clone();
                 let run_index = index;
                 let emit = Arc::clone(&emit);
+                // Panic reporting happens inside the task (catch_unwind
+                // below), so the metadata needed to report it is cloned
+                // up front.
+                let panic_emit = Arc::clone(&emit);
+                let panic_id = run_id.clone();
+                let panic_task = run_task.clone();
+                let panic_log = log_path.clone().map(|p| p.display().to_string());
+                set.spawn(async move {
+                    let run = async move {
+                        let result =
+                            run_agent_loop(vec![user_msg], sub_context, sub_config, move |ev| {
+                                let _ = event_tx.send(ev);
+                            })
+                            .await;
 
-                let handle = tokio::spawn(async move {
-                    let result =
-                        run_agent_loop(vec![user_msg], sub_context, sub_config, move |ev| {
-                            let _ = event_tx.send(ev);
-                        })
-                        .await;
+                        // Wait for forwarder to drain.
+                        let _ = fwd_handle.await;
 
-                    // Wait for forwarder to drain.
-                    let _ = fwd_handle.await;
-
-                    match result {
-                        Ok(msgs) => {
-                            // A run can end "successfully" with a failed
-                            // stream: provider error mid-response, or abort via
-                            // cancel. StopReason::Error/Aborted is surfaced as
-                            // a sub-agent error, not a completion — otherwise
-                            // the main agent and the frontend see a green
-                            // checkmark on work that never finished.
-                            let failed = msgs.iter().rev().find_map(|m| match m {
-                                AgentMessage::Assistant(a) => match &a.stop_reason {
-                                    conga::StopReason::Error(e) => {
-                                        Some(format!("sub-agent stream failed: {e}"))
-                                    }
-                                    conga::StopReason::Aborted => {
-                                        Some("sub-agent cancelled".into())
-                                    }
+                        match result {
+                            Ok(msgs) => {
+                                // A run can end "successfully" with a failed
+                                // stream: provider error mid-response, or abort via
+                                // cancel. StopReason::Error/Aborted is surfaced as
+                                // a sub-agent error, not a completion — otherwise
+                                // the main agent and the frontend see a green
+                                // checkmark on work that never finished.
+                                let failed = msgs.iter().rev().find_map(|m| match m {
+                                    AgentMessage::Assistant(a) => match &a.stop_reason {
+                                        conga::StopReason::Error(e) => {
+                                            Some(format!("sub-agent stream failed: {e}"))
+                                        }
+                                        conga::StopReason::Aborted => {
+                                            Some("sub-agent cancelled".into())
+                                        }
+                                        _ => None,
+                                    },
                                     _ => None,
-                                },
-                                _ => None,
-                            });
-                            if let Some(err_msg) = failed {
+                                });
+                                if let Some(err_msg) = failed {
+                                    emit(SubagentEvent::Error {
+                                        id: run_id.clone(),
+                                        index: run_index,
+                                        error: err_msg.clone(),
+                                    });
+                                    SubagentResult {
+                                        id: run_id,
+                                        task: run_task,
+                                        index: run_index,
+                                        summary: String::new(),
+                                        output: String::new(),
+                                        tool_count: 0,
+                                        error: Some(err_msg),
+                                        log_path: log_path.clone().map(|p| p.display().to_string()),
+                                    }
+                                } else {
+                                    let (summary, tool_count, output) =
+                                        extract_summary_tools_output(&msgs);
+                                    emit(SubagentEvent::Completed {
+                                        id: run_id.clone(),
+                                        index: run_index,
+                                        summary: summary.clone(),
+                                        tool_count,
+                                    });
+                                    SubagentResult {
+                                        id: run_id,
+                                        task: run_task,
+                                        index: run_index,
+                                        summary,
+                                        output,
+                                        tool_count,
+                                        error: None,
+                                        log_path: log_path.clone().map(|p| p.display().to_string()),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
                                 emit(SubagentEvent::Error {
                                     id: run_id.clone(),
                                     index: run_index,
@@ -245,83 +286,68 @@ impl SubagentSpawner for HostSubagentSpawner {
                                     error: Some(err_msg),
                                     log_path: log_path.clone().map(|p| p.display().to_string()),
                                 }
-                            } else {
-                                let (summary, tool_count, output) =
-                                    extract_summary_tools_output(&msgs);
-                                emit(SubagentEvent::Completed {
-                                    id: run_id.clone(),
-                                    index: run_index,
-                                    summary: summary.clone(),
-                                    tool_count,
-                                });
-                                SubagentResult {
-                                    id: run_id,
-                                    task: run_task,
-                                    index: run_index,
-                                    summary,
-                                    output,
-                                    tool_count,
-                                    error: None,
-                                    log_path: log_path.clone().map(|p| p.display().to_string()),
-                                }
                             }
                         }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            emit(SubagentEvent::Error {
-                                id: run_id.clone(),
+                    };
+                    // A panicking sub-agent still yields one result per spawn
+                    // (frontend completion counts stay consistent); caught
+                    // here so id/index/task are still in scope.
+                    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(panic) => {
+                            let err_msg = format!(
+                                "subagent task panicked: {}",
+                                panic_message(panic.as_ref())
+                            );
+                            panic_emit(SubagentEvent::Error {
+                                id: panic_id.clone(),
                                 index: run_index,
                                 error: err_msg.clone(),
                             });
                             SubagentResult {
-                                id: run_id,
-                                task: run_task,
+                                id: panic_id,
+                                task: panic_task,
                                 index: run_index,
                                 summary: String::new(),
                                 output: String::new(),
                                 tool_count: 0,
                                 error: Some(err_msg),
-                                log_path: log_path.clone().map(|p| p.display().to_string()),
+                                log_path: panic_log,
                             }
                         }
                     }
                 });
-                guard.push(&handle);
-                pending.push(SubagentTask {
-                    handle,
-                    id,
-                    index,
-                    task: task_clone,
-                });
             }
 
-            let mut results = Vec::with_capacity(pending.len());
-            for st in pending {
-                match st.handle.await {
+            // join_next() yields in completion order; restore declaration
+            // order so the parent (and the frontend) read results as spawned.
+            let mut results = Vec::with_capacity(set.len());
+            while let Some(joined) = set.join_next().await {
+                match joined {
                     Ok(r) => results.push(r),
+                    // Unreachable in practice: panics were converted to
+                    // error results inside the task, and nothing aborts
+                    // individual tasks. Kept as a safety net so a lost
+                    // task still yields one result slot instead of a
+                    // silent gap.
                     Err(e) => {
-                        // Panicked sub-agent task: surface it exactly like a
-                        // run error (event + result) so the frontend's
-                        // completion count stays consistent.
-                        let err_msg = format!("subagent task panicked: {e}");
-                        emit(SubagentEvent::Error {
-                            id: st.id.clone(),
-                            index: st.index,
-                            error: err_msg.clone(),
-                        });
+                        tracing::error!(error = %e, "subagent join failed");
                         results.push(SubagentResult {
-                            id: st.id,
-                            task: st.task,
-                            index: st.index,
+                            id: String::new(),
+                            task: String::new(),
+                            index: usize::MAX,
                             summary: String::new(),
                             output: String::new(),
                             tool_count: 0,
-                            error: Some(err_msg),
+                            error: Some(format!("subagent task lost: {e}")),
                             log_path: None,
                         });
                     }
                 }
             }
+            results.sort_by_key(|r| r.index);
 
             // All sub-agents finished: signal the main agent is synthesizing
             // their results. Must come AFTER all handles complete, not before.
@@ -331,36 +357,16 @@ impl SubagentSpawner for HostSubagentSpawner {
     }
 }
 
-/// Owns sub-agent abort handles; aborts every still-running task on drop.
-/// The spawn future holds one of these, so dropping the future mid-flight
-/// (turn cancelled, connection closed) stops sub-agents instead of leaving
-/// them detached. Handles are never removed — a drop at ANY await point
-/// (including the collection loop) aborts everything, even the task
-/// currently being awaited. abort() on a completed task is a no-op.
-#[derive(Default)]
-struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
-
-impl AbortOnDrop {
-    fn push(&mut self, handle: &tokio::task::JoinHandle<SubagentResult>) {
-        self.0.push(handle.abort_handle());
+/// Best-effort panic payload text (`panic!("...")` payloads are `&str` or
+/// `String`; anything else degrades to a placeholder).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".into()
     }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        for abort in &self.0 {
-            abort.abort();
-        }
-    }
-}
-
-/// A spawned sub-agent task awaiting collection: its JoinHandle plus the
-/// metadata needed to report a panic (id / index / task description).
-struct SubagentTask {
-    handle: tokio::task::JoinHandle<SubagentResult>,
-    id: String,
-    index: usize,
-    task: String,
 }
 
 /// Map a sub-agent's `AgentEvent` to a `SubagentEvent` tagged with `id`.
@@ -404,10 +410,13 @@ fn map_agent_event(id: &str, ev: &AgentEvent) -> Option<SubagentEvent> {
         }
         // Provider usage from a sub-agent's LLM calls: internal accounting
         // only — the gateway folds it into the session token counters.
+        // Unreported cache (`None`) maps to 0 = not reported.
         AgentEvent::AfterProviderResponse { response, .. } => {
             response.usage.as_ref().map(|u| SubagentEvent::Usage {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
+                cache_read: u.cache_read_tokens.unwrap_or(0),
+                cache_write: u.cache_write_tokens.unwrap_or(0),
             })
         }
         _ => None,
@@ -485,8 +494,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use conga::{
-        AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn, ThinkingLevel,
-        ToolDefinition,
+        AgentLoopConfig, ModelSpec, ProviderApi, RetryPolicy, StreamChunk, StreamFn, ToolDefinition,
     };
 
     use crate::hooks::HookStack;
@@ -532,11 +540,10 @@ mod tests {
                     id: "test".into(),
                     api: ProviderApi::OpenAiCompat,
                     max_tokens: 1024,
-                    supports_thinking: false,
                 },
-                thinking_level: ThinkingLevel::Off,
                 max_turns: 2,
                 max_tool_calls_per_turn: 20,
+                tool_timeout: None,
                 signal: None,
                 stream_fn: stream,
                 hooks: None,
@@ -666,6 +673,85 @@ mod tests {
         );
     }
 
+    /// A hook that blocks a tool by name must also gate SUB-AGENT calls:
+    /// hosts pass a composed stack (extra hooks first, policy last) into
+    /// the spawner, so an extra hook can never be bypassed by delegating
+    /// the call to a sub-agent. (Regression: the spawner used to receive
+    /// the policy alone.)
+    #[tokio::test]
+    async fn extra_hook_blocks_tool_inside_subagent_run() {
+        struct BlockBashByHook;
+        impl conga::HookChain for BlockBashByHook {
+            fn before_tool_call<'a>(
+                &'a self,
+                _: &'a str,
+                name: &'a str,
+                _: &'a serde_json::Value,
+                _: conga::RiskLevel,
+            ) -> Pin<Box<dyn Future<Output = conga::ToolCallVerdict> + Send + 'a>> {
+                Box::pin(async move {
+                    if name == "bash" {
+                        conga::ToolCallVerdict::Block("no bash by extra hook".into())
+                    } else {
+                        conga::ToolCallVerdict::Allow
+                    }
+                })
+            }
+            fn after_tool_call(
+                &self,
+                _: &str,
+                r: &conga::ToolResultMessage,
+            ) -> conga::ToolResultMessage {
+                r.clone()
+            }
+        }
+
+        // Same composition order as the main agent: extra hooks, then policy.
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto, // policy alone would ALLOW; only the hook blocks
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn conga::HookChain> =
+            Arc::new(HookStack::new(vec![Arc::new(BlockBashByHook), policy]));
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::ToolCallDelta {
+                    index: None,
+                    id: "t1".into(),
+                    name: Some("bash".into()),
+                    args_delta: "{\"command\":\"echo hi\"}".into(),
+                },
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            conga::CancelSignal::new(),
+        );
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "run a command".into(),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.is_none());
+
+        let mut tool_ends = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let SubagentEvent::ToolEnd { name, output, .. } = ev {
+                tool_ends.push((name, output.unwrap_or_default()));
+            }
+        }
+        assert!(
+            tool_ends
+                .iter()
+                .any(|(n, o)| n == "bash" && o.contains("no bash by extra hook")),
+            "the extra hook's block must surface inside the sub-agent: {tool_ends:?}"
+        );
+    }
+
     /// Protocol ordering: `Synthesizing` must arrive after every sub-agent
     /// terminal event; `AllStarted` leads; usage is forwarded internally.
     #[tokio::test]
@@ -683,6 +769,8 @@ mod tests {
                 StreamChunk::Usage {
                     input: 7,
                     output: 3,
+                    cache_read: 0,
+                    cache_write: 0,
                 },
                 StreamChunk::Done,
             ])),
@@ -718,7 +806,8 @@ mod tests {
                 e,
                 SubagentEvent::Usage {
                     input_tokens: 7,
-                    output_tokens: 3
+                    output_tokens: 3,
+                    ..
                 }
             )),
             "usage must be emitted: {events:?}"

@@ -50,23 +50,38 @@ fn atomic_groups(messages: &[AgentMessage]) -> Vec<(usize, usize)> {
     groups
 }
 
-/// If `messages.len() > max_messages`, keep the newest groups whose total
-/// message count fits in `max_messages - 1` (one slot reserved for the
-/// summary notice) and prepend one user notice naming how many were dropped.
-/// Groups are kept whole, so an `Assistant(tool_call)` is never separated from
-/// its trailing `ToolResult`s.
-///
-/// Harness invariants on top of the plain drop-oldest walk:
-/// - The FIRST group (the original task) is never dropped — an agent that
-///   forgets why it started is worse than an agent with a shorter window.
-/// - Before dropping anything, ToolResult text blocks OUTSIDE the newest
-///   groups are truncated to a head preview: old tool output is usually
-///   spent; the tail is what the model still reasons over.
-///
-/// Under budget (or `max_messages == 0`): clone unchanged.
-pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<AgentMessage> {
+/// Compaction result: the no-op path borrows the input instead of cloning
+/// the whole history on every LLM call.
+pub enum Compacted<'a> {
+    /// Under budget: the input itself is the view; nothing was cloned.
+    Borrowed(&'a [AgentMessage]),
+    /// Compacted: a shorter, owned history.
+    Owned(Vec<AgentMessage>),
+}
+
+impl<'a> Compacted<'a> {
+    pub fn as_slice(&self) -> &[AgentMessage] {
+        match self {
+            Compacted::Borrowed(s) => s,
+            Compacted::Owned(v) => v,
+        }
+    }
+
+    /// Flatten to an owned `Vec` (the loop's `transform_context` seam
+    /// returns a `Vec` by contract).
+    pub fn into_owned(self) -> Vec<AgentMessage> {
+        match self {
+            Compacted::Borrowed(s) => s.to_vec(),
+            Compacted::Owned(v) => v,
+        }
+    }
+}
+
+/// Core group-walking algorithm; `None` = nothing to drop (under budget,
+/// `max_messages == 0`, or the walk kept everything).
+fn compacted(messages: &[AgentMessage], max_messages: usize) -> Option<Vec<AgentMessage>> {
     if max_messages == 0 || messages.len() <= max_messages {
-        return messages.to_vec();
+        return None;
     }
 
     let groups = atomic_groups(messages);
@@ -99,7 +114,7 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
     let pinned_len = groups[0].1 - groups[0].0;
     let dropped = start.saturating_sub(pinned_len);
     if dropped == 0 {
-        return messages.to_vec();
+        return None;
     }
 
     let mut out: Vec<AgentMessage> = Vec::with_capacity(kept_msg_count + 1);
@@ -121,7 +136,33 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
             out.push(m.clone());
         }
     }
-    out
+    Some(out)
+}
+
+/// If `messages.len() > max_messages`, keep the newest groups whose total
+/// message count fits in `max_messages - 1` (one slot reserved for the
+/// summary notice) and prepend one user notice naming how many were dropped.
+/// Groups are kept whole, so an `Assistant(tool_call)` is never separated from
+/// its trailing `ToolResult`s.
+///
+/// Harness invariants on top of the plain drop-oldest walk:
+/// - The FIRST group (the original task) is never dropped — an agent that
+///   forgets why it started is worse than an agent with a shorter window.
+/// - Before dropping anything, ToolResult text blocks OUTSIDE the newest
+///   groups are truncated to a head preview: old tool output is usually
+///   spent; the tail is what the model still reasons over.
+///
+/// Under budget (or `max_messages == 0`): clone unchanged.
+pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<AgentMessage> {
+    compacted(messages, max_messages).unwrap_or_else(|| messages.to_vec())
+}
+
+/// Borrowed-when-unchanged twin of [`compact_by_count`].
+fn compact_by_count_view<'a>(messages: &'a [AgentMessage], max_messages: usize) -> Compacted<'a> {
+    match compacted(messages, max_messages) {
+        Some(v) => Compacted::Owned(v),
+        None => Compacted::Borrowed(messages),
+    }
 }
 
 /// Head-truncate a message's ToolResult text blocks. Other message kinds
@@ -209,6 +250,18 @@ impl ContextBudget {
         self.last_input_tokens = n;
     }
 
+    /// Override the context window (settings.json `maxTokens` beats the
+    /// env-derived value). `run_turn` re-reads the settings file every
+    /// turn and calls this, so a dialog save applies to the very next
+    /// turn without a restart.
+    pub fn set_window(&mut self, n: u64) {
+        self.window = n;
+    }
+
+    /// The configured context window (env/settings-resolved).
+    pub fn window(&self) -> u64 {
+        self.window
+    }
     /// Current input-token occupancy (most recent provider report).
     pub fn current_tokens(&self) -> u64 {
         self.last_input_tokens
@@ -218,27 +271,28 @@ impl ContextBudget {
     pub fn needs_compaction(&self) -> bool {
         self.last_input_tokens > self.window * self.threshold_pct as u64 / 100
     }
-
-    /// Compact `messages` according to the budget.
+    /// Compact `messages` according to the budget. The unchanged (no-op)
+    /// paths borrow the input — [`Compacted::Borrowed`] — instead of
+    /// cloning the whole history on every LLM call.
     ///
     /// - No usage recorded: fall back to [`compact_by_count`] with
     ///   `fallback_max_messages`.
-    /// - Under threshold: return unchanged.
+    /// - Under threshold: return unchanged (borrowed).
     /// - Over threshold: [`compact_by_count`] retaining `target_pct`% of the
     ///   current message count. One algorithm, two triggers.
-    pub fn compact(&self, messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    pub fn compact<'a>(&self, messages: &'a [AgentMessage]) -> Compacted<'a> {
         if self.last_input_tokens == 0 {
-            return compact_by_count(messages, self.fallback_max_messages);
+            return compact_by_count_view(messages, self.fallback_max_messages);
         }
         if !self.needs_compaction() {
-            return messages.to_vec();
+            return Compacted::Borrowed(messages);
         }
         // Token pressure triggered. Core has no tokenizer, so a proportional
         // message-count reduction is the honest target — it reuses the same
         // greedy group-walker as the count-based path instead of a second
         // compaction strategy that would pretend to know per-group token cost.
         let target = (messages.len() * self.target_pct as usize / 100).max(1);
-        compact_by_count(messages, target)
+        compact_by_count_view(messages, target)
     }
 }
 
@@ -454,7 +508,7 @@ mod tests {
             fallback_max_messages: 80,
             last_input_tokens: 100_000,
         };
-        let out = budget.compact(&msgs);
+        let out = budget.compact(&msgs).into_owned();
         // Token-triggered → retain target_pct% (50%) of 10 messages as the
         // count budget = 5; compact_by_count keeps 4 newest (m6..m9) under
         // the notice slot, plus the pinned original task (m0) = 6 total,
@@ -486,7 +540,7 @@ mod tests {
             fallback_max_messages: 4,
             last_input_tokens: 0,
         };
-        let out = budget.compact(&msgs);
+        let out = budget.compact(&msgs).into_owned();
         // fallback: compact_by_count(msgs, 4) = 1 pinned task + 1 notice
         // + 3 kept = 5
         assert_eq!(out.len(), 5);
@@ -494,6 +548,28 @@ mod tests {
             if matches!(&u.content[0], ContentBlock::Text { text } if text.contains("m0"))));
     }
 
+    /// `set_window` is the settings.json `maxTokens` override: an
+    /// under-budget occupancy against the env window becomes over-budget
+    /// once a smaller user window is applied (run_turn calls this every
+    /// turn after re-reading the settings file).
+    #[test]
+    fn set_window_overrides_env_derived_threshold() {
+        let mut budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 50_000,
+        };
+        assert_eq!(budget.window(), 100_000);
+        assert!(!budget.needs_compaction(), "50k of 100k is under 80%");
+        budget.set_window(50_000);
+        assert_eq!(budget.window(), 50_000);
+        assert!(
+            budget.needs_compaction(),
+            "50k occupancy against a 50k window is over the 80% trigger"
+        );
+    }
     #[test]
     fn compact_under_threshold_is_noop() {
         let msgs: Vec<_> = (0..5).map(|i| user(&format!("m{i}"))).collect();
@@ -505,14 +581,44 @@ mod tests {
             last_input_tokens: 50_000,
         };
         let out = budget.compact(&msgs);
-        assert_eq!(out.len(), 5);
-        // Clone, not prepended with a notice: first message is still m0.
-        match &out[0] {
+        // Under threshold the view BORROWS the input: same slice, zero
+        // clones — not a fresh copy of the whole history.
+        match out {
+            Compacted::Borrowed(slice) => {
+                assert!(std::ptr::eq(slice.as_ptr(), msgs.as_ptr()));
+                assert_eq!(slice.len(), 5);
+            }
+            Compacted::Owned(v) => panic!("under-threshold compact must borrow, got owned {v:?}"),
+        }
+        // And the flattened view still reads as the original history.
+        let flat = budget.compact(&msgs).into_owned();
+        assert_eq!(flat.len(), 5);
+        match &flat[0] {
             AgentMessage::User(u) => match &u.content[0] {
                 ContentBlock::Text { text } => assert_eq!(text, "m0"),
                 _ => panic!(),
             },
             _ => panic!("expected original first message"),
+        }
+    }
+
+    /// Same borrowing contract on the count-fallback trigger (no recorded
+    /// usage): under the fallback cap there is nothing to drop.
+    #[test]
+    fn compact_fallback_under_cap_borrows() {
+        let msgs: Vec<_> = (0..3).map(|i| user(&format!("m{i}"))).collect();
+        let budget = ContextBudget {
+            window: 100_000,
+            threshold_pct: 80,
+            target_pct: 50,
+            fallback_max_messages: 80,
+            last_input_tokens: 0,
+        };
+        match budget.compact(&msgs) {
+            Compacted::Borrowed(slice) => {
+                assert!(std::ptr::eq(slice.as_ptr(), msgs.as_ptr()))
+            }
+            Compacted::Owned(v) => panic!("must borrow under the cap, got owned {v:?}"),
         }
     }
 
@@ -535,7 +641,7 @@ mod tests {
             fallback_max_messages: 80,
             last_input_tokens: 100_000,
         };
-        let out = budget.compact(&msgs);
+        let out = budget.compact(&msgs).into_owned();
 
         // Collect tool_call ids and result ids from the kept tail (skip the
         // leading summary notice).

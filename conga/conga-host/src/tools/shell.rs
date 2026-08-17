@@ -19,9 +19,18 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// Marker printed after each command's output. The wrapper is evaluated as
-/// one unit by the shell, so the user command cannot swallow it.
-const SENTINEL: &str = "__CONGA_DONE__";
+/// Cap on bytes buffered by [`collect`] while a command runs (spill and
+/// truncation only happen later, at the bash-tool layer). Reuses the
+/// shared output cap plus headroom for the cap/exit markers.
+const SHELL_COLLECT_CAP: usize = crate::tools::MAX_OUTPUT_BYTES + 8 * 1024;
+
+/// Per-run completion marker: `__CONGA_DONE_<uuid>__`. A fresh random nonce
+/// per command means user output can never contain THIS run's sentinel
+/// line — the fixed-marker collision (`echo '__CONGA_DONE__ 0'` truncating
+/// output and forging an exit code) is structurally impossible.
+fn new_sentinel() -> String {
+    format!("__CONGA_DONE_{}__", uuid::Uuid::new_v4().simple())
+}
 
 /// One live shell and its I/O, owned by the registry entry.
 struct ShellSession {
@@ -91,6 +100,10 @@ pub async fn run(
     background_log_dir: Option<&std::path::Path>,
 ) -> ShellOutcome {
     // Background mode: redirect to a log file, return immediately after fork.
+    // The completion marker carries a per-run nonce: only THIS run's exact
+    // marker line terminates `collect`, so output echoing sentinel-shaped
+    // text (e.g. `echo '__CONGA_DONE__ 0'`) passes through untouched.
+    let sentinel = new_sentinel();
     let mut log_path: Option<std::path::PathBuf> = None;
     let wrapped: String = match background_log_dir {
         Some(dir) => {
@@ -98,11 +111,11 @@ pub async fn run(
             let log = dir.join(format!("bg-{}.log", millis()));
             log_path = Some(log.clone());
             format!(
-                "{{ {command} ; }} > '{}' 2>&1 & printf '%s 0\\n' {SENTINEL}\n",
+                "{{ {command} ; }} > '{}' 2>&1 & printf '%s 0\\n' {sentinel}\n",
                 log.display()
             )
         }
-        None => format!("{{ {command} ; }} 2>&1\nprintf \"%s $?\\n\" {SENTINEL}\n"),
+        None => format!("{{ {command} ; }} 2>&1\nprintf \"%s $?\\n\" {sentinel}\n"),
     };
 
     // Fetch (or respawn) the session; serial commands per session.
@@ -130,9 +143,15 @@ pub async fn run(
                 "[shell unavailable: write failed after respawn]".into(),
             );
         }
-        return finish(collect(&mut guard, timeout, session_id).await, log_path);
+        return finish(
+            collect(&mut guard, timeout, session_id, &sentinel).await,
+            log_path,
+        );
     }
-    finish(collect(&mut guard, timeout, session_id).await, log_path)
+    finish(
+        collect(&mut guard, timeout, session_id, &sentinel).await,
+        log_path,
+    )
 }
 
 /// Post-process one outcome: background runs name their log file so the
@@ -146,15 +165,25 @@ fn finish(mut outcome: ShellOutcome, log_path: Option<std::path::PathBuf>) -> Sh
     outcome
 }
 
-/// Read output until the sentinel line; enforce the timeout. On timeout or
-/// shell death the caller's registry entry is evicted (kill_on_drop reaps
-/// the process tree once the Arc refs drop).
+/// Read output until this run's sentinel line; enforce the timeout. On
+/// timeout or shell death the caller's registry entry is evicted
+/// (kill_on_drop reaps the process tree once the Arc refs drop).
+///
+/// Buffered output is capped at [`SHELL_COLLECT_CAP`] during collection
+/// itself: once the cap is hit, further lines are read (and discarded) until
+/// the sentinel arrives — a runaway `cat huge.file` can no longer buffer
+/// gigabytes in RAM while the spill/truncate layer only runs later. The cap
+/// mirrors [`crate::tools::MAX_OUTPUT_BYTES`](crate::tools) but sits
+/// deliberately above it: collect must also hold the truncation marker plus
+/// whatever finish/post-processing appends.
 async fn collect(
     guard: &mut tokio::sync::MutexGuard<'_, ShellSession>,
     timeout: Duration,
     session_id: &str,
+    sentinel: &str,
 ) -> ShellOutcome {
     let mut out = String::new();
+    let mut capped = false;
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -173,15 +202,34 @@ async fn collect(
             }
             Ok(Ok(_)) => {
                 let line = String::from_utf8_lossy(&buf);
-                if let Some(rest) = line.strip_prefix(SENTINEL) {
+                if let Some(rest) = line.strip_prefix(sentinel) {
                     let code = rest.trim();
+                    if capped {
+                        out.push_str("\n[... output capped at ");
+                        out.push_str(&SHELL_COLLECT_CAP.to_string());
+                        out.push_str(" bytes; later output discarded ...]");
+                    }
                     out.push_str(&format!("[exit {code}]"));
                     return ShellOutcome {
                         output: out,
                         exit_code: code.parse().ok(),
                     };
                 }
-                out.push_str(&line);
+                // Keep buffering while under the cap; past it, only the
+                // sentinel line matters (still consumed above).
+                if !capped {
+                    if out.len() + line.len() > SHELL_COLLECT_CAP {
+                        let room = SHELL_COLLECT_CAP.saturating_sub(out.len());
+                        let mut cut = room;
+                        while cut > 0 && !line.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        out.push_str(&line[..cut]);
+                        capped = true;
+                    } else {
+                        out.push_str(&line);
+                    }
+                }
             }
             Ok(Err(e)) => {
                 evict(session_id).await;
@@ -321,6 +369,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sentinel_like_output_is_not_truncated() {
+        // Echoing the legacy fixed marker (and any sentinel-shaped line)
+        // must pass through as plain output: no early truncation, no
+        // forged exit code — only this run's random nonce terminates.
+        let out = run_in("t8-sentinel", "echo '__CONGA_DONE__ 0'; echo survived").await;
+        assert!(
+            out.contains("__CONGA_DONE__ 0"),
+            "marker text must survive: {out}"
+        );
+        assert!(
+            out.contains("survived"),
+            "output after a forged marker must not be cut: {out}"
+        );
+        assert!(out.contains("[exit 0]"), "real exit code must win: {out}");
+        assert!(
+            !out.contains("[exit 7]"),
+            "forged code must be ignored: {out}"
+        );
+    }
+
+    #[tokio::test]
     async fn mirror_of_bash_tool_parameters() {
         // Exact parameters the bash tool passes: tempdir cwd, full process
         // env, uuid session, default timeout. Isolates shell.rs from the
@@ -382,5 +451,40 @@ mod tests {
             !out.contains("sk-secret"),
             "CONGA_* must be stripped: {out}"
         );
+    }
+
+    /// A command emitting far past [`SHELL_COLLECT_CAP`] must not buffer it
+    /// all: the collected output is capped, carries the cap marker, and the
+    /// run still reports the real exit sentinel (0).
+    #[tokio::test]
+    async fn oversized_output_is_capped_with_marker_and_exit() {
+        // ~3x the cap in 1KB lines; fast to emit, impossible to mistake.
+        let lines = SHELL_COLLECT_CAP / 1024 * 3;
+        let session = format!("t9-cap-{}", uuid::Uuid::new_v4());
+        let outcome = run(
+            &session,
+            &format!("i=1; while [ $i -le {lines} ]; do printf 'x%.0s' $(seq 1 1024); printf '\\n'; i=$((i+1)); done"),
+            Duration::from_secs(60),
+            std::path::Path::new("/tmp"),
+            &HashMap::new(),
+            None,
+        )
+        .await;
+        assert!(
+            outcome.output.contains("output capped at"),
+            "cap marker must be present (output len {})",
+            outcome.output.len()
+        );
+        // The buffer itself stayed at (or under) the cap plus markers.
+        assert!(
+            outcome.output.len() <= SHELL_COLLECT_CAP + 200,
+            "collected output must be bounded, got {}",
+            outcome.output.len()
+        );
+        // The shell survives: next call runs clean (bytes were consumed,
+        // not abandoned mid-stream).
+        let next = run_in(&session, "echo alive").await;
+        assert!(next.contains("alive"), "shell must stay usable: {next}");
+        assert!(next.contains("[exit 0]"), "{next}");
     }
 }

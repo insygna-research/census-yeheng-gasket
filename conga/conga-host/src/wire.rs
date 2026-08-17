@@ -42,6 +42,14 @@ pub struct OutgoingEvent {
     /// Cumulative output tokens for the whole session (only on `done`).
     #[serde(skip_serializing_if = "Option::is_none")]
     usage_out: Option<u64>,
+    /// Cumulative prompt-cache-read tokens for the whole session (only on
+    /// `done`; 0 when the provider reports no cache breakdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_cache_read: Option<u64>,
+    /// Cumulative prompt-cache-write tokens for the whole session (only on
+    /// `done`; 0 when the provider reports no cache breakdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_cache_write: Option<u64>,
     /// Wall-clock duration of this turn in milliseconds (only on `done`).
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
@@ -63,6 +71,8 @@ impl OutgoingEvent {
             message: None,
             usage_in: None,
             usage_out: None,
+            usage_cache_read: None,
+            usage_cache_write: None,
             elapsed_ms: None,
         }
     }
@@ -101,11 +111,20 @@ impl OutgoingEvent {
         Self::base("done")
     }
     /// Turn-boundary `done` carrying a usage summary. The frontend renders
-    /// one line: elapsed time + cumulative input/output tokens.
-    pub fn done_with_summary(usage_in: u64, usage_out: u64, elapsed_ms: u64) -> Self {
+    /// one line: elapsed time + cumulative input/output (and cache, when
+    /// the provider reports it) tokens.
+    pub fn done_with_summary(
+        usage_in: u64,
+        usage_out: u64,
+        cache_read: u64,
+        cache_write: u64,
+        elapsed_ms: u64,
+    ) -> Self {
         let mut ev = Self::base("done");
         ev.usage_in = Some(usage_in);
         ev.usage_out = Some(usage_out);
+        ev.usage_cache_read = Some(cache_read);
+        ev.usage_cache_write = Some(cache_write);
         ev.elapsed_ms = Some(elapsed_ms);
         ev
     }
@@ -153,17 +172,24 @@ impl OutgoingEvent {
 
 /// Context occupancy for the frontend. `last_input_tokens` is the current
 /// window occupancy (the most recent provider-reported input-token count)
-/// and drives the saturation percentage against `CONGA_CONTEXT_WINDOW`
-/// (default 128k). `cumulative_in`/`cumulative_out` are the real
-/// accumulated API spend across the session. The percentage is a display
-/// heuristic; the token counts themselves are real API usage.
-pub fn context_stats(last_input_tokens: u64, usage_in: u64, usage_out: u64) -> serde_json::Value {
-    let window: u64 = std::env::var("CONGA_CONTEXT_WINDOW")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128_000);
-    let usage_percent = if window > 0 {
-        (last_input_tokens as f64 / window as f64) * 100.0
+/// and drives the saturation percentage against `max_tokens` — callers
+/// pass the resolved window (settings.json `maxTokens` >
+/// `CONGA_CONTEXT_WINDOW` > 128k; see
+/// [`crate::settings::effective_max_tokens`]). `cumulative_in`/`cumulative_out`
+/// are the real accumulated API spend across the session, with
+/// `cache_read_tokens`/`cache_write_tokens` as its cache breakdown. The
+/// percentage is a display heuristic; the token counts themselves are real
+/// API usage.
+pub fn context_stats(
+    last_input_tokens: u64,
+    usage_in: u64,
+    usage_out: u64,
+    cache_read: u64,
+    cache_write: u64,
+    max_tokens: u64,
+) -> serde_json::Value {
+    let usage_percent = if max_tokens > 0 {
+        (last_input_tokens as f64 / max_tokens as f64) * 100.0
     } else {
         0.0
     };
@@ -173,6 +199,9 @@ pub fn context_stats(last_input_tokens: u64, usage_in: u64, usage_out: u64) -> s
         "is_compressing": false,
         "cumulative_in": usage_in,
         "cumulative_out": usage_out,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "max_tokens": max_tokens,
     })
 }
 
@@ -180,40 +209,56 @@ pub fn context_stats(last_input_tokens: u64, usage_in: u64, usage_out: u64) -> s
 mod tests {
     use super::*;
 
-    /// The scenarios live in ONE test because they mutate the process-global
-    /// `CONGA_CONTEXT_WINDOW` env var; a single test function runs on one
-    /// thread, so parallel test threads can't race on it.
     #[test]
     fn context_stats_scenarios() {
-        // 1. Zero usage -> zero tokens, zero percent (default window).
-        std::env::remove_var("CONGA_CONTEXT_WINDOW");
-        let stats = context_stats(0, 0, 0);
+        // 1. Zero usage -> zero tokens, zero percent against the default window.
+        let stats = context_stats(0, 0, 0, 0, 0, 128_000);
         assert_eq!(stats["current_tokens"], 0);
         assert_eq!(stats["usage_percent"], 0.0);
         assert_eq!(stats["is_compressing"], false);
         assert_eq!(stats["cumulative_in"], 0);
         assert_eq!(stats["cumulative_out"], 0);
+        assert_eq!(stats["cache_read_tokens"], 0);
+        assert_eq!(stats["cache_write_tokens"], 0);
+        assert_eq!(stats["max_tokens"], 128_000);
 
         // 2. Occupancy uses `last_input_tokens` (NOT cumulative in+out).
-        // 64k current against the default 128k window = 50%.
-        let stats = context_stats(64_000, 100_000, 50_000);
+        // 64k current against a 128k window = 50%; cache + max pass
+        // through verbatim (callers resolve the window from env/settings).
+        let stats = context_stats(64_000, 100_000, 50_000, 30_000, 10_000, 128_000);
         assert_eq!(stats["current_tokens"], 64_000);
         assert_eq!(stats["usage_percent"], 50.0);
         assert_eq!(stats["cumulative_in"], 100_000);
         assert_eq!(stats["cumulative_out"], 50_000);
+        assert_eq!(stats["cache_read_tokens"], 30_000);
+        assert_eq!(stats["cache_write_tokens"], 10_000);
+        assert_eq!(stats["max_tokens"], 128_000);
 
-        // 3. A configured `CONGA_CONTEXT_WINDOW` is respected.
-        std::env::set_var("CONGA_CONTEXT_WINDOW", "50000");
-        let stats = context_stats(25_000, 999, 999);
+        // 3. An env-derived window (CONGA_CONTEXT_WINDOW=50000, what
+        // effective_max_tokens passes through when settings are silent).
+        let stats = context_stats(25_000, 999, 999, 0, 0, 50_000);
         assert_eq!(stats["current_tokens"], 25_000);
         assert_eq!(stats["usage_percent"], 50.0);
+        assert_eq!(stats["max_tokens"], 50_000);
 
         // 4. Zero window is "no percentage", not a division by zero.
-        std::env::set_var("CONGA_CONTEXT_WINDOW", "0");
-        let stats = context_stats(1_000, 1_000, 1_000);
+        let stats = context_stats(1_000, 1_000, 1_000, 0, 0, 0);
         assert_eq!(stats["current_tokens"], 1_000);
         assert_eq!(stats["usage_percent"], 0.0);
+    }
 
-        std::env::remove_var("CONGA_CONTEXT_WINDOW");
+    #[test]
+    fn done_with_summary_carries_cache_fields() {
+        let v =
+            serde_json::to_value(OutgoingEvent::done_with_summary(10, 20, 30, 40, 1_000)).unwrap();
+        assert_eq!(v["type"], "done");
+        assert_eq!(v["usage_in"], 10);
+        assert_eq!(v["usage_out"], 20);
+        assert_eq!(v["usage_cache_read"], 30);
+        assert_eq!(v["usage_cache_write"], 40);
+        assert_eq!(v["elapsed_ms"], 1_000);
+        // A plain done carries no summary fields at all.
+        let v = serde_json::to_value(OutgoingEvent::done()).unwrap();
+        assert!(v.get("usage_in").is_none() && v.get("usage_cache_read").is_none());
     }
 }

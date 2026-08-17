@@ -2,6 +2,7 @@
 import { Button } from '@/components/ui/button';
 import { Send, Square, Terminal } from 'lucide-vue-next';
 import { computed, nextTick, onMounted, ref } from 'vue';
+import { gatewayFetch } from '@/lib/backend';
 import { isTauri } from '@/lib/platform';
 
 const props = defineProps<{
@@ -40,8 +41,7 @@ const fetchCommands = async () => {
     return;
   }
   try {
-    const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-    const res = await fetch(`${apiUrl}/api/commands`);
+    const res = await gatewayFetch('/api/commands');
     if (res.ok) {
       const data = await res.json();
       commands.value = Array.isArray(data) ? data : [];

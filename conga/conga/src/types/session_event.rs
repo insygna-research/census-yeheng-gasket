@@ -186,6 +186,8 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                 }),
             },
             SessionEvent::TurnEnd {

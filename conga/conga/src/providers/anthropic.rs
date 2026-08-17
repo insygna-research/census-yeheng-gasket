@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::collect_text;
 use crate::types::context::{ModelSpec, StreamChunk, StreamFn};
-use crate::types::message::{AgentMessage, ContentBlock};
+use crate::types::message::{AgentMessage, ContentBlock, StopReason};
 use crate::types::tool::ToolDefinition;
 
 /// Anthropic native messages provider.
@@ -305,17 +305,50 @@ pub(crate) fn parse_anthropic_chunk(json_str: &str) -> Vec<StreamChunk> {
             }
         }
         "message_delta" => {
-            if let Some(usage) = v.pointer("/usage/output_tokens") {
-                let output = usage.as_u64().unwrap_or(0);
-                vec![StreamChunk::Usage { input: 0, output }]
-            } else {
-                vec![]
+            // Terminal event: carries the stop reason (`delta.stop_reason`)
+            // and the final output-token count. `max_tokens` means the
+            // output was cut short — surfaced as MaxTokens so the loop
+            // discards partial tool calls instead of executing them with
+            // malformed arguments.
+            let mut chunks = Vec::new();
+            if let Some(reason) = v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) {
+                let stop = match reason {
+                    "max_tokens" => StopReason::MaxTokens,
+                    "tool_use" => StopReason::ToolUse,
+                    _ => StopReason::EndTurn,
+                };
+                chunks.push(StreamChunk::Stop(stop));
             }
+            if let Some(output) = v.pointer("/usage/output_tokens").and_then(|u| u.as_u64()) {
+                chunks.push(StreamChunk::Usage {
+                    input: 0,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+            }
+            chunks
         }
         "message_start" => {
             if let Some(input) = v.pointer("/message/usage/input_tokens") {
                 let input = input.as_u64().unwrap_or(0);
-                vec![StreamChunk::Usage { input, output: 0 }]
+                // Prompt-cache accounting lives in message_start alongside
+                // input_tokens: tokens read from the cache and tokens spent
+                // creating cache entries. Absent → 0 (not reported).
+                let cache_read = v
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0);
+                let cache_write = v
+                    .pointer("/message/usage/cache_creation_input_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0);
+                vec![StreamChunk::Usage {
+                    input,
+                    output: 0,
+                    cache_read,
+                    cache_write,
+                }]
             } else {
                 vec![]
             }
@@ -380,8 +413,83 @@ mod tests {
             chunks,
             vec![StreamChunk::Usage {
                 input: 42,
-                output: 0
+                output: 0,
+                cache_read: 0,
+                cache_write: 0
             }]
+        );
+    }
+
+    #[test]
+    fn parses_message_start_cache_usage() {
+        // message_start also reports prompt-cache stats:
+        // cache_read_input_tokens (cache hits) and
+        // cache_creation_input_tokens (cache writes). Absent fields must
+        // degrade to 0, present ones flow through to the chunk.
+        let json = r#"{"type":"message_start","message":{"usage":{
+            "input_tokens":100,
+            "cache_read_input_tokens":80,
+            "cache_creation_input_tokens":15}}}"#;
+        let chunks = parse_anthropic_chunk(json);
+        assert_eq!(
+            chunks,
+            vec![StreamChunk::Usage {
+                input: 100,
+                output: 0,
+                cache_read: 80,
+                cache_write: 15
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_message_delta_stop_reason_max_tokens() {
+        // The terminal message_delta carries BOTH the stop reason and the
+        // final output-token count; `max_tokens` means the output was cut
+        // short. Without this the loop would classify a mid-tool-call
+        // truncation as ToolUse and execute it with malformed args.
+        let json = r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":99}}"#;
+        assert_eq!(
+            parse_anthropic_chunk(json),
+            vec![
+                StreamChunk::Stop(StopReason::MaxTokens),
+                StreamChunk::Usage {
+                    input: 0,
+                    output: 99,
+                    cache_read: 0,
+                    cache_write: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_message_delta_stop_reason_end_turn_and_tool_use() {
+        let end = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#;
+        assert_eq!(
+            parse_anthropic_chunk(end),
+            vec![
+                StreamChunk::Stop(StopReason::EndTurn),
+                StreamChunk::Usage {
+                    input: 0,
+                    output: 7,
+                    cache_read: 0,
+                    cache_write: 0
+                },
+            ]
+        );
+        let tools = r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}"#;
+        assert_eq!(
+            parse_anthropic_chunk(tools),
+            vec![
+                StreamChunk::Stop(StopReason::ToolUse),
+                StreamChunk::Usage {
+                    input: 0,
+                    output: 8,
+                    cache_read: 0,
+                    cache_write: 0
+                },
+            ]
         );
     }
 
@@ -403,7 +511,6 @@ mod tests {
             id: "claude".into(),
             api: ProviderApi::Anthropic,
             max_tokens: 1024,
-            supports_thinking: false,
         };
         let tools = vec![ToolDefinition {
             name: "t".into(),
@@ -437,7 +544,6 @@ mod tests {
             id: "claude".into(),
             api: ProviderApi::Anthropic,
             max_tokens: 1024,
-            supports_thinking: false,
         };
         build_request_body(&model, messages, "", &[])
     }

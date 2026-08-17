@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use conga::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApiImpl,
-    ModelSpec, ProviderApi, StreamChunk, StreamFn, ThinkingLevel, ToolDefinition,
+    ModelSpec, ProviderApi, StreamChunk, StreamFn, ToolDefinition,
 };
 use futures_util::{stream, Stream};
 
@@ -54,11 +54,10 @@ async fn hello_extension_greets() {
             id: "m".into(),
             api: ProviderApi::OpenAiCompat,
             max_tokens: 64,
-            supports_thinking: false,
         },
-        thinking_level: ThinkingLevel::Off,
         max_turns: 1,
         max_tool_calls_per_turn: 5,
+        tool_timeout: None,
         signal: None,
         stream_fn: Arc::new(CallToolOnce {
             tool: "hello".into(),
@@ -106,11 +105,10 @@ async fn permission_gate_blocks_bash() {
             id: "m".into(),
             api: ProviderApi::OpenAiCompat,
             max_tokens: 64,
-            supports_thinking: false,
         },
-        thinking_level: ThinkingLevel::Off,
         max_turns: 1,
         max_tool_calls_per_turn: 5,
+        tool_timeout: None,
         signal: None,
         stream_fn: Arc::new(CallToolOnce {
             tool: "bash".into(),

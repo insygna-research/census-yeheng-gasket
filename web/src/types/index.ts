@@ -72,7 +72,7 @@ export type WsMessage =
   | { type: 'tool_start'; name: string; arguments?: string; tool_call_id?: string }
   | { type: 'tool_end'; name: string; output?: string; error?: string; tool_call_id?: string }
   | { type: 'error'; content?: string; message?: string }
-  | { type: 'done'; usage_in?: number; usage_out?: number; elapsed_ms?: number }
+  | { type: 'done'; usage_in?: number; usage_out?: number; usage_cache_read?: number; usage_cache_write?: number; elapsed_ms?: number }
   | { type: 'busy'; content?: string; message?: string }
   | { type: 'queued'; message: string }
   | { type: 'approval_request'; id: string; tool_name: string; description: string; arguments: string; preview?: string }
@@ -119,12 +119,6 @@ export type SubagentWsMessage =
   | { type: 'subagent_completed'; id: string; index: number; summary: string; tool_count: number }
   | { type: 'subagent_error'; id: string; index: number; error: string };
 
-/**
- * Type guard to check if a WebSocket message is a subagent message
- */
-export function isSubagentMessage(msg: { type: string }): msg is SubagentWsMessage {
-  return msg.type.startsWith('subagent_');
-}
 
 // ── IM Types ────────────────────────────────────────────────
 
@@ -173,6 +167,10 @@ export interface TurnSummary {
   usageIn: number;
   /** Cumulative output tokens across the session so far. */
   usageOut: number;
+  /** Cumulative cache-read tokens (absent = provider didn't report). */
+  cacheRead?: number;
+  /** Cumulative cache-write tokens (absent = provider didn't report). */
+  cacheWrite?: number;
   /** Wall-clock duration of this turn in milliseconds. */
   elapsedMs: number;
 }
@@ -185,6 +183,12 @@ export interface ContextStats {
   is_compressing: boolean;
   cumulative_in: number;
   cumulative_out: number;
+  /** Context window ceiling; absent when the backend didn't report one. */
+  max_tokens?: number;
+  /** Cumulative session cache-read tokens; absent = not reported. */
+  cache_read_tokens?: number;
+  /** Cumulative session cache-write tokens; absent = not reported. */
+  cache_write_tokens?: number;
 }
 
 export interface Chat {
@@ -228,6 +232,8 @@ export interface EnvSettingsView {
   fastLlm: LlmSettingsGroupView | null;
   /** Custom base instructions; empty string = built-in prompt. */
   systemPrompt: string;
+  /** Context budget ceiling override; null/absent = env/default applies. */
+  maxTokens?: number | null;
 }
 
 /** PUT body: `null` group clears it (env config applies again). An absent
@@ -236,4 +242,6 @@ export interface EnvSettingsPayload {
   llm: LlmSettingsGroup | null;
   fastLlm: LlmSettingsGroup | null;
   systemPrompt?: string;
+  /** `null` clears the override (env CONGA_CONTEXT_WINDOW / 128000 default). */
+  maxTokens?: number | null;
 }

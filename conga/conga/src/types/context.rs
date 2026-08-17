@@ -1,12 +1,14 @@
 //! `AgentContext` / `AgentLoopConfig` — what the agent sees and how it runs.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cancel::CancelSignal;
 use crate::error::AgentError;
-use crate::types::message::{AgentMessage, ModelId};
+use crate::types::message::{AgentMessage, ModelId, StopReason};
 use crate::types::session_event::SessionEvent;
 use crate::types::tool::ToolDefinition;
 
@@ -38,11 +40,18 @@ impl std::fmt::Debug for AgentContext {
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: ModelSpec,
-    pub thinking_level: ThinkingLevel,
     /// Hard ceiling on outer-loop turns. Default 50.
     pub max_turns: usize,
     /// Hard ceiling on tool calls executed within a single turn. Default 20.
     pub max_tool_calls_per_turn: usize,
+    /// Engine-level safety net for one tool call: a tool whose Future never
+    /// resolves (wedged MCP server, deadlocked plugin) is cut off and
+    /// reported as an error tool_result instead of hanging the whole loop.
+    /// `None` (the default) imposes no engine limit — tools with their own
+    /// timeouts (bash, fetch, MCP, external) keep governing themselves, and
+    /// a tool may legitimately run longer than any fixed default. Hosts that
+    /// want the net set it via `CONGA_TOOL_TIMEOUT_S`.
+    pub tool_timeout: Option<Duration>,
     /// Cooperative abort: cancels the loop at the next safe point. Async
     /// waiters (SSE download, approval waits) are woken the instant
     /// [`CancelSignal::cancel`](crate::CancelSignal::cancel) fires - no polling.
@@ -83,7 +92,6 @@ impl std::fmt::Debug for AgentLoopConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentLoopConfig")
             .field("model", &self.model.id)
-            .field("thinking_level", &self.thinking_level)
             .field("max_turns", &self.max_turns)
             .field("max_tool_calls_per_turn", &self.max_tool_calls_per_turn)
             .finish_non_exhaustive()
@@ -136,10 +144,10 @@ impl RetryPolicy {
 /// - `CONGA_MAX_TURNS`        - outer-loop turn ceiling (default 50)
 /// - `CONGA_MAX_TOOL_CALLS`   - per-turn tool-call ceiling (default 20)
 /// - `CONGA_MAX_TOKENS`       - model output token cap (default 4096)
-/// - `CONGA_THINKING`         - `off`|`low`|`medium`|`high` (default off)
 /// - `CONGA_RETRY_MAX`        - max LLM-call retries (default 2)
 /// - `CONGA_RETRY_INITIAL_MS` - first retry backoff ms (default 500)
-/// - `CONGA_RETRY_MAX_MS`     - backoff cap ms (default 8000)
+/// - `CONGA_TOOL_TIMEOUT_S`   - engine-level per-call tool timeout in
+///   seconds (default: none)
 ///
 /// Malformed values fall back to the default silently.
 #[derive(Debug, Clone)]
@@ -147,8 +155,9 @@ pub struct AgentTunables {
     pub max_turns: usize,
     pub max_tool_calls_per_turn: usize,
     pub max_tokens: usize,
-    pub thinking_level: ThinkingLevel,
     pub retry: RetryPolicy,
+    /// Engine-level tool timeout (see `AgentLoopConfig::tool_timeout`);
+    pub tool_timeout_secs: Option<u64>,
 }
 
 impl AgentTunables {
@@ -165,12 +174,9 @@ impl AgentTunables {
             max_turns: env_parse(lookup, "CONGA_MAX_TURNS", 50),
             max_tool_calls_per_turn: env_parse(lookup, "CONGA_MAX_TOOL_CALLS", 20),
             max_tokens: env_parse(lookup, "CONGA_MAX_TOKENS", 4096),
-            thinking_level: match lookup("CONGA_THINKING").ok().as_deref() {
-                Some("low") => ThinkingLevel::Low,
-                Some("medium") => ThinkingLevel::Medium,
-                Some("high") => ThinkingLevel::High,
-                _ => ThinkingLevel::Off,
-            },
+            tool_timeout_secs: lookup("CONGA_TOOL_TIMEOUT_S")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             retry: RetryPolicy {
                 max_retries: env_parse(lookup, "CONGA_RETRY_MAX", default_retry.max_retries),
                 initial_delay_ms: env_parse(
@@ -204,7 +210,6 @@ pub struct ModelSpec {
     pub id: ModelId,
     pub api: ProviderApi,
     pub max_tokens: usize,
-    pub supports_thinking: bool,
 }
 
 /// Which wire protocol the provider speaks. Determines `convert_to_llm` shape.
@@ -214,16 +219,6 @@ pub enum ProviderApi {
     OpenAiCompat,
     /// Anthropic native messages API.
     Anthropic,
-}
-
-/// Extended-thinking level. Off for providers/models that don't support it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ThinkingLevel {
-    #[default]
-    Off,
-    Low,
-    Medium,
-    High,
 }
 
 /// A provider-agnostic stream chunk produced by `StreamFn`.
@@ -244,7 +239,18 @@ pub enum StreamChunk {
     Usage {
         input: u64,
         output: u64,
+        /// Prompt tokens served from the provider cache; 0 = not reported.
+        cache_read: u64,
+        /// Prompt tokens written into the provider cache; 0 = not reported.
+        cache_write: u64,
     },
+    /// Provider-reported stop signal (OpenAI `finish_reason`, Anthropic
+    /// `message_delta.stop_reason`), already mapped to the internal
+    /// [`StopReason`]. Emitted at most once per stream, before `Done`.
+    /// When present it overrides the loop's content-based stop guess, so a
+    /// length-truncated response classifies as `MaxTokens` instead of a
+    /// bogus tool call with malformed arguments.
+    Stop(StopReason),
     Done,
     Error(String),
 }
@@ -275,7 +281,6 @@ mod tests {
         assert_eq!(t.max_turns, 50);
         assert_eq!(t.max_tool_calls_per_turn, 20);
         assert_eq!(t.max_tokens, 4096);
-        assert_eq!(t.thinking_level, ThinkingLevel::Off);
         assert_eq!(t.retry.max_retries, 2);
     }
 
@@ -285,7 +290,6 @@ mod tests {
             ("CONGA_MAX_TURNS", "5"),
             ("CONGA_MAX_TOOL_CALLS", "8"),
             ("CONGA_MAX_TOKENS", "123"),
-            ("CONGA_THINKING", "medium"),
             ("CONGA_RETRY_MAX", "3"),
             ("CONGA_RETRY_INITIAL_MS", "100"),
             ("CONGA_RETRY_MAX_MS", "2000"),
@@ -293,7 +297,6 @@ mod tests {
         assert_eq!(t.max_turns, 5);
         assert_eq!(t.max_tool_calls_per_turn, 8);
         assert_eq!(t.max_tokens, 123);
-        assert_eq!(t.thinking_level, ThinkingLevel::Medium);
         assert_eq!(t.retry.max_retries, 3);
         assert_eq!(t.retry.initial_delay_ms, 100);
         assert_eq!(t.retry.max_delay_ms, 2000);
@@ -301,11 +304,7 @@ mod tests {
 
     #[test]
     fn tunables_malformed_falls_back() {
-        let t = AgentTunables::from_env_with(&fake_env(&[
-            ("CONGA_MAX_TURNS", "not-a-number"),
-            ("CONGA_THINKING", "bogus"),
-        ]));
+        let t = AgentTunables::from_env_with(&fake_env(&[("CONGA_MAX_TURNS", "not-a-number")]));
         assert_eq!(t.max_turns, 50);
-        assert_eq!(t.thinking_level, ThinkingLevel::Off);
     }
 }

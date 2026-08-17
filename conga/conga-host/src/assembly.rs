@@ -302,7 +302,6 @@ fn apply_fast_provider(
         id: fast.model.clone(),
         api: fast.api,
         max_tokens: tunables.max_tokens,
-        supports_thinking: tunables.thinking_level != conga::ThinkingLevel::Off,
     };
     loop_config.stream_fn = match fast.api {
         conga::ProviderApi::OpenAiCompat => Arc::new(conga::OpenAiCompat::from_config(fast)),
@@ -314,8 +313,8 @@ fn apply_fast_provider(
 /// skills prompt -> hook stack (`extra_hooks` first, policy last) -> signal
 /// wiring -> sub-agent spawner. Sub-agents get the built-in set minus
 /// `spawn_subagents` (nesting disabled; shared MCP/external servers are not
-/// built for N parallel loops); the shared permission policy still gates
-/// every call the sub-agents do get.
+/// built for N parallel loops); the SAME composed hook stack (extra gates,
+/// then policy) gates every call the sub-agents do get.
 async fn assemble_host(
     cfg: HostConfig,
     session: SessionManager,
@@ -334,20 +333,23 @@ async fn assemble_host(
 
     // Host hooks: extra gates first (e.g. the CLI's ext permission gate),
     // the permission policy last so its verdicts see post-gate calls.
+    // The SAME composed stack gates sub-agents: a sub-agent used to get
+    // the policy alone, letting it bypass every extra hook the host
+    // installed.
     let mut hook_stack = HookStack::new(Vec::new());
     for h in extra_hooks {
         hook_stack.push(h);
     }
     hook_stack.push(policy.clone());
+    let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(hook_stack);
 
     let subagent_tools: Vec<_> = crate::built_in_tools()
         .iter()
         .filter(|t| t.name != "spawn_subagents")
         .cloned()
         .collect();
-
     let host = Host::new(cfg.clone(), session, policy.clone(), system_prompt, tools)
-        .with_hooks(Arc::new(hook_stack));
+        .with_hooks(Arc::clone(&spawner_hooks));
     // The approver may wait on a client that never answers; give it the
     // Host's cancel signal so cancel unwinds the wait. (The desktop
     // backend used to miss this line - it lived only in the gateway's
@@ -355,7 +357,6 @@ async fn assemble_host(
     policy.set_signal(host.signal().clone());
     let spawner_signal = host.signal().clone();
     let spawner_stream_fn = cfg.provider_stream_fn();
-    let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(HookStack::new(vec![policy]));
     // Fast-model routing, precedence: the web UI's settings file
     // (`fastLlm` group) wins, then a complete `CONGA_FAST_LLM_*` env set.
     // Same tunables otherwise; a partial env set fails loud at startup —

@@ -47,7 +47,8 @@ struct ListedTool {
     #[serde(default)]
     label: Option<String>,
     /// Self-reported risk: "low" | "medium" | "high" (case-insensitive).
-    /// Unknown/missing falls back to High — the safe default.
+    /// A self-report is NEVER trusted on its own — the process is unvetted
+    /// code — see [`effective_risk`].
     #[serde(default)]
     risk: Option<String>,
 }
@@ -63,6 +64,27 @@ fn parse_risk(s: Option<&str>) -> RiskLevel {
     match s.map(|v| v.to_ascii_lowercase()).as_deref() {
         Some("low") => RiskLevel::Low,
         Some("medium") => RiskLevel::Medium,
+        _ => RiskLevel::High,
+    }
+}
+
+/// Numeric rank of a level for comparisons (`RiskLevel` carries no ordering).
+fn risk_rank(r: RiskLevel) -> u8 {
+    match r {
+        RiskLevel::Low => 0,
+        RiskLevel::Medium => 1,
+        RiskLevel::High => 2,
+    }
+}
+
+/// Effective risk for an external tool: an unvetted subprocess defaults to
+/// High. A lower level is honored only when the operator explicitly vouched
+/// for the command in `CONGA_EXTERNAL_TOOLS` (`@low` etc.) AND the
+/// self-report does not exceed the vouch — vouching `@low` cannot wash a
+/// `medium`/`high`/missing report clean.
+fn effective_risk(vouch: Option<RiskLevel>, self_reported: RiskLevel) -> RiskLevel {
+    match vouch {
+        Some(v) if risk_rank(self_reported) <= risk_rank(v) => self_reported,
         _ => RiskLevel::High,
     }
 }
@@ -109,20 +131,25 @@ struct BridgeInner {
 pub struct ExternalToolBridge {
     inner: Mutex<BridgeInner>,
     timeout: Duration,
+    /// Operator's risk vouch for this command (`@low` etc. in
+    /// `CONGA_EXTERNAL_TOOLS`); `None` = every tool stays High.
+    risk_vouch: Option<RiskLevel>,
 }
 
 impl ExternalToolBridge {
     /// Spawn `program` with `args`, run `list`, return bridge + tool defs.
+    /// No risk vouch: every tool of this command registers as High.
     pub async fn spawn(
         program: &str,
         args: &[&str],
     ) -> Result<(Arc<Self>, Vec<ToolDefinition>), ExternalToolError> {
-        Self::spawn_with_timeout(program, args, DEFAULT_TIMEOUT).await
+        Self::spawn_with_timeout(program, args, None, DEFAULT_TIMEOUT).await
     }
 
     pub async fn spawn_with_timeout(
         program: &str,
         args: &[&str],
+        risk_vouch: Option<RiskLevel>,
         timeout: Duration,
     ) -> Result<(Arc<Self>, Vec<ToolDefinition>), ExternalToolError> {
         let mut child = Command::new(program)
@@ -149,6 +176,7 @@ impl ExternalToolBridge {
                 stdout: BufReader::new(stdout),
             }),
             timeout,
+            risk_vouch,
         });
 
         let listed = bridge.list().await?;
@@ -212,7 +240,7 @@ impl ExternalToolBridge {
         let bridge = Arc::clone(self);
         let name = t.name.clone();
         let label = t.label.unwrap_or_else(|| t.name.clone());
-        let risk = parse_risk(t.risk.as_deref());
+        let risk = effective_risk(self.risk_vouch, parse_risk(t.risk.as_deref()));
         ToolDefinition {
             name: t.name,
             label,
@@ -253,30 +281,67 @@ impl ExternalToolBridge {
     }
 }
 
-/// Parse `CONGA_EXTERNAL_TOOLS`: comma-separated commands.
-/// Each entry is split on whitespace into program + args
-/// (e.g. `python3 /path/echo.py,./bin/tool`).
-pub fn commands_from_env() -> Vec<Vec<String>> {
+/// One parsed `CONGA_EXTERNAL_TOOLS` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCommand {
+    /// Program + args to spawn.
+    pub argv: Vec<String>,
+    /// Operator's risk vouch from a trailing `@low`/`@medium`/`@high`
+    /// token. `None` (the default) keeps every tool of this command at
+    /// High — a self-reported risk alone is never trusted.
+    pub risk: Option<RiskLevel>,
+}
+
+/// Parse `CONGA_EXTERNAL_TOOLS`: comma-separated commands, each split on
+/// whitespace into program + args (e.g. `python3 /path/echo.py,./bin/tool`).
+///
+/// An entry may end with a risk vouch: a trailing `@low`, `@medium`, or
+/// `@high` token (e.g. `python3 /path/echo.py @low`) lowers the tools of
+/// THAT ONE command below the default High — but only as far as the tool's
+/// own self-report (see [`effective_risk`]). A trailing `@`-token naming
+/// no known level stays a literal argument.
+pub fn commands_from_env() -> Vec<ExternalCommand> {
     commands_from(&|k| std::env::var(k))
 }
 
 pub fn commands_from(
     lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Vec<Vec<String>> {
+) -> Vec<ExternalCommand> {
     let Ok(raw) = lookup("CONGA_EXTERNAL_TOOLS") else {
         return Vec::new();
     };
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|entry| {
-            shell_words(entry)
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
+        .map(parse_entry)
+        .filter(|c| !c.argv.is_empty())
         .collect()
+}
+
+/// Split one entry into argv + optional trailing `@level` vouch.
+fn parse_entry(entry: &str) -> ExternalCommand {
+    let mut words = shell_words(entry);
+    let risk = words
+        .last()
+        .and_then(|last| last.strip_prefix('@'))
+        .and_then(parse_level);
+    if risk.is_some() {
+        words.pop();
+    }
+    ExternalCommand {
+        argv: words.into_iter().map(str::to_string).collect(),
+        risk,
+    }
+}
+
+/// Recognized vouch level (`low`/`medium`/`high`, case-insensitive).
+fn parse_level(s: &str) -> Option<RiskLevel> {
+    match s.to_ascii_lowercase().as_str() {
+        "low" => Some(RiskLevel::Low),
+        "medium" => Some(RiskLevel::Medium),
+        "high" => Some(RiskLevel::High),
+        _ => None,
+    }
 }
 
 /// Minimal whitespace split (no quotes gymnastics). Good enough for env paths.
@@ -285,12 +350,16 @@ fn shell_words(s: &str) -> Vec<&str> {
 }
 
 /// Spawn every command from env/list; collect tools. Failures are returned per command.
-pub async fn load_all(commands: &[Vec<String>]) -> Result<Vec<ToolDefinition>, ExternalToolError> {
+pub async fn load_all(
+    commands: &[ExternalCommand],
+) -> Result<Vec<ToolDefinition>, ExternalToolError> {
     let mut tools = Vec::new();
     for cmd in commands {
-        let (program, args) = cmd.split_first().ok_or(ExternalToolError::Empty)?;
+        let (program, args) = cmd.argv.split_first().ok_or(ExternalToolError::Empty)?;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (_bridge, defs) = ExternalToolBridge::spawn(program, &arg_refs).await?;
+        let (_bridge, defs) =
+            ExternalToolBridge::spawn_with_timeout(program, &arg_refs, cmd.risk, DEFAULT_TIMEOUT)
+                .await?;
         // Bridge lives inside each tool's execute Arc; drop tools → kill child.
         tools.extend(defs);
     }
@@ -354,7 +423,8 @@ for line in sys.stdin:
             .expect("spawn");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
-        assert_eq!(tools[0].risk, RiskLevel::Low);
+        // Self-reports "low" but no operator vouch: stays High.
+        assert_eq!(tools[0].risk, RiskLevel::High);
 
         let result = (tools[0].execute)(ToolCallCtx {
             tool_call_id: "c1".into(),
@@ -377,21 +447,55 @@ for line in sys.stdin:
         drop(bridge);
     }
 
+    /// The vouch path: `@low` in CONGA_EXTERNAL_TOOLS + a "low"
+    /// self-report → Low. Everything else stays as [`effective_risk`].
+    #[tokio::test]
+    async fn vouched_low_report_is_low() {
+        let script = fixture_script();
+        let (_bridge, tools) = ExternalToolBridge::spawn_with_timeout(
+            "python3",
+            &[&script],
+            Some(RiskLevel::Low),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .expect("spawn");
+        assert_eq!(tools[0].risk, RiskLevel::Low);
+    }
+
     #[test]
     fn parse_env_commands() {
         let cmds = commands_from(&|k| {
             if k == "CONGA_EXTERNAL_TOOLS" {
-                Ok("python3 /tmp/a.py, ./bin/x".into())
+                Ok("python3 /tmp/a.py @low, ./bin/x, ./bin/y @tier".into())
             } else {
                 Err(std::env::VarError::NotPresent)
             }
         });
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 3);
         assert_eq!(
             cmds[0],
-            vec!["python3".to_string(), "/tmp/a.py".to_string()]
+            ExternalCommand {
+                argv: vec!["python3".to_string(), "/tmp/a.py".to_string()],
+                risk: Some(RiskLevel::Low),
+            }
         );
-        assert_eq!(cmds[1], vec!["./bin/x".to_string()]);
+        // No vouch: default High for every tool of this command.
+        assert_eq!(
+            cmds[1],
+            ExternalCommand {
+                argv: vec!["./bin/x".to_string()],
+                risk: None,
+            }
+        );
+        // Unknown level token is NOT a vouch: stays a literal argument.
+        assert_eq!(
+            cmds[2],
+            ExternalCommand {
+                argv: vec!["./bin/y".to_string(), "@tier".to_string()],
+                risk: None,
+            }
+        );
     }
 
     #[test]
@@ -402,5 +506,35 @@ for line in sys.stdin:
         // Unknown / missing → safe default High.
         assert_eq!(parse_risk(Some("extreme")), RiskLevel::High);
         assert_eq!(parse_risk(None), RiskLevel::High);
+    }
+
+    #[test]
+    fn effective_risk_requires_vouch_that_covers_the_report() {
+        // No vouch: a self-reported "low"/"medium" stays High — the default.
+        assert_eq!(effective_risk(None, RiskLevel::Low), RiskLevel::High);
+        assert_eq!(effective_risk(None, RiskLevel::Medium), RiskLevel::High);
+        // Vouch covers the report → honored.
+        assert_eq!(
+            effective_risk(Some(RiskLevel::Low), RiskLevel::Low),
+            RiskLevel::Low
+        );
+        assert_eq!(
+            effective_risk(Some(RiskLevel::Medium), RiskLevel::Low),
+            RiskLevel::Low
+        );
+        // Report exceeds the vouch → High (a @low vouch washes nothing).
+        assert_eq!(
+            effective_risk(Some(RiskLevel::Low), RiskLevel::Medium),
+            RiskLevel::High
+        );
+        assert_eq!(
+            effective_risk(Some(RiskLevel::Low), RiskLevel::High),
+            RiskLevel::High
+        );
+        // @high = trust the self-report wholesale.
+        assert_eq!(
+            effective_risk(Some(RiskLevel::High), RiskLevel::Low),
+            RiskLevel::Low
+        );
     }
 }

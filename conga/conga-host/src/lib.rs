@@ -36,10 +36,14 @@ pub mod tools;
 pub mod wire;
 
 pub use assembly::{gather_tools, resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
-pub use compact::{compact_by_count, max_messages_from_env, ContextBudget, DEFAULT_MAX_MESSAGES};
+pub use compact::{
+    compact_by_count, max_messages_from_env, Compacted, ContextBudget, DEFAULT_MAX_MESSAGES,
+};
 pub use config::{ConfigLoader, HostConfig, TurnInputs};
 pub use conga::RiskLevel;
-pub use external_tool::{commands_from_env, load_all as load_external_tools, ExternalToolBridge};
+pub use external_tool::{
+    commands_from_env, load_all as load_external_tools, ExternalCommand, ExternalToolBridge,
+};
 pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
@@ -355,7 +359,7 @@ impl Host {
         let settings = if self.stream_fn_overridden {
             crate::settings::EnvSettings::default()
         } else {
-            crate::settings::load_settings()
+            crate::settings::load_settings_async().await
         };
         let base_prompt = crate::prompt::with_custom_base_prompt(
             &self.system_prompt,
@@ -374,7 +378,12 @@ impl Host {
         // UI save reaches the very next LLM call (model id + stream_fn
         // together - a half-applied switch would be worse than none).
         let (turn_cfg, turn_stream_fn) = self.resolve_turn_provider(&settings);
-
+        // A saved `maxTokens` overrides the env-derived context window on
+        // the very next turn — the budget is per-turn state cloned above,
+        // so this never needs a restart. Absent = keep the env window.
+        if let Some(n) = settings.max_tokens {
+            budget.set_window(n);
+        }
         let (context, mut config) = turn_cfg.prepare_turn(
             TurnInputs {
                 system_prompt: &turn_prompt,
@@ -390,7 +399,10 @@ impl Host {
             Some(self.session.persist_fn()),
         );
         config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
-            Ok(budget.compact(msgs))
+            let view = budget.compact(msgs);
+            // The under-budget path borrows the accumulator: this clone
+            // only runs when compaction actually dropped something.
+            Ok(view.into_owned())
         }));
         config.steer = Some(self.steer.clone());
 
@@ -574,6 +586,7 @@ mod tests {
             }),
             fast_llm: None,
             system_prompt: None,
+            max_tokens: None,
         };
         // No injection → settings win (provider + stream_fn swapped).
         let (cfg, _) = make_host(false).resolve_turn_provider(&settings);

@@ -47,14 +47,24 @@ fn err_response(e: &SessionApiError) -> Response {
 }
 
 /// Context occupancy for the frontend (see `conga_host::wire::context_stats`
-/// for the shape). Reads the live connection's counters when present.
+/// for the shape). Reads the live connection's counters when present; the
+/// window knob is the settings/env-resolved `effective_max_tokens()`
+/// (settings.json `maxTokens` > `CONGA_CONTEXT_WINDOW` > 128k).
 async fn stats_of(state: &AppState, key: &str) -> Value {
+    let max_tokens = conga_host::settings::effective_max_tokens();
     match state.sessions.get(key) {
         Some(s) => {
             let s = s.lock().await;
-            conga_host::wire::context_stats(s.last_input_tokens, s.usage_in, s.usage_out)
+            conga_host::wire::context_stats(
+                s.last_input_tokens,
+                s.usage_in,
+                s.usage_out,
+                s.cache_read,
+                s.cache_write,
+                max_tokens,
+            )
         }
-        None => conga_host::wire::context_stats(0, 0, 0),
+        None => conga_host::wire::context_stats(0, 0, 0, 0, 0, max_tokens),
     }
 }
 
@@ -230,6 +240,7 @@ mod tests {
             sessions: DashMap::new(),
             store_root: root.clone(),
             index_db: root.join("index.db"),
+            auth_token: std::sync::Arc::new("test-token".to_string()),
         })
     }
 
@@ -405,5 +416,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Token auth middleware ─────────────────────────────────
+
+    fn authed_router(state: Arc<AppState>) -> Router {
+        let for_middleware = state.clone();
+        Router::new()
+            .route("/api/sessions", get(list_sessions))
+            // Stands in for the static SPA fallback: non-/api, non-/ws
+            // paths must pass without a token.
+            .route("/ping", get(|| async { "pong" }))
+            .layer(axum::middleware::from_fn_with_state(
+                for_middleware,
+                crate::auth::require_token,
+            ))
+            .with_state(state)
+    }
+
+    fn authed_state(root: std::path::PathBuf, token: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            sessions: DashMap::new(),
+            store_root: root.clone(),
+            index_db: root.join("index.db"),
+            auth_token: std::sync::Arc::new(token.to_string()),
+        })
+    }
+    #[tokio::test]
+    async fn api_without_token_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
+        let res = app.oneshot(get_uri("/api/sessions")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_with_wrong_token_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
+        let req = Request::builder()
+            .uri("/api/sessions")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_with_bearer_token_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
+        let req = Request::builder()
+            .uri("/api/sessions")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_with_query_token_passes() {
+        // Browser WebSocket cannot set headers; ?token= must work.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
+        let res = app
+            .oneshot(get_uri("/api/sessions?token=secret"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_api_path_passes_without_token() {
+        // Static SPA assets are exempt: the app must load before the user
+        // can enter the token.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
+        let res = app.oneshot(get_uri("/ping")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

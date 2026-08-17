@@ -59,6 +59,23 @@ pub(crate) async fn ws_handler(
         .filter(|s| conga::is_valid_session_id(s))
         .cloned()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // One live connection per session id: a second client reusing the id
+    // would clobber the session map entry (the first connection's cleanup
+    // would then remove/kill the second's resources, e.g. its persistent
+    // shell). Reject instead — the entry is removed on disconnect, so a
+    // prompt reconnect still works. (TOCTOU between two simultaneous
+    // upgrades remains, but the sequential double-connect is the case that
+    // corrupted state.)
+    if state.sessions.contains_key(&session_id) {
+        warn!("ws upgrade rejected: session {session_id} already connected");
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": format!("session already connected: {session_id}")
+            })),
+        )
+            .into_response();
+    }
     info!("ws upgrade: session={session_id}");
     ws.on_upgrade(move |socket| handle_ws(socket, state, session_id))
 }
@@ -69,10 +86,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         sender: ws_tx,
         usage_in: 0,
         usage_out: 0,
+        cache_read: 0,
+        cache_write: 0,
         last_input_tokens: 0,
         turn_start: None,
     }));
-    state.sessions.insert(session_id.clone(), session.clone());
 
     // ── Single ordered wire channel ──────────────────────────
     // All outbound events (main agent stream, subagent events, approval
@@ -95,11 +113,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         tool_names.insert(tool_call_id.clone(), tool_name.clone());
                     }
                     // Accumulate provider-reported usage for the context API.
+                    // Unreported cache breakdown (None) contributes 0.
                     if let AgentEvent::AfterProviderResponse { response, .. } = &event {
                         if let Some(u) = &response.usage {
                             let mut s = wire_session.lock().await;
                             s.usage_in += u.input_tokens;
                             s.usage_out += u.output_tokens;
+                            s.cache_read += u.cache_read_tokens.unwrap_or(0);
+                            s.cache_write += u.cache_write_tokens.unwrap_or(0);
                             s.last_input_tokens = u.input_tokens;
                         }
                     }
@@ -110,6 +131,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     if let conga_host::SubagentEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read,
+                        cache_write,
                     } = ev
                     {
                         // Sub-agent provider usage counts toward the session's
@@ -119,6 +142,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         let mut s = wire_session.lock().await;
                         s.usage_in += input_tokens;
                         s.usage_out += output_tokens;
+                        s.cache_read += cache_read;
+                        s.cache_write += cache_write;
                         None
                     } else {
                         conga_host::event_map::subagent_event_to_ws(&ev)
@@ -153,7 +178,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                         .map(|t| t.elapsed().as_millis() as u64)
                         .unwrap_or(0);
                     let ev = if elapsed_ms > 0 {
-                        OutgoingEvent::done_with_summary(s.usage_in, s.usage_out, elapsed_ms)
+                        OutgoingEvent::done_with_summary(
+                            s.usage_in,
+                            s.usage_out,
+                            s.cache_read,
+                            s.cache_write,
+                            elapsed_ms,
+                        )
                     } else {
                         OutgoingEvent::done()
                     };
@@ -286,6 +317,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                     let mut s = session.lock().await;
                                     s.usage_in = 0;
                                     s.usage_out = 0;
+                                    s.cache_read = 0;
+                                    s.cache_write = 0;
                                     s.last_input_tokens = 0;
                                     Some(OutgoingEvent::content("(session cleared)".to_string()))
                                 }

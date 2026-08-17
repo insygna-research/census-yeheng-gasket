@@ -29,20 +29,18 @@ const hasThinking = computed(() => !!props.message.thinking);
 const hasTools = computed(() => (props.message.toolCalls?.length || 0) > 0);
 const hasSubagents = computed(() => (props.subagents?.length || 0) > 0);
 
-// Auto-expand when subagents are active so users see real-time progress
-watch(
-  () => props.subagents,
-  (subagents) => {
-    if (
-      subagents &&
-      subagents.length > 0 &&
-      (props.subagentPhase === 'running' || props.subagentPhase === 'synthesizing')
-    ) {
-      expanded.value = true;
-    }
-  },
-  { immediate: true, deep: true }
+// Auto-expand when subagents are active so users see real-time progress.
+// Keyed explicitly on what the decision reads (any subagent exists + live
+// phase) — the previous deep watcher re-traversed every nested timeline/
+// tool mutation on each streaming event only to re-evaluate this.
+const hasActiveSubagents = computed(
+  () =>
+    (props.subagents?.length || 0) > 0 &&
+    (props.subagentPhase === 'running' || props.subagentPhase === 'synthesizing')
 );
+watch(hasActiveSubagents, active => {
+  if (active) expanded.value = true;
+}, { immediate: true });
 const runningToolCount = computed(() => props.message.toolCalls?.filter(t => t.status === 'running').length || 0);
 const completedToolCount = computed(() => props.message.toolCalls?.filter(t => t.status === 'complete').length || 0);
 const errorToolCount = computed(() => props.message.toolCalls?.filter(t => t.status === 'error').length || 0);

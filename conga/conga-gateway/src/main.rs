@@ -50,6 +50,7 @@ use crate::state::AppState;
 use crate::ws::ws_handler;
 
 mod api;
+mod auth;
 mod state;
 mod wire;
 mod ws;
@@ -61,10 +62,21 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let _ = dotenvy::dotenv();
 
+    let (auth_token, token_source) = match auth::load_or_create_token() {
+        Ok((t, src)) => (Arc::new(t), src),
+        Err(e) => {
+            eprintln!("conga-gateway: cannot establish auth token: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Never log the token value itself — only where it came from.
+    info!("gateway auth: token required for /ws and /api/* (source: {token_source})");
+
     let state = Arc::new(AppState {
         sessions: DashMap::new(),
         store_root: conga::JsonlStorage::default_root().base_dir_clone(),
         index_db: conga::storage::config_dir().join("index.db"),
+        auth_token,
     });
     let frontend_dist =
         std::env::var("CONGA_GATEWAY_STATIC_DIR").unwrap_or_else(|_| "../web/dist".to_string());
@@ -85,6 +97,10 @@ async fn main() {
                 tower_http::services::ServeFile::new(format!("{frontend_dist}/index.html")),
             ),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_token,
+        ))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
 

@@ -22,6 +22,7 @@ export const storageKeys = {
   sidebarWidth: 'conga_sidebar_width',
   sidebarCollapsed: 'conga_sidebar_collapsed',
   proxy: 'conga_proxy',
+  gatewayToken: 'conga_gateway_token',
 } as const;
 
 const memory = new Map<string, string>();

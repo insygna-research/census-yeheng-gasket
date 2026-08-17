@@ -16,7 +16,7 @@ use serde_json::json;
 
 use super::collect_text;
 use crate::types::context::{ModelSpec, StreamChunk, StreamFn};
-use crate::types::message::{AgentMessage, ContentBlock};
+use crate::types::message::{AgentMessage, ContentBlock, StopReason};
 use crate::types::tool::ToolDefinition;
 
 /// OpenAI-compatible chat completions provider.
@@ -223,7 +223,37 @@ pub(crate) fn parse_openai_chunk(json_str: &str) -> Vec<StreamChunk> {
             .get("completion_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        chunks.push(StreamChunk::Usage { input, output });
+        // Cached prompt tokens live under `prompt_tokens_details.cached_tokens`;
+        // the details object and the field are both optional (absent → 0).
+        let cache_read = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        chunks.push(StreamChunk::Usage {
+            input,
+            output,
+            cache_read,
+            cache_write: 0,
+        });
+    }
+
+    // Stop signal: the terminal chunk carries `finish_reason` at the choice
+    // level (next to an empty delta). `length` (token cap) and
+    // `content_filter` mean the output was cut short — surfaced as MaxTokens
+    // so the loop discards partial tool calls instead of executing them with
+    // malformed arguments. `stop` maps to EndTurn; `tool_calls` needs no
+    // explicit signal (the loop infers ToolUse from content) but is mapped
+    // for completeness so the provider's word always wins.
+    if let Some(reason) = v
+        .pointer("/choices/0/finish_reason")
+        .and_then(|r| r.as_str())
+    {
+        let stop = match reason {
+            "length" | "content_filter" => StopReason::MaxTokens,
+            "tool_calls" => StopReason::ToolUse,
+            _ => StopReason::EndTurn,
+        };
+        chunks.push(StreamChunk::Stop(stop));
     }
 
     let delta = match v.pointer("/choices/0/delta") {
@@ -332,7 +362,6 @@ mod tests {
                 id: "test".into(),
                 api: ProviderApi::OpenAiCompat,
                 max_tokens: 16,
-                supports_thinking: false,
             };
             let mut stream = provider.stream(&model, &[], "", &[], None);
 
@@ -439,7 +468,38 @@ mod tests {
                 chunks,
                 vec![StreamChunk::Usage {
                     input: 10,
-                    output: 5
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0
+                }]
+            );
+        }
+
+        #[test]
+        fn parses_usage_cached_tokens() {
+            // OpenAI reports prompt-cache hits under
+            // `usage.prompt_tokens_details.cached_tokens`. The details
+            // object is optional and may be absent entirely.
+            let with = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5,
+                "prompt_tokens_details":{"cached_tokens":6}}}"#;
+            assert_eq!(
+                parse_openai_chunk(with),
+                vec![StreamChunk::Usage {
+                    input: 10,
+                    output: 5,
+                    cache_read: 6,
+                    cache_write: 0
+                }]
+            );
+            let empty_details = r#"{"usage":{"prompt_tokens":10,"completion_tokens":5,
+                "prompt_tokens_details":{}}}"#;
+            assert_eq!(
+                parse_openai_chunk(empty_details),
+                vec![StreamChunk::Usage {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0
                 }]
             );
         }
@@ -495,6 +555,42 @@ mod tests {
             assert_eq!(
                 chunks,
                 vec![StreamChunk::ThinkingDelta("thinking...".into())]
+            );
+        }
+
+        #[test]
+        fn parses_finish_reason_length_as_max_tokens() {
+            // The terminal chunk carries finish_reason next to an empty
+            // delta; `length` means the output was cut short by the token
+            // cap. Without this the loop would classify a mid-tool-call
+            // truncation as ToolUse and execute it with malformed args.
+            let json = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#;
+            assert_eq!(
+                parse_openai_chunk(json),
+                vec![StreamChunk::Stop(StopReason::MaxTokens)]
+            );
+        }
+
+        #[test]
+        fn parses_finish_reason_content_filter_as_max_tokens() {
+            let json = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#;
+            assert_eq!(
+                parse_openai_chunk(json),
+                vec![StreamChunk::Stop(StopReason::MaxTokens)]
+            );
+        }
+
+        #[test]
+        fn parses_finish_reason_stop_and_tool_calls() {
+            let stop = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+            assert_eq!(
+                parse_openai_chunk(stop),
+                vec![StreamChunk::Stop(StopReason::EndTurn)]
+            );
+            let tools = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+            assert_eq!(
+                parse_openai_chunk(tools),
+                vec![StreamChunk::Stop(StopReason::ToolUse)]
             );
         }
     }

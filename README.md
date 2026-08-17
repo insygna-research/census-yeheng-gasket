@@ -72,10 +72,7 @@ All backend config is via environment variables + `conga/.env`. See [`.env.examp
 
 Key groups:
 - **LLM connection** (required): `CONGA_LLM_BASE_URL` / `CONGA_LLM_KEY` / `CONGA_LLM_MODEL` / `CONGA_LLM_API`
-- **Gateway**: `CONGA_GATEWAY_PORT` (3000) / `CONGA_GATEWAY_MODE` / `CONGA_GATEWAY_STATIC_DIR`
-- **Compaction**: `CONGA_CONTEXT_WINDOW` / `CONGA_COMPACT_THRESHOLD_PCT` / `CONGA_COMPACT_TARGET_PCT`
-- **MCP**: `~/.conga/mcp.json` (or `CONGA_MCP_CONFIG`)
-- **Loop tunables**: `CONGA_MAX_TURNS` / `CONGA_MAX_TOOL_CALLS` / `CONGA_THINKING` / retry policy
+- **Gateway**: `CONGA_GATEWAY_PORT` (3000) / `CONGA_GATEWAY_MODE` / `CONGA_GATEWAY_STATIC_DIR` / `CONGA_GATEWAY_TOKEN` (auth for `/ws` + `/api/*`)
 
 ## Docker
 
@@ -86,9 +83,12 @@ docker run -d -p 3000:3000 \
   -e CONGA_LLM_KEY=sk-... \
   -e CONGA_LLM_MODEL=deepseek-chat \
   -e CONGA_LLM_API=openai \
+  -e CONGA_GATEWAY_TOKEN=change-me \
   --name conga conga:latest
-# Visit http://localhost:3000/
+# Visit http://localhost:3000/ and enter the token in Settings → Connection.
 ```
+
+All `/ws` and `/api/*` requests require the gateway token (`Authorization: Bearer <t>` or `?token=<t>`); static assets are exempt. Without `CONGA_GATEWAY_TOKEN`, a random token is generated on first start and stored in `~/.conga/gateway_token` (0600). The desktop app uses in-process IPC and needs no token.
 
 ## Development
 

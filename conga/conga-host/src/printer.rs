@@ -43,10 +43,20 @@ impl<W: Write> EventPrinter<W> {
             }
             AgentEvent::AfterProviderResponse { response, .. } => {
                 if let Some(u) = &response.usage {
+                    // Cache segment only when the provider reported cache
+                    // tokens (read↔write); most OpenAI-compat providers
+                    // report none — keep their line unchanged.
+                    let cr = u.cache_read_tokens.unwrap_or(0);
+                    let cw = u.cache_write_tokens.unwrap_or(0);
+                    let cache = if cr > 0 || cw > 0 {
+                        format!(", cache: {cr}↔{cw}")
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         self.out,
-                        "\n[in: {}, out: {}]",
-                        u.input_tokens, u.output_tokens
+                        "\n[in: {}, out: {}{}]",
+                        u.input_tokens, u.output_tokens, cache
                     );
                 }
             }
@@ -112,6 +122,8 @@ mod tests {
         msg.usage = Some(conga::types::message::Usage {
             input_tokens: 42,
             output_tokens: 7,
+            cache_read_tokens: Some(100),
+            cache_write_tokens: Some(50),
         });
         let _ = msg.stop_reason;
         p.on_event(&AgentEvent::AfterProviderResponse {
@@ -119,6 +131,30 @@ mod tests {
             response: msg,
         });
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("in: 42") && s.contains("out: 7"));
+        assert!(
+            s.contains("[in: 42, out: 7, cache: 100↔50]"),
+            "cache-reported usage line: {s:?}"
+        );
+
+        // No cache breakdown (None/0) -> the classic two-field line.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        let mut msg = AssistantMessage::new(&model);
+        msg.usage = Some(conga::types::message::Usage {
+            input_tokens: 42,
+            output_tokens: 7,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        });
+        let _ = msg.stop_reason;
+        p.on_event(&AgentEvent::AfterProviderResponse {
+            model: "m".into(),
+            response: msg,
+        });
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("[in: 42, out: 7]") && !s.contains("cache"),
+            "cache must be omitted when unreported: {s:?}"
+        );
     }
 }

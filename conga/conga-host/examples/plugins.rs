@@ -9,7 +9,7 @@ use std::sync::Arc;
 use conga::extension::ExtensionApiImpl;
 use conga::{
     AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, ModelSpec, ProviderApi, StreamChunk,
-    StreamFn, ThinkingLevel, UserMessage,
+    StreamFn, UserMessage,
 };
 use futures_util::Stream;
 
@@ -40,11 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             id: "mock".into(),
             api: ProviderApi::OpenAiCompat,
             max_tokens: 256,
-            supports_thinking: false,
         },
-        thinking_level: ThinkingLevel::Off,
         max_turns: 5,
         max_tool_calls_per_turn: 5,
+        tool_timeout: None,
         signal: None,
         stream_fn: Arc::new(MockThatCallsHello),
         hooks: Some(Arc::new(api)),

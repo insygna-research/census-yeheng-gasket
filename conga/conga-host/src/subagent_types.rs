@@ -79,11 +79,14 @@ pub enum SubagentEvent {
     },
     Synthesizing,
     /// Provider-reported token usage from a sub-agent's LLM calls. Never
-    /// forwarded to the frontend — the gateway accumulates it into the
-    /// session's usage counters.
+    /// forwarded to the frontend — the gateway/desktop accumulates it into
+    /// the session's usage counters. Cache fields mirror the core `Usage`:
+    /// 0 = the provider did not report a cache breakdown.
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        cache_read: u64,
+        cache_write: u64,
     },
 }
 

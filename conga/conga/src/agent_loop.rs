@@ -1,10 +1,11 @@
 //! The agent loop — single outer loop: LLM call → tool calls → repeat.
 
+use std::future::Future;
 use std::pin::Pin;
 
 use futures_util::StreamExt;
 
-use crate::error::AgentError;
+use crate::error::{AgentError, ToolError};
 use crate::types::context::{AgentContext, AgentLoopConfig, RetryPolicy, StreamChunk};
 use crate::types::event::{AgentEvent, ContentDelta};
 use crate::types::message::{
@@ -12,7 +13,7 @@ use crate::types::message::{
     UserMessage,
 };
 use crate::types::session_event::SessionEvent;
-use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext};
+use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolResult};
 
 /// Run the agent loop to completion.
 ///
@@ -379,7 +380,11 @@ where
     }
 
     // ---- Phase 2: concurrent dispatch (Start events stay in order) ----
-    let mut futures = Vec::new();
+    // `tool_timeout` is the engine-level safety net: a tool whose Future
+    // never resolves (wedged MCP server, deadlocked plugin) is cut off and
+    // reported as an error result instead of hanging the whole loop. Tools
+    type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send>>;
+    let mut futures: Vec<ToolFuture> = Vec::new();
     for slot in &slots {
         if let Slot::Ready {
             tc, execute, args, ..
@@ -391,7 +396,7 @@ where
                 args: args.clone(),
             });
             tracing::info!(tool = %tc.function.name, "tool execute");
-            futures.push((execute.clone())(ToolCallCtx {
+            let fut = (execute.clone())(ToolCallCtx {
                 tool_call_id: tc.id.clone(),
                 args: args.clone(),
                 signal: config.signal.as_ref().map(|s| s.flag()).unwrap_or_default(),
@@ -399,9 +404,24 @@ where
                     cwd: context.cwd.clone(),
                     env: context.env.clone(),
                     session_id: context.session_id.clone(),
-                    state_dir: tool_state_dir(context, &tc.function.name),
+                    // Invalid session id (would escape the state root): fall
+                    // back to a scratch temp dir, never a path outside it.
+                    state_dir: tool_state_dir(context, &tc.function.name)
+                        .unwrap_or_else(std::env::temp_dir),
                 },
-            }));
+            });
+            futures.push(match config.tool_timeout {
+                Some(limit) => Box::pin(async move {
+                    match tokio::time::timeout(limit, fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(ToolError::Message(format!(
+                            "tool execution timed out after {}s",
+                            limit.as_secs()
+                        ))),
+                    }
+                }),
+                None => fut,
+            });
         }
     }
     let raws = futures_util::future::join_all(futures).await;
@@ -470,11 +490,23 @@ where
 
 /// Default per-tool state directory:
 /// `<config_dir>/tool_state/<session_id>/<tool_name>/`.
-fn tool_state_dir(context: &AgentContext, tool_name: &str) -> std::path::PathBuf {
-    crate::storage::config_dir()
-        .join("tool_state")
-        .join(&context.session_id)
-        .join(tool_name)
+///
+/// The session id is validated before interpolation: an id that could
+/// escape the root (`../`, separators, empty) gets no state dir at all
+/// rather than a directory outside it. Note this uses the global
+/// [`crate::storage::config_dir`] — a host-injected custom storage root is
+/// not threaded into `AgentContext`, so state stays under the default root.
+fn tool_state_dir(context: &AgentContext, tool_name: &str) -> Option<std::path::PathBuf> {
+    if !crate::storage::is_valid_session_id(&context.session_id) {
+        tracing::warn!(session = %context.session_id, "invalid session id; tool state dir skipped");
+        return None;
+    }
+    Some(
+        crate::storage::config_dir()
+            .join("tool_state")
+            .join(&context.session_id)
+            .join(tool_name),
+    )
 }
 
 /// Stream one assistant response from the LLM, accumulating into an
@@ -607,14 +639,22 @@ where
 
     let mut accumulated = AssistantMessage::new(&config.model.id);
     let mut usage = None;
+    // Raw cache-token totals for this step. Kept separate from `usage`
+    // (whose cache fields are Option) and normalized below: 0 total means
+    // the provider never reported cache tokens → None ("absent = unknown",
+    // matching old logs that predate these fields).
+    let mut cache_read_total: u64 = 0;
+    let mut cache_write_total: u64 = 0;
     let mut emitted_content = false;
+    // Provider-reported stop reason, when the stream carried one
+    // (StreamChunk::Stop). Overrides the content-based guess below.
+    let mut provider_stop: Option<StopReason> = None;
 
     while let Some(chunk) = stream.next().await {
         // Cooperative abort: stop accumulating as soon as the signal is set.
         if is_aborted(config) {
             tracing::info!("provider stream aborted");
             accumulated.stop_reason = StopReason::Aborted;
-            break;
         }
         match chunk {
             StreamChunk::TextDelta(t) => {
@@ -647,18 +687,33 @@ where
                     delta: ContentDelta::ThinkingDelta(t),
                 });
             }
-            StreamChunk::Usage { input, output } => {
+            StreamChunk::Usage {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            } => {
                 // Merge, don't overwrite: Anthropic sends input tokens in
                 // `message_start` and output tokens in `message_delta` as two
                 // separate Usage chunks. Overwriting would zero input on the
                 // second. Both OpenAI (one combined chunk) and Anthropic
-                // (complementary partials) sum correctly.
-                let u = usage.get_or_insert(crate::types::message::Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
+                // (complementary partials) sum correctly. Cache counters sum
+                // the same way.
+                let u = usage.get_or_insert(crate::types::message::Usage::default());
                 u.input_tokens += input;
                 u.output_tokens += output;
+                cache_read_total += cache_read;
+                cache_write_total += cache_write;
+            }
+            StreamChunk::Stop(reason) => {
+                // Provider-reported stop signal (OpenAI `finish_reason`,
+                // Anthropic `message_delta.stop_reason`). Remembered and
+                // applied after the loop: it wins over the content-based
+                // guess below, so a length-truncated response that died
+                // mid-tool-call classifies as MaxTokens instead of ToolUse
+                // with malformed arguments. An explicit stop never counts
+                // as "content emitted" on its own.
+                provider_stop = Some(reason);
             }
             StreamChunk::Done => break,
             StreamChunk::Error(e) => {
@@ -678,6 +733,8 @@ where
     if accumulated.stop_reason != StopReason::Aborted {
         accumulated.stop_reason = if is_aborted(config) {
             StopReason::Aborted
+        } else if let Some(reason) = provider_stop {
+            reason
         } else if accumulated
             .content
             .iter()
@@ -689,6 +746,10 @@ where
         };
     }
 
+    if let Some(u) = usage.as_mut() {
+        u.cache_read_tokens = (cache_read_total > 0).then_some(cache_read_total);
+        u.cache_write_tokens = (cache_write_total > 0).then_some(cache_write_total);
+    }
     accumulated.usage = usage;
     StreamAttempt::Done(accumulated)
 }
@@ -731,7 +792,6 @@ mod tests {
     use crate::types::tool::ToolDefinition;
     use crate::ExtensionApi;
     use crate::StreamFn;
-    use crate::ThinkingLevel;
     use futures_util::stream;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -759,11 +819,10 @@ mod tests {
                 id: "test".into(),
                 api: ProviderApi::OpenAiCompat,
                 max_tokens: 1024,
-                supports_thinking: false,
             },
-            thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
+            tool_timeout: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
             hooks: None,
@@ -783,6 +842,8 @@ mod tests {
             StreamChunk::Usage {
                 input: 3,
                 output: 2,
+                cache_read: 0,
+                cache_write: 0,
             },
             StreamChunk::Done,
         ]);
@@ -940,6 +1001,81 @@ mod tests {
         assert!(
             !split,
             "chunked args leaked into a split empty-name tool call"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_tool_times_out_and_loop_continues() {
+        // A tool whose Future never resolves must not wedge the loop: with
+        // `tool_timeout` set, the engine cuts it off, records an error
+        // tool_result (event + persist), and the run finishes normally.
+        let hung = crate::types::tool::ToolDefinition {
+            name: "hang".into(),
+            label: "Hang".into(),
+            description: "never resolves".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| Box::pin(std::future::pending())),
+        };
+        let mut config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t-hang".into(),
+                name: Some("hang".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        config.tool_timeout = Some(std::time::Duration::from_millis(50));
+
+        let persisted = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let persist_sink = Arc::clone(&persisted);
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            if matches!(ev, SessionEvent::ToolResult(_)) {
+                persist_sink.lock().unwrap().push("tool_result");
+            }
+            Ok(())
+        }));
+
+        let mut saw_timeout_end = false;
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![hung],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s-hang".into(),
+        };
+        let msgs = run_agent_loop(vec![], context, config, |ev| {
+            if let AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } = ev
+            {
+                if is_error
+                    && result.tool_name == "hang"
+                    && result.content.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text.contains("timed out")),
+                    )
+                {
+                    saw_timeout_end = true;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            saw_timeout_end,
+            "timeout must surface as an error ToolExecutionEnd"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(m, AgentMessage::ToolResult(tr)
+                if tr.tool_name == "hang" && tr.is_error)),
+            "the loop must record an error tool_result for the hung tool"
+        );
+        assert!(
+            !persisted.lock().unwrap().is_empty(),
+            "the timeout tool_result must be persisted"
         );
     }
 
@@ -1265,11 +1401,10 @@ mod tests {
                 id: "test".into(),
                 api: ProviderApi::OpenAiCompat,
                 max_tokens: 1024,
-                supports_thinking: false,
             },
-            thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
+            tool_timeout: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
@@ -1329,11 +1464,10 @@ mod tests {
                 id: "test".into(),
                 api: ProviderApi::OpenAiCompat,
                 max_tokens: 1024,
-                supports_thinking: false,
             },
-            thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
+            tool_timeout: None,
             signal: None,
             stream_fn: std::sync::Arc::new(MockStream(vec![
                 StreamChunk::ToolCallDelta {
@@ -1541,11 +1675,10 @@ mod tests {
                 id: "test".into(),
                 api: ProviderApi::OpenAiCompat,
                 max_tokens: 1024,
-                supports_thinking: false,
             },
-            thinking_level: ThinkingLevel::Off,
             max_turns: 5,
             max_tool_calls_per_turn: 5,
+            tool_timeout: None,
             signal: Some(crate::CancelSignal::new()),
             stream_fn: std::sync::Arc::new(FlipOnStream),
             hooks: None,
@@ -2038,10 +2171,14 @@ mod tests {
             StreamChunk::Usage {
                 input: 42,
                 output: 0,
+                cache_read: 100,
+                cache_write: 50,
             },
             StreamChunk::Usage {
                 input: 0,
                 output: 7,
+                cache_read: 0,
+                cache_write: 0,
             },
             StreamChunk::Done,
         ]);
@@ -2058,9 +2195,49 @@ mod tests {
             .unwrap();
         let merged = msgs.iter().any(|m| {
             matches!(m, AgentMessage::Assistant(a)
-                if a.usage.as_ref().is_some_and(|u| u.input_tokens == 42 && u.output_tokens == 7))
+                if a.usage.as_ref().is_some_and(|u|
+                    u.input_tokens == 42
+                        && u.output_tokens == 7
+                        && u.cache_read_tokens == Some(100)
+                        && u.cache_write_tokens == Some(50)))
         });
-        assert!(merged, "usage must merge input+output across chunks");
+        assert!(
+            merged,
+            "usage must merge input+output+cache fields across chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_cache_zero_reports_none() {
+        // Zero cache totals mean "provider didn't report cache stats";
+        // the persisted Usage must keep None (absent = unknown) rather
+        // than Some(0), matching old-log semantics.
+        let config = test_config(vec![
+            StreamChunk::Usage {
+                input: 42,
+                output: 7,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            StreamChunk::Done,
+        ]);
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        };
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+        let none = msgs.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant(a)
+                if a.usage.as_ref().is_some_and(|u|
+                    u.cache_read_tokens.is_none() && u.cache_write_tokens.is_none()))
+        });
+        assert!(none, "unreported cache tokens must persist as None");
     }
 
     /// Test stream that must never be polled: the pre-set abort has to stop
@@ -2141,6 +2318,8 @@ mod tests {
             StreamChunk::Usage {
                 input: 5,
                 output: 3,
+                cache_read: 0,
+                cache_write: 0,
             },
             StreamChunk::Done,
         ]);
@@ -2180,6 +2359,8 @@ mod tests {
                     &Some(crate::types::message::Usage {
                         input_tokens: 5,
                         output_tokens: 3,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
                     }),
                     "persisted Assistant must carry this step's usage"
                 );
@@ -2269,6 +2450,158 @@ mod tests {
                 if tr.tool_name == "bash" && tr.is_error
                 && tr.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "blocked by policy"))),
             "a blocked call must still persist its is_error ToolResult"
+        );
+    }
+
+    #[test]
+    fn tool_state_dir_rejects_traversal_session_ids() {
+        // A session id that could escape the state root (`../`, separators,
+        // empty) must yield NO directory, never one outside the root.
+        let mk = |id: &str| AgentContext {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: vec![],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: id.into(),
+        };
+        for bad in ["../escape", "a/b", "..", "", "a\\b", "."] {
+            assert!(
+                tool_state_dir(&mk(bad), "t").is_none(),
+                "session id {bad:?} must be rejected"
+            );
+        }
+        // A valid id stays under <config_dir>/tool_state.
+        let dir = tool_state_dir(&mk("s-1_ok"), "t").unwrap();
+        assert_eq!(
+            dir,
+            crate::storage::config_dir()
+                .join("tool_state")
+                .join("s-1_ok")
+                .join("t")
+        );
+    }
+
+    /// A mock that replays a different chunk script per LLM call (turn 1
+    /// truncates, turn 2 recovers), sharing a call counter (`StreamFn` is
+    /// `&self`).
+    struct ScriptedStream {
+        scripts: Vec<Vec<StreamChunk>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl StreamFn for ScriptedStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[crate::types::tool::ToolDefinition],
+            _signal: Option<crate::CancelSignal>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.scripts.get(n) {
+                Some(script) => Box::pin(stream::iter(script.clone())),
+                None => Box::pin(stream::iter(vec![StreamChunk::Done])),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_truncation_skips_tool_execution() {
+        // OpenAI `finish_reason: "length"` shape: a tool call cut off
+        // mid-arguments (malformed JSON) plus the Stop chunk. Without the
+        // stop signal the loop would misclassify this as ToolUse and feed
+        // the model a bogus malformed-args error; with it the turn ends as
+        // MaxTokens and every partial call is discarded unread.
+        let executed: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let exec_sink = executed.clone();
+        let echo = crate::types::tool::ToolDefinition {
+            name: "echo".into(),
+            label: "Echo".into(),
+            description: "echo args".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(move |c: ToolCallCtx| {
+                let sink = exec_sink.clone();
+                Box::pin(async move {
+                    sink.lock().push(c.args.to_string());
+                    Ok(crate::types::tool::ToolResult::text("ran"))
+                })
+            }),
+        };
+        let mut config = test_config(vec![]);
+        config.stream_fn = Arc::new(ScriptedStream {
+            scripts: vec![
+                vec![
+                    StreamChunk::ToolCallDelta {
+                        index: Some(0),
+                        id: "t1".into(),
+                        name: Some("echo".into()),
+                        args_delta: "{\"x\":".into(), // truncated mid-JSON
+                    },
+                    StreamChunk::Stop(StopReason::MaxTokens),
+                    StreamChunk::Done,
+                ],
+                vec![
+                    StreamChunk::TextDelta("recovered".into()),
+                    StreamChunk::Done,
+                ],
+            ],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        config.max_turns = 2;
+        let context = AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![echo],
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s-trunc".into(),
+        };
+
+        let msgs = run_agent_loop(vec![], context, config, |_| {})
+            .await
+            .unwrap();
+
+        // The truncated assistant message classifies as MaxTokens...
+        let truncated = msgs.iter().find_map(|m| match m {
+            AgentMessage::Assistant(a) if a.stop_reason == StopReason::MaxTokens => Some(a.clone()),
+            _ => None,
+        });
+        let truncated = truncated.expect("an assistant message with stop_reason MaxTokens");
+        assert!(
+            truncated
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolCall { .. })),
+            "fixture streams a partial tool call"
+        );
+        // ...and the tool NEVER executes (no malformed-args execution path).
+        assert!(
+            executed.lock().is_empty(),
+            "truncated tool call must not execute"
+        );
+        // Instead every partial call gets an is_error discard result.
+        let discarded: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(tr) if tr.tool_name == "echo" => Some(tr.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        assert!(discarded[0].is_error);
+        assert!(
+            discarded[0].content.iter().any(|b| matches!(b,
+                ContentBlock::Text { text } if text.contains("truncated"))),
+            "discard result explains the truncation"
+        );
+        // And the loop continues: the next turn's plain text ends the run.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AgentMessage::Assistant(a) if a
+                .content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "recovered")))),
+            "loop recovers on the next turn"
         );
     }
 }

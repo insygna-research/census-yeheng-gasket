@@ -23,7 +23,7 @@ interface ChatEventPayload {
 
 export function useTauriChat(
   chatId: Ref<string>,
-  onMessage: (data: string) => void
+  onMessage: (data: string, sessionId: string) => void
 ) {
   // The in-process channel has no connection lifecycle: it is "connected"
   // as soon as the listener is installed, and there is nothing to reconnect.
@@ -36,8 +36,9 @@ export function useTauriChat(
     listen<ChatEventPayload>('chat-event', e => {
       // One broadcast channel carries every session; route by id. The
       // closure reads chatId lazily, so chat switches need no re-subscribe.
-      if (e.payload.session_id !== chatId.value) return;
-      onMessage(JSON.stringify(e.payload.event));
+      // The payload's session id (not chatId.value) tags the message so
+      // background sessions keep streaming into their own turn state.
+      onMessage(JSON.stringify(e.payload.event), e.payload.session_id);
     })
       .then(u => {
         unlisten = u;
@@ -48,9 +49,13 @@ export function useTauriChat(
 
   /**
    * Accepts the same WS-shaped JSON strings the WebSocket transport sends
-   * and dispatches them to the matching Tauri command.
+   * and dispatches them to the matching Tauri command. `targetSessionId`
+   * routes session-scoped commands (message/cancel) to a specific session —
+   * defaults to the active chat, but a background turn's cancel must reach
+   * the session that owns it.
    */
-  const send = (data: string): boolean => {
+  const send = (data: string, targetSessionId?: string): boolean => {
+    const sessionId = targetSessionId ?? chatId.value;
     let msg: {
       type?: string;
       content?: string;
@@ -68,15 +73,15 @@ export function useTauriChat(
     const cmd =
       msg.type === 'message'
         ? invoke('send_message', {
-            sessionId: chatId.value,
+            sessionId,
             content: msg.content ?? '',
             traceId: msg.trace_id ?? null,
           })
         : msg.type === 'cancel'
-          ? invoke('cancel_turn', { sessionId: chatId.value })
+          ? invoke('cancel_turn', { sessionId })
           : msg.type === 'approval_response'
             ? invoke('approval_response', {
-                sessionId: chatId.value,
+                sessionId,
                 requestId: msg.request_id,
                 approved: !!msg.approved,
                 remember: !!msg.remember,
