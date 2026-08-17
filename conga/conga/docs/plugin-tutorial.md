@@ -36,6 +36,9 @@ let config = AgentLoopConfig {
 };
 ```
 
+For process-out hooks (external commands, Claude-compatible protocol) — see
+[hooks.md](hooks.md) — no Rust crate required; configure via `hooks.json`.
+
 Optional capabilities = optional **dependencies + features**, then recompile.
 That is the static-world substitute for a plugin marketplace.
 
