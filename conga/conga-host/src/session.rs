@@ -53,14 +53,27 @@ fn count_messages(raw: &str, is_events: bool) -> usize {
             if !is_events {
                 return count + 1;
             }
-            match serde_json::from_str::<SessionEvent>(line) {
-                Ok(SessionEvent::User(_))
-                | Ok(SessionEvent::Assistant { .. })
-                | Ok(SessionEvent::ToolResult(_)) => count + 1,
-                Ok(SessionEvent::Cleared) => 0,
+            match serde_json::from_str::<EventTypeProbe>(line)
+                .map(|p| p.kind)
+                .as_deref()
+            {
+                Ok("user" | "assistant" | "tool_result") => count + 1,
+                Ok("cleared") => 0,
                 _ => count,
             }
         })
+}
+
+/// Type-only probe for [`count_messages`]: counting rows must not
+/// materialize each row's full `SessionEvent` (a large session holds
+/// megabytes of tool output per row). serde skips unknown fields without
+/// allocating, so only the discriminant string is built. Unknown `type`
+/// values (a newer writer's variants) hit the catch-all arm — the same skip
+/// a full-parse failure produced.
+#[derive(serde::Deserialize)]
+struct EventTypeProbe {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 /// `msg_count` cache keys stored in the session's `meta.json` sidecar.
@@ -95,7 +108,11 @@ async fn write_msg_count_cache(meta_path: &std::path::Path, count: usize, events
             map.insert(META_MSG_COUNT.into(), count.into());
             map.insert(META_MSG_COUNT_BYTES.into(), events_len.into());
         }
-        let tmp = meta_path.with_extension("json.tmp");
+        // Unique tmp name: concurrent `list` self-heals of the same session
+        // must not write through one shared `meta.json.tmp`.
+        let mut tmp_os = meta_path.as_os_str().to_os_string();
+        tmp_os.push(format!(".{}.conga-tmp", uuid::Uuid::new_v4()));
+        let tmp = std::path::PathBuf::from(tmp_os);
         tokio::fs::write(&tmp, v.to_string()).await?;
         tokio::fs::rename(&tmp, meta_path).await?;
         Ok::<(), std::io::Error>(())

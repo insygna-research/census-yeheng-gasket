@@ -347,11 +347,11 @@ impl Host {
         repair_unanswered_tool_calls(&mut history);
 
         // Per-turn environment block: git status / diffstat drift as the
-        // session progresses. Built fresh each turn (blocking git calls
-        // are capped and timeout-guarded inside `env_snapshot`);
+        // session progresses. Built fresh each turn (async git subprocess
+        // calls are capped and timeout-guarded inside `env_snapshot`);
         // appended, never persisted - the static prompt in
         // `self.system_prompt` stays the durable part.
-        let snapshot = crate::prompt::env_snapshot(&self.cwd);
+        let snapshot = crate::prompt::env_snapshot(&self.cwd).await;
         // Per-turn settings: re-read the file every turn so a UI save
         // reaches the very next LLM call - both the provider AND the
         // custom base prompt (a half-applied switch would be worse than

@@ -133,14 +133,15 @@ fn find_project_doc(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
 /// The per-turn environment block: UTC date, platform, git status, and diff
 /// stat. Empty string when the directory is not a git repository (caller
 /// omits the block entirely) — non-git projects skip git entirely.
-pub fn env_snapshot(cwd: &Path) -> String {
+pub async fn env_snapshot(cwd: &Path) -> String {
     let date = utc_date();
     let status = git_output(
         cwd,
         &["status", "--porcelain"],
         MAX_STATUS_LINES,
         "status lines omitted",
-    );
+    )
+    .await;
     if status.is_none() {
         // Not a git repo (or git missing): date-only snapshot.
         return format!("Date (UTC): {date}\nPlatform: {}", std::env::consts::OS);
@@ -152,6 +153,7 @@ pub fn env_snapshot(cwd: &Path) -> String {
         MAX_DIFFSTAT_LINES,
         "diffstat lines omitted",
     )
+    .await
     .unwrap_or_default();
     let untracked_note = if status.lines().any(|l| l.starts_with("??")) {
         "\nUntracked files exist; inspect them before assuming a clean tree."
@@ -168,21 +170,25 @@ pub fn env_snapshot(cwd: &Path) -> String {
 }
 
 /// Run `git <args>` capped and timeout-guarded. `None` when the directory is
-/// not a git repository (or git is unavailable at all). The subprocess runs
-/// on a plain thread with a channel deadline so a wedged git cannot stall
-/// the async turn.
-fn git_output(cwd: &Path, args: &[&str], max_lines: usize, omit_note: &str) -> Option<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let cwd = cwd.to_path_buf();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&cwd)
-            .output();
-        let _ = tx.send(out);
-    });
-    let out = match rx.recv_timeout(GIT_TIMEOUT) {
+/// not a git repository (or git is unavailable at all). An async subprocess
+/// with a timeout future: a wedged git is killed on drop (`kill_on_drop`)
+/// instead of stalling — or thread-spawning for — the async turn.
+async fn git_output(
+    cwd: &Path,
+    args: &[&str],
+    max_lines: usize,
+    omit_note: &str,
+) -> Option<String> {
+    let out = tokio::time::timeout(
+        GIT_TIMEOUT,
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let out = match out {
         Ok(Ok(o)) => o,
         Ok(Err(_)) => return None, // no git binary
         Err(_) => return None,     // wedged: treat as not-a-repo
@@ -289,20 +295,20 @@ mod tests {
         assert!(out.len() < MAX_PROJECT_DOC_BYTES + 2_000);
     }
 
-    #[test]
-    fn snapshot_in_git_repo_has_status() {
+    #[tokio::test]
+    async fn snapshot_in_git_repo_has_status() {
         // This test runs inside the conga workspace (a git repo).
         let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let snap = env_snapshot(cwd);
+        let snap = env_snapshot(cwd).await;
         assert!(snap.contains("Date (UTC):"));
         assert!(snap.contains("Platform:"));
         assert!(snap.contains("Git status:"));
     }
 
-    #[test]
-    fn snapshot_in_plain_dir_is_date_only() {
+    #[tokio::test]
+    async fn snapshot_in_plain_dir_is_date_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let snap = env_snapshot(tmp.path());
+        let snap = env_snapshot(tmp.path()).await;
         assert!(snap.contains("Date (UTC):"));
         assert!(!snap.contains("Git status:"), "non-git dir: {snap}");
     }

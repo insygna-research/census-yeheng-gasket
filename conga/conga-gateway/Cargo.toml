@@ -27,4 +27,5 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+tokio-tungstenite = "0.29"
 tempfile = { workspace = true }

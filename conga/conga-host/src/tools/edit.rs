@@ -99,14 +99,24 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
         updated.replace_range(range.start..range.end, new_text);
     }
 
-    // Atomic write via temp file + rename. Append a suffix (rather than
-    // `with_extension`, which would drop the original extension and let
-    // `Cargo.toml` and `Cargo.lock` collide on `Cargo.conga-tmp`).
+    // Atomic write via temp file + rename. The tmp name adds a unique uuid
+    // before the suffix (suffix, not `with_extension`, which would drop the
+    // original extension and let `Cargo.toml`/`Cargo.lock` collide): concurrent
+    // writers to the same target never share a tmp file. Same directory as the
+    // target, so `rename` stays atomic within one filesystem.
     let mut tmp_os = full.clone().into_os_string();
-    tmp_os.push(".conga-tmp");
+    tmp_os.push(format!(".{}.conga-tmp", uuid::Uuid::new_v4()));
     let tmp = std::path::PathBuf::from(tmp_os);
-    tokio::fs::write(&tmp, &updated).await?;
-    tokio::fs::rename(&tmp, &full).await?;
+    let outcome = async {
+        tokio::fs::write(&tmp, &updated).await?;
+        tokio::fs::rename(&tmp, &full).await
+    }
+    .await;
+    if outcome.is_err() {
+        // Best effort: never leave our own tmp behind on a failed edit.
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    outcome?;
 
     let matches: Vec<&str> = located
         .iter()

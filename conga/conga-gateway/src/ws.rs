@@ -6,6 +6,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
+use dashmap::mapref::entry::Entry;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::Mutex;
@@ -63,9 +64,10 @@ pub(crate) async fn ws_handler(
     // would clobber the session map entry (the first connection's cleanup
     // would then remove/kill the second's resources, e.g. its persistent
     // shell). Reject instead — the entry is removed on disconnect, so a
-    // prompt reconnect still works. (TOCTOU between two simultaneous
-    // upgrades remains, but the sequential double-connect is the case that
-    // corrupted state.)
+    // prompt reconnect still works. This check is the cheap early reject
+    // for the sequential case; the authoritative atomic claim (DashMap
+    // `entry`) happens in `handle_ws`, closing the simultaneous-upgrade
+    // race this check alone cannot.
     if state.sessions.contains_key(&session_id) {
         warn!("ws upgrade rejected: session {session_id} already connected");
         return (
@@ -91,6 +93,24 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
         last_input_tokens: 0,
         turn_start: None,
     }));
+
+    // ── Atomic session claim ────────────────────────────────
+    // Register under the session id in one atomic step (check + insert via
+    // DashMap `entry`). The `ws_handler` pre-check cannot close the race
+    // between two simultaneous upgrades of the same id — both handshakes
+    // would pass it before either registers. The loser here closes its
+    // socket immediately, without touching the winner's resources.
+    match state.sessions.entry(session_id.clone()) {
+        Entry::Occupied(_) => {
+            warn!("ws session {session_id}: duplicate connection lost the race; closing");
+            let mut s = session.lock().await;
+            let _ = s.sender.send(Message::Close(None)).await;
+            return;
+        }
+        Entry::Vacant(e) => {
+            e.insert(session.clone());
+        }
+    }
 
     // ── Single ordered wire channel ──────────────────────────
     // All outbound events (main agent stream, subagent events, approval
@@ -521,5 +541,99 @@ async fn send_json(sender: &mut SplitSink<WebSocket, Message>, event: &OutgoingE
     let text = serde_json::to_string(event).unwrap_or_default();
     if let Err(e) = sender.send(Message::Text(text.into())).await {
         warn!("send failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use axum::Router;
+    use dashmap::DashMap;
+
+    /// Two SIMULTANEOUS upgrades of one session id race past the handler's
+    /// cheap pre-check; the atomic DashMap `entry` claim in `handle_ws`
+    /// must still admit exactly one. Guards both the removed-insert
+    /// regression (map stays empty → nothing registers) and the check-then-
+    /// act race (map grows to two → state clobbered).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_id_upgrades_register_exactly_one() {
+        // Provider env so `SessionAssembly::build` succeeds headless (no
+        // network happens during assembly). Process-global; no other
+        // gateway test reads these.
+        std::env::set_var("CONGA_LLM_BASE_URL", "http://127.0.0.1:9");
+        std::env::set_var("CONGA_LLM_KEY", "test-key");
+        std::env::set_var("CONGA_LLM_MODEL", "test-model");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            sessions: DashMap::new(),
+            store_root: tmp.path().to_path_buf(),
+            index_db: tmp.path().join("index.db"),
+            auth_token: Arc::new("t".to_string()),
+        });
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("ws://{addr}/ws?user_id=race-sess");
+        let (a, b) = tokio::join!(
+            tokio_tungstenite::connect_async(url.clone()),
+            tokio_tungstenite::connect_async(url),
+        );
+        // Both handshakes may legitimately succeed (the pre-check cannot
+        // close the window); the entry claim decides the winner after.
+        let mut streams = Vec::new();
+        if let Ok((s, _)) = a {
+            streams.push(s);
+        }
+        if let Ok((s, _)) = b {
+            streams.push(s);
+        }
+        assert!(!streams.is_empty(), "at least one upgrade must succeed");
+
+        // Exactly one registration — never zero (claim exists), never two
+        // (claim is atomic). Registration precedes assembly, so this cannot
+        // flap on host-build timing.
+        wait_until(&state, 10, |n| n == 1, "exactly one session registered").await;
+
+        // Sequential duplicate while one is live: 409 at the handler.
+        let third =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?user_id=race-sess")).await;
+        match third {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+            }
+            other => panic!("sequential duplicate upgrade must 409, got {other:?}"),
+        }
+
+        // Disconnect releases the claim: a reconnect works.
+        drop(streams);
+        wait_until(&state, 10, |n| n == 0, "entry released on disconnect").await;
+    }
+
+    async fn wait_until(
+        state: &Arc<AppState>,
+        secs: u64,
+        pred: impl Fn(usize) -> bool,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let n = state.sessions.len();
+            if pred(n) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what} (sessions.len() == {n})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

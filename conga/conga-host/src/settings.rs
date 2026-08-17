@@ -157,9 +157,16 @@ pub fn save_settings_at(path: &Path, s: &EnvSettings) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let bytes = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // Unique tmp name (same directory → same mount, atomic rename): two
+    // concurrent PUTs must never write through one shared `settings.json.tmp`.
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".{}.conga-tmp", uuid::Uuid::new_v4()));
+    let tmp = std::path::PathBuf::from(tmp_os);
+    let res = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map_err(|e| e.to_string())?;
     Ok(())
 }
 
