@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod permission;
 pub mod preview;
 pub mod printer;
+pub mod process_hooks;
 pub mod prompt;
 pub mod proxy;
 pub mod session;
