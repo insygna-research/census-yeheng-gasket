@@ -160,7 +160,7 @@ const submit = () => {
 
 <template>
   <div class="p-4 bg-transparent shrink-0">
-    <div class="max-w-3xl mx-auto w-full relative">
+    <div class="w-full relative">
       <!-- Slash Command Completer Dropdown -->
       <Transition
         enter-active-class="transition-all duration-150 ease-out"

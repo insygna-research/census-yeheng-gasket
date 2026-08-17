@@ -10,8 +10,7 @@ import {
   DropdownMenuTrigger,
 } from 'radix-vue';
 import { computed, ref } from 'vue';
-import { Cpu, Globe, Loader2, Moon, MoreVertical, Palette, RotateCcw, Settings, Sun, Trash2, Check } from 'lucide-vue-next';
-import NetworkProxyDialog from './NetworkProxyDialog.vue';
+import { Cpu, Loader2, Moon, MoreVertical, Palette, RotateCcw, Settings, Sun, Trash2, Check } from 'lucide-vue-next';
 import SettingsDialog from './SettingsDialog.vue';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
 import type { ContextStats } from '@/types';
@@ -63,7 +62,6 @@ const menuItemClass =
 const menuLabelClass =
   'px-3 py-1.5 text-[11px] font-semibold th-text-muted uppercase tracking-wider';
 
-const showProxyDialog = ref(false);
 const showSettingsDialog = ref(false);
 </script>
 
@@ -126,19 +124,10 @@ const showSettingsDialog = ref(false);
         </DropdownMenuPortal>
       </DropdownMenuRoot>
 
-      <!-- Network proxy -->
+      <!-- Settings (model, prompt, proxy) -->
       <button
         class="p-2 rounded-md th-hover th-text-muted hover:th-text transition-colors"
-        title="Network proxy"
-        @click="showProxyDialog = true"
-      >
-        <Globe class="w-4 h-4" />
-      </button>
-
-      <!-- Model settings (LLM env overrides, persisted backend-side) -->
-      <button
-        class="p-2 rounded-md th-hover th-text-muted hover:th-text transition-colors"
-        title="Model settings"
+        title="Settings"
         @click="showSettingsDialog = true"
       >
         <Settings class="w-4 h-4" />
@@ -179,7 +168,6 @@ const showSettingsDialog = ref(false);
         </DropdownMenuPortal>
       </DropdownMenuRoot>
 
-      <NetworkProxyDialog :open="showProxyDialog" @close="showProxyDialog = false" />
       <SettingsDialog :open="showSettingsDialog" @close="showSettingsDialog = false" />
     </div>
   </header>

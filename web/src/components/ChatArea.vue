@@ -176,7 +176,7 @@ const handleApprovalResponse = (requestId: string, approved: boolean, remember: 
         </div>
 
         <!-- Messages List -->
-        <div v-else class="flex flex-col gap-1 max-w-3xl mx-auto w-full pb-4 px-4">
+        <div v-else class="flex flex-col gap-1 w-full pb-4 px-4">
           <template v-for="(msg, idx) in messages" :key="msg.id">
             <ChatTimeDivider
               v-if="idx > 0 && msg.timestamp - messages[idx - 1].timestamp > 5 * 60 * 1000"

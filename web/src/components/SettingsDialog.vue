@@ -1,14 +1,23 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
-import { Check, Cpu, Loader2, X } from 'lucide-vue-next';
+import { Check, Cpu, FileText, Globe, Loader2, Settings, X } from 'lucide-vue-next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import SettingsProxyTab from './SettingsProxyTab.vue';
 import { renderMarkdownBlock } from '@/lib/markdown';
 import { fetchEnvSettings, saveEnvSettings } from '@/lib/backend';
 import type { EnvSettingsView, LlmSettingsGroup } from '@/types';
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: 'close'): void }>();
+
+const tabs = [
+  { id: 'model', label: 'Model', icon: Cpu },
+  { id: 'prompt', label: 'Prompt', icon: FileText },
+  { id: 'proxy', label: 'Proxy', icon: Globe },
+] as const;
+type TabId = (typeof tabs)[number]['id'];
+const activeTab = ref<TabId>('model');
 
 /** One editable group; `enabled` maps to null (cleared) vs present. */
 interface EditableGroup {
@@ -61,6 +70,7 @@ watch(
   () => props.open,
   async open => {
     if (open) {
+      activeTab.value = 'model';
       error.value = '';
       previewing.value = false;
       previewHtml.value = '';
@@ -145,81 +155,98 @@ const togglePreview = () => {
 
         <!-- Dialog -->
         <div
-          class="relative w-full max-w-md bg-popover border border-border rounded-2xl shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-200 max-h-[85vh] overflow-auto"
+          class="relative w-[40vw] min-w-[28rem] max-w-full bg-popover border border-border rounded-2xl shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-200 max-h-[85vh] overflow-auto"
         >
           <!-- Header -->
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center shrink-0">
-              <Cpu class="w-5 h-5 text-primary" />
+              <Settings class="w-5 h-5 text-primary" />
             </div>
             <div>
-              <h3 class="text-sm font-semibold text-foreground">Model Settings</h3>
+              <h3 class="text-sm font-semibold text-foreground">Settings</h3>
               <p class="text-xs text-muted-foreground">
-                Overrides the server's env config; applies from the next message
+                Model, prompt and network overrides
               </p>
             </div>
           </div>
 
-          <!-- Main LLM group -->
-          <div class="space-y-3 rounded-xl border border-border p-3">
-            <label class="flex items-center gap-2 text-xs font-medium text-foreground cursor-pointer">
-              <input v-model="llm.enabled" type="checkbox" class="rounded border-border text-primary" />
-              <span>Main model</span>
-              <span class="text-muted-foreground font-normal">(overrides CONGA_LLM_*)</span>
-            </label>
-            <template v-if="llm.enabled">
-              <Input v-model="llm.baseUrl" placeholder="Base URL (https://api.deepseek.com/v1)" class="text-xs" />
-              <div class="flex gap-2">
-                <Input v-model="llm.model" placeholder="Model (deepseek-chat)" class="text-xs" />
-                <select
-                  v-model="llm.api"
-                  class="text-xs rounded-md border border-border bg-background px-2 shrink-0"
-                >
-                  <option value="openai">openai</option>
-                  <option value="anthropic">anthropic</option>
-                </select>
-              </div>
-              <div class="space-y-1">
+          <!-- Tabs -->
+          <div class="flex gap-1 p-1 rounded-lg border border-border bg-background">
+            <button
+              v-for="tab in tabs"
+              :key="tab.id"
+              class="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs transition-colors"
+              :class="activeTab === tab.id ? 'bg-accent text-foreground font-medium' : 'text-muted-foreground hover:text-foreground'"
+              @click="activeTab = tab.id"
+            >
+              <component :is="tab.icon" class="w-3.5 h-3.5" />
+              {{ tab.label }}
+            </button>
+          </div>
+
+          <!-- Model tab -->
+          <template v-if="activeTab === 'model'">
+            <!-- Main LLM group -->
+            <div class="space-y-3 rounded-xl border border-border p-3">
+              <label class="flex items-center gap-2 text-xs font-medium text-foreground cursor-pointer">
+                <input v-model="llm.enabled" type="checkbox" class="rounded border-border text-primary" />
+                <span>Main model</span>
+                <span class="text-muted-foreground font-normal">(overrides CONGA_LLM_*)</span>
+              </label>
+              <template v-if="llm.enabled">
+                <Input v-model="llm.baseUrl" placeholder="Base URL (https://api.deepseek.com/v1)" class="text-xs" />
+                <div class="flex gap-2">
+                  <Input v-model="llm.model" placeholder="Model (deepseek-chat)" class="text-xs" />
+                  <select
+                    v-model="llm.api"
+                    class="text-xs rounded-md border border-border bg-background px-2 shrink-0"
+                  >
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                  </select>
+                </div>
+                <div class="space-y-1">
+                  <Input
+                    v-model="llm.apiKey"
+                    type="password"
+                    :placeholder="llm.apiKeySet ? `stored (${llm.apiKeyHint}) — leave blank to keep` : 'API key'"
+                    class="text-xs"
+                  />
+                </div>
+              </template>
+            </div>
+
+            <!-- Fast LLM group -->
+            <div class="space-y-3 rounded-xl border border-border p-3">
+              <label class="flex items-center gap-2 text-xs font-medium text-foreground cursor-pointer">
+                <input v-model="fast.enabled" type="checkbox" class="rounded border-border text-primary" />
+                <span>Fast model (sub-agents)</span>
+                <span class="text-muted-foreground font-normal">(overrides CONGA_FAST_LLM_*)</span>
+              </label>
+              <template v-if="fast.enabled">
+                <Input v-model="fast.baseUrl" placeholder="Base URL" class="text-xs" />
+                <div class="flex gap-2">
+                  <Input v-model="fast.model" placeholder="Model" class="text-xs" />
+                  <select
+                    v-model="fast.api"
+                    class="text-xs rounded-md border border-border bg-background px-2 shrink-0"
+                  >
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                  </select>
+                </div>
                 <Input
-                  v-model="llm.apiKey"
+                  v-model="fast.apiKey"
                   type="password"
-                  :placeholder="llm.apiKeySet ? `stored (${llm.apiKeyHint}) — leave blank to keep` : 'API key'"
+                  :placeholder="fast.apiKeySet ? `stored (${fast.apiKeyHint}) — leave blank to keep` : 'API key'"
                   class="text-xs"
                 />
-              </div>
-            </template>
-          </div>
+              </template>
+            </div>
+          </template>
 
-          <!-- Fast LLM group -->
-          <div class="space-y-3 rounded-xl border border-border p-3">
-            <label class="flex items-center gap-2 text-xs font-medium text-foreground cursor-pointer">
-              <input v-model="fast.enabled" type="checkbox" class="rounded border-border text-primary" />
-              <span>Fast model (sub-agents)</span>
-              <span class="text-muted-foreground font-normal">(overrides CONGA_FAST_LLM_*)</span>
-            </label>
-            <template v-if="fast.enabled">
-              <Input v-model="fast.baseUrl" placeholder="Base URL" class="text-xs" />
-              <div class="flex gap-2">
-                <Input v-model="fast.model" placeholder="Model" class="text-xs" />
-                <select
-                  v-model="fast.api"
-                  class="text-xs rounded-md border border-border bg-background px-2 shrink-0"
-                >
-                  <option value="openai">openai</option>
-                  <option value="anthropic">anthropic</option>
-                </select>
-              </div>
-              <Input
-                v-model="fast.apiKey"
-                type="password"
-                :placeholder="fast.apiKeySet ? `stored (${fast.apiKeyHint}) — leave blank to keep` : 'API key'"
-                class="text-xs"
-              />
-            </template>
-          </div>
-
-          <!-- Custom system prompt -->
-          <div class="space-y-2 rounded-xl border border-border p-3">
+          <!-- Prompt tab -->
+          <div v-else-if="activeTab === 'prompt'" class="space-y-2 rounded-xl border border-border p-3">
             <div class="flex items-center justify-between gap-2">
               <div class="min-w-0">
                 <p class="text-xs font-medium text-foreground">System prompt</p>
@@ -264,19 +291,24 @@ const togglePreview = () => {
             </p>
           </div>
 
-          <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
+          <!-- Proxy tab: self-contained, owns its own actions -->
+          <SettingsProxyTab v-else @close="emit('close')" />
 
-          <!-- Actions -->
-          <div class="flex gap-2 pt-1">
-            <Button variant="outline" class="flex-1 h-8 text-xs" @click="emit('close')">
-              <X class="w-3.5 h-3.5 mr-1" /> Cancel
-            </Button>
-            <Button class="flex-1 h-8 text-xs" :disabled="saving" @click="save">
-              <Loader2 v-if="saving" class="w-3.5 h-3.5 mr-1 animate-spin" />
-              <Check v-else class="w-3.5 h-3.5 mr-1" />
-              Save
-            </Button>
-          </div>
+          <template v-if="activeTab !== 'proxy'">
+            <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
+
+            <!-- Actions -->
+            <div class="flex gap-2 pt-1">
+              <Button variant="outline" class="flex-1 h-8 text-xs" @click="emit('close')">
+                <X class="w-3.5 h-3.5 mr-1" /> Cancel
+              </Button>
+              <Button class="flex-1 h-8 text-xs" :disabled="saving" @click="save">
+                <Loader2 v-if="saving" class="w-3.5 h-3.5 mr-1 animate-spin" />
+                <Check v-else class="w-3.5 h-3.5 mr-1" />
+                Save
+              </Button>
+            </div>
+          </template>
         </div>
       </div>
     </Transition>
