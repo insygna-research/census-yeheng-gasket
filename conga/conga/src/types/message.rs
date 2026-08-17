@@ -203,9 +203,6 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
-    Image {
-        image: ImageContent,
-    },
     ToolCall {
         tool_call: ToolCall,
     },
@@ -219,12 +216,6 @@ impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
         ContentBlock::Text { text: s.into() }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ImageContent {
-    pub mime_type: String,
-    pub data: String, // base64
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

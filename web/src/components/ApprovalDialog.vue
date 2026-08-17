@@ -77,8 +77,25 @@ const formatArgs = (args: string | undefined) => {
                 {{ request.description }}
               </span>
             </div>
+            <div v-if="request.preview" class="space-y-1">
+              <div class="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground">
+                <Terminal class="w-3 h-3" />
+                <span>Preview</span>
+              </div>
+              <div class="font-mono text-[11px] bg-black/5 dark:bg-black/40 rounded-lg p-3 whitespace-pre overflow-auto max-h-56 leading-relaxed border border-border">
+                <template v-for="(line, i) in request.preview.split('\n')" :key="i">
+                  <div
+                    :class="line.startsWith('+ ') || line.startsWith('+')
+                      ? 'text-green-600 dark:text-green-400'
+                      : line.startsWith('- ') || line.startsWith('-')
+                        ? 'text-red-600 dark:text-red-400'
+                        : 'text-foreground'"
+                  >{{ line }}</div>
+                </template>
+              </div>
+            </div>
 
-            <div v-if="request.arguments" class="space-y-1">
+            <div v-if="request.arguments && !request.preview" class="space-y-1">
               <div class="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground">
                 <Terminal class="w-3 h-3" />
                 <span>Arguments</span>

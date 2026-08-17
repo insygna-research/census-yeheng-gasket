@@ -16,7 +16,7 @@ pub struct OutgoingEvent {
     event_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    /// Stable id pairing a `tool_start` with its `tool_end` (only on those).
+    /// Stable id pairing a `tool_start` with a `tool_end` (only on those).
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,6 +29,9 @@ pub struct OutgoingEvent {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arguments: Option<String>,
+    /// Human-readable diff preview for `approval_request` (edit/write).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,7 @@ impl OutgoingEvent {
             content: None,
             name: None,
             arguments: None,
+            preview: None,
             output: None,
             message: None,
             usage_in: None,
@@ -114,10 +118,18 @@ impl OutgoingEvent {
         ev.message = Some(msg);
         ev
     }
+    /// Acknowledgment for a mid-turn user message that was queued for
+    /// steering. The frontend renders the text as a pending user bubble.
+    pub fn queued(text: String) -> Self {
+        let mut ev = Self::base("queued");
+        ev.message = Some(text);
+        ev
+    }
     pub fn approval_request(
         request_id: String,
         tool_name: String,
         args: &serde_json::Value,
+        preview: Option<String>,
     ) -> Self {
         // description 给前端展示；arguments 保留原始参数。截断防超长。
         let desc = serde_json::to_string(args).unwrap_or_default();
@@ -131,6 +143,7 @@ impl OutgoingEvent {
         ev.tool_name = Some(tool_name);
         ev.description = Some(desc);
         ev.arguments = Some(args.to_string());
+        ev.preview = preview;
         ev
     }
 }

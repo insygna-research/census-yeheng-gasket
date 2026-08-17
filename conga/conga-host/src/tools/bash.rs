@@ -13,12 +13,13 @@ pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: "bash".into(),
         label: "Bash".into(),
-        description: "Run a shell command. Optional timeout in seconds.".into(),
+        description: "Run a shell command in this session's persistent shell: cd, exported env vars, and activated virtualenvs survive across calls (non-Windows). Set run_in_background to start the command without waiting; its output goes to a log file you can read. Optional timeout in seconds.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string" },
-                "timeout": { "type": "integer", "description": "seconds (default 120)" }
+                "timeout": { "type": "integer", "description": "seconds (default 120)" },
+                "run_in_background": { "type": "boolean", "description": "start the command detached; output is redirected to a log file under the tool state dir (returned in the result)" }
             },
             "required": ["command"]
         }),
@@ -35,7 +36,45 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
         .as_str()
         .ok_or_else(|| conga::error::ToolError::Message("command is required".into()))?;
     let timeout = ctx.args["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let run_in_background = ctx.args["run_in_background"].as_bool().unwrap_or(false);
 
+    if !cfg!(target_os = "windows") {
+        // Persistent shell path: state (cwd, exports) survives across calls.
+        // The sandbox confines one-shot spawns; a persistent shell cannot be
+        // confined the same way, so an enabled sandbox falls back to the
+        // one-shot path below.
+        if !super::sandbox::sandbox_enabled(&ctx.ctx.env) {
+            let bg_dir = if run_in_background {
+                Some(ctx.ctx.state_dir.join("bg"))
+            } else {
+                None
+            };
+            let outcome = super::shell::run(
+                &ctx.ctx.session_id,
+                command,
+                Duration::from_secs(timeout),
+                &ctx.ctx.cwd,
+                &ctx.ctx.env,
+                bg_dir.as_deref(),
+            )
+            .await;
+            let text = super::spill_or_truncate(&ctx, &outcome.output);
+            let is_error = match outcome.exit_code {
+                Some(code) => code != 0,
+                // No code = the run did not complete (timeout / shell death).
+                None => true,
+            };
+            return Ok(ToolResult {
+                content: vec![ContentBlock::text(text.trim())],
+                details: serde_json::json!({
+                    "persistent": true,
+                    "background": run_in_background,
+                    "exit_code": outcome.exit_code,
+                }),
+                is_error,
+            });
+        }
+    }
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = tokio::process::Command::new("cmd");
         c.arg("/C").arg(command);
@@ -88,7 +127,7 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     let is_error = !output.status.success();
     Ok(ToolResult {
         content: vec![ContentBlock::text(text.trim())],
-        details: serde_json::json!({"exit_code": code}),
+        details: serde_json::json!({"exit_code": code, "persistent": false}),
         is_error,
     })
 }
@@ -100,6 +139,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     async fn run(args: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
+        // Unique session per call: the persistent shell serializes per
+        // session id, and parallel tests sharing one id would interleave.
+        let session = format!("bash-test-{}", uuid::Uuid::new_v4());
         let t = tool();
         (t.execute)(ToolCallCtx {
             tool_call_id: "x".into(),
@@ -108,7 +150,7 @@ mod tests {
             ctx: ToolContext {
                 cwd: cwd.to_path_buf(),
                 env: std::env::vars().collect(),
-                session_id: "s".into(),
+                session_id: session,
                 state_dir: cwd.to_path_buf(),
             },
         })
@@ -131,10 +173,12 @@ mod tests {
     #[tokio::test]
     async fn reports_nonzero_exit() {
         let tmp = tempfile::tempdir().unwrap();
+        // Inner sh: a top-level `exit N` would terminate the persistent
+        // shell session itself.
         let cmd = if cfg!(target_os = "windows") {
             "cmd /C exit 3"
         } else {
-            "exit 3"
+            "sh -c 'exit 3'"
         };
         let r = run(serde_json::json!({"command": cmd}), tmp.path()).await;
         assert!(r.is_error);
@@ -202,7 +246,10 @@ mod tests {
         );
         assert!(r.is_error);
         match &r.content[0] {
-            ContentBlock::Text { text } => assert!(text.contains("timed out"), "got: {text}"),
+            ContentBlock::Text { text } => assert!(
+                text.contains("timed out") || text.contains("[exit timeout]"),
+                "got: {text}"
+            ),
             _ => panic!("expected text content"),
         }
         // Give the runtime a moment to reap the killed child before probing.
@@ -228,6 +275,9 @@ mod tests {
         cwd: &std::path::Path,
         env: std::collections::HashMap<String, String>,
     ) -> ToolResult {
+        // Unique session per call: parallel tests sharing one persistent
+        // shell would interleave each other's output.
+        let session = format!("bash-test-{}", uuid::Uuid::new_v4());
         let t = tool();
         (t.execute)(ToolCallCtx {
             tool_call_id: "x".into(),
@@ -236,7 +286,7 @@ mod tests {
             ctx: ToolContext {
                 cwd: cwd.to_path_buf(),
                 env,
-                session_id: "s".into(),
+                session_id: session,
                 state_dir: cwd.to_path_buf(),
             },
         })

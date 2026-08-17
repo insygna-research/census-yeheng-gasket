@@ -76,6 +76,7 @@ impl HostConfig {
             hooks,
             retry: self.tunables.retry.clone(),
             persist: None,
+            steer: None,
             transform_context: None,
         }
     }

@@ -567,24 +567,31 @@ async fn run_turn_compacts_before_every_llm_call() {
     // Call 2: user + assistant + tool_result = 3, still within cap.
     assert_eq!(seen[1].len(), 3);
     // Call 3: history is 5 (user + 2×(assistant+tool_result)); the wire
-    // view must be compacted back to the cap, notice included — under the
-    // old compact-once-at-turn-start behavior this call saw all 5.
+    // view must be compacted — pinned task + notice + kept tail under the
+    // cap (pinned task rides outside the budget, so ≤ 3 + 1).
     assert!(
-        seen[2].len() <= 3,
+        seen[2].len() <= 4,
         "third call must be compacted, got {}",
         seen[2].len()
     );
-    let notice = match &seen[2][0] {
+    let first = match &seen[2][0] {
         AgentMessage::User(u) => match &u.content[0] {
             ContentBlock::Text { text } => text.clone(),
             _ => panic!("expected text"),
         },
-        _ => panic!("expected compaction notice first, got {:?}", seen[2][0]),
+        _ => panic!("expected pinned task or notice first, got {:?}", seen[2][0]),
     };
+    // Either the pinned original task ("go") leads and the notice follows,
+    // or (degenerate single-group history) the notice leads.
     assert!(
-        notice.starts_with("[compacted"),
-        "expected compaction notice, got: {notice}"
+        first == "go" || first.starts_with("[compacted"),
+        "expected pinned task or compaction notice, got: {first}"
     );
+    let has_notice = seen[2].iter().any(|m| {
+        matches!(m, AgentMessage::User(u)
+        if matches!(&u.content[0], ContentBlock::Text { text } if text.starts_with("[compacted")))
+    });
+    assert!(has_notice, "compaction notice must be present: {first:?}");
     // The on-disk log keeps the FULL transcript: every assistant message,
     // uncompacted — the seam is a wire view only.
     let sid = host.session().current_id().to_string();

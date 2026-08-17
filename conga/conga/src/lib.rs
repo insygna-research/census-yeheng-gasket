@@ -10,6 +10,7 @@ pub mod error;
 pub mod extension;
 pub mod guard;
 pub mod providers;
+pub mod steer;
 pub mod storage;
 pub mod types;
 
@@ -20,6 +21,8 @@ pub use cancel::CancelSignal;
 pub use error::{AgentError, ToolError};
 pub use extension::{ExtensionApi, ExtensionApiImpl};
 pub use providers::{AnthropicProvider, ConfigError, OpenAiCompat, ProviderConfig};
+pub use steer::SteerQueue;
+
 pub use storage::{is_valid_session_id, EventStorage, JsonlStorage, SessionMeta};
 
 pub use types::context::{

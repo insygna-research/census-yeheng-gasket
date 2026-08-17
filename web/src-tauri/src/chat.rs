@@ -46,12 +46,16 @@ enum WireEvent {
     request_id: String,
     tool_name: String,
     args: serde_json::Value,
+    preview: Option<String>,
   },
   /// Reply to a message received while a turn is already running.
   Busy(String),
-  /// Slash-command reply: a content/error event that bypasses run_turn.
-  /// Always followed by `Done` so the frontend's turn-boundary handling
-  /// fires (clears isReceiving, refreshes context).
+  /// Mid-turn user message accepted into the steer queue; the loop injects
+  /// it as a User message before its next LLM call.
+  Queued(String),
+  /// Slash-command reply: bypasses run_turn through the same ordered
+  /// channel. Always followed by `Done` so the frontend's turn-boundary
+  /// handling fires (clears isReceiving, refreshes context).
   Reply(OutgoingEvent),
   Done,
   Error(String),
@@ -186,9 +190,18 @@ fn spawn_emitter(
           request_id,
           tool_name,
           args,
-        } => serde_json::to_value(OutgoingEvent::approval_request(request_id, tool_name, &args))
-          .ok(),
+          preview,
+        } => {
+          serde_json::to_value(OutgoingEvent::approval_request(
+            request_id,
+            tool_name,
+            &args,
+            preview,
+          ))
+          .ok()
+        }
         WireEvent::Busy(msg) => serde_json::to_value(OutgoingEvent::busy(msg)).ok(),
+        WireEvent::Queued(text) => serde_json::to_value(OutgoingEvent::queued(text)).ok(),
         WireEvent::Reply(ev) => serde_json::to_value(ev).ok(),
         WireEvent::Done => {
           // Turn boundary: the tool-name cache is per-turn.
@@ -243,7 +256,10 @@ async fn build_session(
   let approval_emit: conga_host::ApprovalEmit = {
     let wire = wire_tx.clone();
     Arc::new(
-      move |request_id: String, tool_name: String, args: serde_json::Value| {
+      move |request_id: String,
+            tool_name: String,
+            args: serde_json::Value,
+            preview: Option<String>| {
         // Approval requests ride the same ordered channel as every other
         // wire event, so a request can never overtake the tool_start of
         // the call it belongs to.
@@ -251,6 +267,7 @@ async fn build_session(
           request_id,
           tool_name,
           args,
+          preview,
         });
       },
     )
@@ -335,9 +352,10 @@ pub async fn send_message(
   };
 
   if session.turn_active.swap(true, Ordering::AcqRel) {
-    let _ = session.wire_tx.send(WireEvent::Busy(
-      "The agent is busy processing your previous request; this message was not accepted.".into(),
-    ));
+    // Mid-turn message: steer it into the running loop (a real User message
+    // before its next LLM call) and acknowledge — not rejected.
+    session.host.steer().push(content.clone());
+    let _ = session.wire_tx.send(WireEvent::Queued(content.clone()));
     return Ok(());
   }
 

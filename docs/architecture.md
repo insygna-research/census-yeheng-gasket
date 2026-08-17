@@ -161,8 +161,13 @@ host.run_turn(user_msg, |ev| {
 for turn in 0..max_turns {                       ← 外层循环,受 CONGA_MAX_TURNS 限制
     若 signal 被置位 → 协作式中止,返回已累积的 partial transcript
 
+    steer.drain():                              ← 中途转向(AgentLoopConfig.steer)
+        每条排队的用户文本 → persist(User) + 追加为真实 User 消息
+        (重启可还原:走事件日志,不是旁路内存)
+
     stream = stream_fn.stream(model, messages, system_prompt, tools, signal)
-              └─ 仅在"流出首个 chunk 之前"的失败才重试 (RetryPolicy);
+              └─ 仅在"流出首个 chunk 之前"的失败才重试 (RetryPolicy;
+                 429 按更长退避下限 + jitter 处理);
                  流中途失败则直接上报,不重试(避免重复输出)
     consume(stream):                              ← 消费 StreamChunk 流
         TextDelta      → on_event(MessageUpdate) + 累积 assistant 文本
@@ -245,21 +250,25 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 > **为什么 `HookChain` 定义在 `types` 而不是 `extension`?** 这样 `AgentLoopConfig` 能持有 `Option<Arc<dyn HookChain>>` 而**不引入循环依赖**(concrete 实现是 `ExtensionApiImpl`)。
 
-### 5.2 内置工具(`tools/`)
+### 5.2 内置工具(`conga-host/src/tools/`)
 
-`built_in_tools()` 返回 8 个内置工具,均带风险分级:
+> **归属纠偏**:内置工具住在 **conga-host**(`conga-host/src/tools/`),不在内核 crate。内核(`conga`)只持有工具的类型契约(`types/tool.rs`);审计文档 `core-module-audit.md` 描述的"core + `built-in-tools` feature"方案已被取代——工具是宿主层服务,不是三宿主共享的内核能力。
+
+`built_in_tools()` 返回 9 个内置工具,均带风险分级:
 
 | 工具 | 文件 | 用途 | 典型风险 |
 |---|---|---|---|
 | `read` | `tools/read.rs` | 读文件 | Low |
 | `write` | `tools/write.rs` | 写文件 | High |
-| `edit` | `tools/edit.rs` | 编辑文件 | High |
-| `bash` | `tools/bash.rs` | 执行 shell | High |
+| `edit` | `tools/edit.rs` | 多 hunk 原子编辑(exact→fuzzy 定位,全有或全无) | High |
+| `bash` | `tools/bash.rs` | **持久 shell**(每 session 一个 `sh`,`cd`/env 跨调用存活;`run_in_background` 后台执行,输出落 `state_dir/bg/*.log`;超时重置会话) | High |
 | `grep` | `tools/grep.rs` | 正则搜索(基于 `ignore`,尊重 .gitignore) | Low |
 | `list` | `tools/list.rs` | 列目录(基于 `ignore`+`glob`) | Low |
 | `fetch` | `tools/fetch.rs` | HTTP GET URL,HTML 转可读 markdown 文本(30s 超时,200KB 截断) | Low |
+| `todo` | `tools/todo.rs` | 多步任务工作记忆(add/list/toggle/clear,状态落 `state_dir`) | Low |
 | `spawn_subagents` | `tools/subagent.rs` | 并行子 agent 编排(maxItems 5,见 §11) | Medium |
 
+工具名冲突:装配层(`assembly.rs::dedup_tool_names`)按"首个注册胜出"(built-in → ext → external → MCP → append)去重并告警——循环按名字首匹解析,未上报的冲突会静默调错工具。
 工具执行闭包签名(`ToolFn`):`Arc<dyn Fn(ToolCallCtx) -> Future<Output=Result<ToolResult,ToolError>>>`。`ToolContext.state_dir`(`~/.conga/tool_state/<session>/<tool>/`)是每个工具的**私有**状态目录;`ToolCallCtx.aborted()` 用于长循环里协作式中止。
 
 ### 5.3 LLM Provider(`providers/`)
@@ -327,10 +336,12 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `external_tool.rs` | 从 `CONGA_EXTERNAL_TOOLS` 白名单加载外部命令工具 | `ExternalToolBridge` / `commands_from_env` / `load_all` |
 | `mcp.rs` | MCP(Model Context Protocol)客户端:连接外部 MCP 工具服务器(stdio),握手 → tools/list → tools/call | `McpBridge` / `load_all_mcp` / `McpServerConfig` |
 | `printer.rs` | 把 `AgentEvent` 渲染到终端(含 Error 分支与 flush) | `EventPrinter` |
-| `wire.rs` | 出站 wire 协议类型(`OutgoingEvent`):`thinking`/`tool_start`/`tool_end`/`content`/`error`/`done`/`busy`/`approval_request` 的 JSON schema,网关与桌面端共用 | `OutgoingEvent` |
+| `prompt.rs` | **编码 agent 系统提示**:`CODING_AGENT_PROMPT` 纪律文本、`append_project_doc`(向上找 AGENTS.md/CLAUDE.md,≤16KB)、`env_snapshot`(UTC 日期 + git status/diffstat,3s 超时防护) | `CODING_AGENT_PROMPT` / `append_project_doc` / `env_snapshot` |
+| `preview.rs` | 审批 diff 预览:零依赖 LCS 行 diff,`edit` hunk 与 `write` 覆盖文件的 old→new 渲染 | `approval_preview` |
+| `wire.rs` | 出站 wire 协议类型(`OutgoingEvent`):`thinking`/`tool_start`/`tool_end`/`content`/`error`/`done`/`busy`/`queued`/`approval_request(带 preview)` 的 JSON schema,网关与桌面端共用 | `OutgoingEvent` |
 | `event_map.rs` | `AgentEvent` → `OutgoingEvent`(WS JSON)映射,含 10 种 `SubagentEvent` 转发 | `event_to_ws` / `subagent_event_to_ws` |
 | `approval.rs` | 审批登记(`ApprovalRegistry`):在途审批 + "remember" 缓存,三路 select 等待决策 | `ApprovalRegistry` |
-| `subagent.rs` | 子 agent 编排:`spawn_subagents` 工具的 host 侧 spawner | `HostSubagentSpawner` |
+| `subagent.rs` | 子 agent 编排:`spawn_subagents` 工具的 host 侧 spawner(子日志持久化、全文结果提取) | `HostSubagentSpawner` |
 
 ### 6.3 `install_ctrl_c`(`lib.rs:328`)
 
@@ -385,9 +396,9 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `content` | `content` | 助手文本增量 |
 | `error` | `content?`,`message?` | 错误横幅 |
 | `busy` | `content?`,`message?` | 一轮仍在进行时又收到新消息的回执(区别于 `error`,前端弹 toast 而不清状态) |
+| `queued` | `message` | **中途转向回执**:turn 进行中收到的新消息已入列(steer),循环在下一次 LLM 调用前把它作为真实 User 消息注入并落盘;前端渲染为待处理用户气泡 |
 | `done` | `usage_in?`,`usage_out?`,`elapsed_ms?` | 本轮结束;可带累计输入/输出 token 数与本轮耗时 |
-| `approval_request` | `id`,`tool_name`,`description`,`arguments` | 请求人工审批 |
-| `subagent_*`(10 种) | — | ✅ **已实现**:子 agent 编排(`spawn_subagents` 工具)触发,网关经 `event_map::subagent_event_to_ws` 转发,前端 `SubagentThoughtsPanel` 渲染(见 §11) |
+| `approval_request` | `id`,`tool_name`,`description`,`arguments`,`preview?` | 请求人工审批;`preview` 为 `edit`/`write` 的行 diff 预览(零依赖 LCS),前端优先渲染 diff 而非原始 JSON |
 
 ### 7.4 审批(`conga-host/src/approval.rs`)
 
@@ -433,8 +444,10 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 压缩是**纯宿主策略**(`host/src/compact.rs`),目的是在喂给 LLM 前缩小工作 transcript。三个硬约束:
 
 1. **只缩内存,不改盘**——`~/.conga/sessions/<id>/events.jsonl` 始终是 append-only 事件日志,压缩只作用于本次喂给 LLM 的 `history`(每轮现派生)。
-2. **无 LLM 摘要**——不调用模型做总结,只做"丢弃最旧的若干组 + 前置一条 `[compacted N earlier messages]` 提示"。
+2. **无 LLM 摘要**——不调用模型做总结,只做"丢弃最旧的若干组 + 前置一条 `[compacted N earlier messages; original task kept]` 提示"。
 3. **永不切断 tool_call ↔ result**——见 `atomic_groups`。
+4. **pin 原始任务**(harness 约束)——首组(最初的用户任务)**永不丢弃**,钉在压缩输出最前;忘了为什么出发的 agent 比窗口短一点的 agent 更糟。
+5. **老工具结果截断**(harness 约束)——最后一组之前的 `ToolResult` 文本块压到头部 400 字符 + 截断标记;最新交互保持逐字。二者都只改 wire view,日志不动。
 
 ### 9.1 原子组(`atomic_groups`)
 
@@ -576,15 +589,22 @@ src/
 
 ---
 
-## 11. 扩展机制(conga-ext)
+## 11. 扩展机制(conga-ext)与子 agent 编排
 
 `conga-ext` 是可选的进程内扩展 crate,启动时经 `ExtensionApi` 注册工具与 hook:
 
-- `register_all(&mut api)` 把 `hello` / `todo` / `search` / `permission_gate` 注册进去。
+- `register_all(&mut api)` 把 `hello` / `search` / `permission_gate` 注册进去(`todo` 已转正为内置工具,住 `conga-host/src/tools/todo.rs`)。
 - CLI 通过 Cargo feature `ext`(`--features ext`)链接它;gateway 可类似接入。
 - **事件 vs hook**:事件是纯观察(emit 闭包),hook 返回 verdict 控制流程,二者在类型层不可混淆(见 5.4)。
 - 搜索扩展(`search.rs`)支持多家 provider:Brave / Tavily / **Serper(默认)** / SerpAPI / Exa / Firecrawl / DuckDuckGo,由 `CONGA_SEARCH_PROVIDER` + 对应 `*_API_KEY` 选择。
-- **桌面 App 链接 conga-ext**:`web/src-tauri/src/chat.rs` 把 `conga_ext::search` 注册的 `web_search` 加入每个 session 的 tool set(`chat.rs:321-329`),其 HTTP client 遵守运行时工具代理(`conga::apply_tool_proxy`,见 §5.6)。
+- **桌面 App 链接 conga-ext**:`web/src-tauri/src/chat.rs` 把 `conga_ext::search` 注册的 `web_search` 加入每个 session 的 tool set,其 HTTP client 遵守运行时工具代理(`conga::apply_tool_proxy`,见 §5.6)。
+
+**子 agent 编排(harness 升级)**:
+
+- **持久化**:每个子 agent 的运行落 `sessions/<parent>/sub/<uuid>/events.jsonl`(`HostSubagentSpawner::with_sub_log_root`),崩溃可恢复、事后可检视;父 agent 可用 `read` 工具读取其全文。
+- **全文结果**:`SubagentResult.output` 携带全部 assistant 文本(非 200 字符摘要),`log_path` 指向子日志;父 agent 对完整产出推理。
+- **fast 模型路由**:完整的 `CONGA_FAST_LLM_*` 环境集把子 agent 切到便宜模型(同一套 tunables);缺省集(打错字)在启动时 fail-loud 告警。
+- 子 agent 工具集 = 内置工具减 `spawn_subagents`(禁嵌套),MCP/external 工具不给子 agent;共享权限策略仍逐调用把关。
 
 > 想加自己的工具:实现一个返回 `Vec<ToolDefinition>`(+ 可选 `HookChain`)的注册函数,在宿主启动时调用;无需改内核。
 

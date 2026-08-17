@@ -181,6 +181,12 @@ async fn append_line<T: serde::Serialize>(
     let mut line = serde_json::to_string(value)?;
     line.push('\n');
     file.write_all(line.as_bytes()).await?;
+    // `tokio::fs::File` buffers writes in userspace and completes
+    // `write_all` as soon as the syscall is *submitted* to the blocking
+    // pool. Awaiting `flush` waits for the write to actually land in the
+    // kernel, so a caller that reads (or crashes) right after this
+    // returns observes the line instead of racing the background write.
+    file.flush().await?;
     Ok(())
 }
 

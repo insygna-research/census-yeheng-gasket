@@ -5,10 +5,11 @@ use std::pin::Pin;
 use futures_util::StreamExt;
 
 use crate::error::AgentError;
-use crate::types::context::{AgentContext, AgentLoopConfig, StreamChunk};
+use crate::types::context::{AgentContext, AgentLoopConfig, RetryPolicy, StreamChunk};
 use crate::types::event::{AgentEvent, ContentDelta};
 use crate::types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolCall, ToolResultMessage,
+    UserMessage,
 };
 use crate::types::session_event::SessionEvent;
 use crate::types::tool::{RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext};
@@ -46,10 +47,24 @@ where
 
     let mut guard = crate::guard::RepeatGuard::new();
 
-    // Single outer loop.
     for turn in 0..config.max_turns {
         emit(AgentEvent::TurnStart);
         tracing::info!("agent turn {} start", turn);
+
+        // Mid-turn steering: user text queued while the previous turn was
+        // running enters here, as a real User message (persisted like the
+        // initial prompt) — the agent sees it before its next decision.
+        if let Some(steer) = &config.steer {
+            for text in steer.drain() {
+                let user = AgentMessage::User(UserMessage {
+                    content: vec![ContentBlock::text(text)],
+                    timestamp: crate::now(),
+                });
+                persist_event(&config, &SessionEvent::User(user.clone()))?;
+                context.messages.push(user.clone());
+                new_messages.push(user);
+            }
+        }
 
         // 1. Call the LLM. (An abort signal is handled inside
         //    `stream_assistant_response`, before any provider request is made.)
@@ -527,10 +542,16 @@ where
                 // retry is invisible) and the signal isn't already aborting.
                 let can_retry = !emitted_content && attempt <= max_retries && !is_aborted(config);
                 if can_retry {
-                    let delay = backoff_ms(attempt, &config.retry);
+                    // Rate-limit errors back off longer: hammering a 429
+                    // provider on the fast schedule just deepens the limit.
+                    // The status rides the provider's own error string
+                    // ("HTTP 429 ...") - bounded to self-produced text.
+                    let rate_limited = error.contains("429");
+                    let delay = backoff_ms(attempt, &config.retry, rate_limited);
                     tracing::warn!(
                         attempt,
                         max_retries,
+                        rate_limited,
                         delay_ms = delay,
                         error = %error,
                         "provider stream error, retrying"
@@ -673,14 +694,34 @@ where
 }
 
 /// Exponential backoff for retry `attempt` (1-based): `initial * 2^(attempt-1)`,
-/// capped at `max`. Returns 0 when `initial` is 0 (no delay).
-fn backoff_ms(attempt: usize, policy: &crate::types::context::RetryPolicy) -> u64 {
+/// capped at `max`. Returns 0 when `initial` is 0 (no delay). Rate-limited
+/// calls (HTTP 429) get a longer floor (`4 * initial`) so the fast schedule
+/// doesn't deepen the limit. Jitter, when on, applies a bounded offset of
+/// ± delay/4 derived from the wall clock (no rand dependency).
+fn backoff_ms(attempt: usize, policy: &RetryPolicy, rate_limited: bool) -> u64 {
     if policy.initial_delay_ms == 0 {
         return 0;
     }
     let shift = attempt.saturating_sub(1).min(10);
     let base = policy.initial_delay_ms.saturating_mul(1u64 << shift);
-    base.min(policy.max_delay_ms)
+    let mut delay = base.min(policy.max_delay_ms);
+    if rate_limited {
+        let floor = policy
+            .initial_delay_ms
+            .saturating_mul(4)
+            .min(policy.max_delay_ms);
+        delay = delay.max(floor);
+    }
+    if policy.jitter {
+        let span = (delay / 4).max(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let offset = nanos % (2 * span);
+        delay = delay.saturating_add(span).saturating_sub(offset);
+    }
+    delay
 }
 
 #[cfg(test)]
@@ -727,6 +768,7 @@ mod tests {
             stream_fn: std::sync::Arc::new(MockStream(chunks)),
             hooks: None,
             retry: crate::RetryPolicy::off(),
+            steer: None,
             persist: None,
             transform_context: None,
         }
@@ -1242,6 +1284,7 @@ mod tests {
             persist: None,
             transform_context: None,
             retry: crate::RetryPolicy::off(),
+            steer: None,
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1305,6 +1348,7 @@ mod tests {
             persist: None,
             transform_context: None,
             retry: crate::RetryPolicy::off(),
+            steer: None,
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1508,6 +1552,7 @@ mod tests {
             persist: None,
             transform_context: None,
             retry: crate::RetryPolicy::off(),
+            steer: None,
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1741,6 +1786,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backoff_rate_limited_gets_longer_floor() {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 8_000,
+            jitter: false,
+        };
+        // Attempt 1: base 100ms; rate-limited floor 400ms wins.
+        assert_eq!(backoff_ms(1, &policy, true), 400);
+        // Attempt 1 without rate limiting stays on the fast schedule.
+        assert_eq!(backoff_ms(1, &policy, false), 100);
+        // Once the exponential curve passes the floor, both are equal.
+        assert_eq!(backoff_ms(4, &policy, true), 800);
+        assert_eq!(backoff_ms(4, &policy, false), 800);
+    }
+
+    #[test]
+    fn backoff_jitter_stays_bounded() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            initial_delay_ms: 100,
+            max_delay_ms: 8_000,
+            jitter: true,
+        };
+        for attempt in 1..=5 {
+            let d = backoff_ms(attempt, &policy, false);
+            let base = backoff_ms(
+                attempt,
+                &RetryPolicy {
+                    jitter: false,
+                    ..policy.clone()
+                },
+                false,
+            );
+            let span = (base / 4).max(1);
+            assert!(d + span >= base, "jitter dipped below bound");
+            assert!(d <= base + span, "jitter exceeded bound");
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_queue_injects_user_message_next_turn() {
+        // Turn 1: model streams text and ends; a steer message queued before
+        // the run must appear as a User message in the LLM input and in the
+        // persisted event log.
+        let steer = crate::SteerQueue::new();
+        steer.push("use plan B");
+        let mut config = test_config(vec![]);
+        config.steer = Some(steer);
+        let seen = Arc::new(Mutex::new(Vec::<Vec<AgentMessage>>::new()));
+        let capture_seen = seen.clone();
+        config.stream_fn = Arc::new(SteerCaptureStream {
+            inner: vec![StreamChunk::TextDelta("done".into()), StreamChunk::Done],
+            seen: capture_seen,
+        });
+        let context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![],
+            tools: vec![],
+            cwd: std::path::PathBuf::from("/tmp"),
+            env: std::collections::HashMap::new(),
+            session_id: "t".into(),
+        };
+        let persisted = Arc::new(Mutex::new(Vec::<SessionEvent>::new()));
+        let p = persisted.clone();
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            p.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+        let _ = run_agent_loop(vec![], context, config, |_| {}).await;
+        let calls = seen.lock().unwrap();
+        let last = calls.last().expect("at least one LLM call");
+        assert!(
+            last.iter().any(|m| matches!(m, AgentMessage::User(u)
+                if u.content.iter().any(|b| matches!(b, crate::ContentBlock::Text { text } if text == "use plan B")))),
+            "steered text must reach the LLM input, got {last:?}"
+        );
+        let log = persisted.lock().unwrap();
+        assert!(
+            log.iter().any(|ev| matches!(ev, SessionEvent::User(m)
+                if matches!(m, AgentMessage::User(u) if u.content.iter().any(|b| matches!(b, crate::ContentBlock::Text { text } if text == "use plan B"))))),
+            "steered text must be persisted as a User event"
+        );
+    }
+
+    /// Streams canned chunks once while recording the message list it was
+    /// handed (the steer assertion inspects what the model would have seen).
+    struct SteerCaptureStream {
+        inner: Vec<StreamChunk>,
+        seen: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
+    }
+
+    impl StreamFn for SteerCaptureStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            messages: &[AgentMessage],
+            _system_prompt: &str,
+            _tools: &[crate::types::tool::ToolDefinition],
+            _signal: Option<crate::CancelSignal>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            Box::pin(stream::iter(self.inner.clone()))
+        }
+    }
+
     #[tokio::test]
     async fn loop_retries_transient_provider_error() {
         // First two attempts error before any content; third succeeds. With
@@ -1755,6 +1907,7 @@ mod tests {
             max_retries: 2,
             initial_delay_ms: 1,
             max_delay_ms: 10,
+            jitter: false,
         };
         let context = AgentContext {
             system_prompt: "sys".into(),
@@ -1786,6 +1939,7 @@ mod tests {
             max_retries: 3,
             initial_delay_ms: 1,
             max_delay_ms: 10,
+            jitter: false,
         };
         let context = AgentContext {
             system_prompt: "sys".into(),

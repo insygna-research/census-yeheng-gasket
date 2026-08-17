@@ -22,9 +22,16 @@ pub struct SubagentResult {
     pub id: String,
     pub task: String,
     pub index: usize,
+    /// Short headline (last assistant message), for event streams.
     pub summary: String,
+    /// Full transcript of the sub-agent's assistant messages — the parent
+    /// reasons over this, not over a tweet-length summary.
+    pub output: String,
     pub tool_count: usize,
     pub error: Option<String>,
+    /// Path of the sub-agent's own events.jsonl (persisted run), when the
+    /// spawner logs sub-agents to disk.
+    pub log_path: Option<String>,
 }
 
 /// Real-time events from sub-agent execution. The first nine variants map
@@ -113,8 +120,10 @@ impl SubagentSpawner for NoopSubagentSpawner {
                     task: t.task,
                     index: i + 1,
                     summary: String::new(),
+                    output: String::new(),
                     tool_count: 0,
                     error: Some("subagents not available in this context".into()),
+                    log_path: None,
                 })
                 .collect()
         })

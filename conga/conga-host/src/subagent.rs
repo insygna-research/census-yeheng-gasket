@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::subagent_types::{SubagentEvent, SubagentResult, SubagentSpawn, SubagentSpawner};
 use conga::{
     run_agent_loop, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, CancelSignal,
-    ContentBlock, ContentDelta, ToolDefinition, UserMessage,
+    ContentBlock, ContentDelta, SessionEvent, ToolDefinition, UserMessage,
 };
 
 /// Max turns for a sub-agent (lower than the parent's default 50).
@@ -39,9 +39,13 @@ pub struct HostSubagentSpawner {
     /// the parent's configured thinking level, per-turn tool-call ceiling,
     /// and retry policy — no hardcoded drift.
     loop_config: AgentLoopConfig,
-    /// Optional event forwarder set by the gateway. All subagent events are
+    /// Optional event-forwarder set by the gateway. All subagent events are
     /// delivered through this callback (the trait has no per-call emit).
     ws_emit: Option<Arc<dyn Fn(SubagentEvent) + Send + Sync>>,
+    /// Where sub-agent event logs live: `<root>/<sub-agent-id>/events.jsonl`
+    /// (the parent session's `sub/` directory). `None` = in-memory only
+    /// (tests, bare spawners).
+    sub_log_root: Option<std::path::PathBuf>,
 }
 
 impl HostSubagentSpawner {
@@ -62,6 +66,7 @@ impl HostSubagentSpawner {
             env: Arc::new(std::env::vars().collect()),
             loop_config,
             ws_emit: None,
+            sub_log_root: None,
         }
     }
 
@@ -69,6 +74,13 @@ impl HostSubagentSpawner {
     /// this callback.
     pub fn with_ws_emit(mut self, ws_emit: Arc<dyn Fn(SubagentEvent) + Send + Sync>) -> Self {
         self.ws_emit = Some(ws_emit);
+        self
+    }
+
+    /// Persist every sub-agent run under `<root>/<id>/events.jsonl`. Crash
+    /// recovery and post-hoc inspection (the parent can `read` the log).
+    pub fn with_sub_log_root(mut self, root: std::path::PathBuf) -> Self {
+        self.sub_log_root = Some(root);
         self
     }
 }
@@ -92,6 +104,7 @@ impl SubagentSpawner for HostSubagentSpawner {
             env: Arc::clone(&self.env),
             loop_config: self.loop_config.clone(),
             ws_emit: self.ws_emit.clone(),
+            sub_log_root: self.sub_log_root.clone(),
         });
 
         Box::pin(async move {
@@ -141,6 +154,34 @@ impl SubagentSpawner for HostSubagentSpawner {
                 sub_config.max_turns = SUBAGENT_MAX_TURNS.min(spawner.loop_config.max_turns);
                 sub_config.signal = Some(spawner.signal.clone());
                 sub_config.hooks = Some(Arc::clone(&spawner.hooks));
+
+                // Optional per-run event log: `<root>/<id>/events.jsonl`.
+                // The persist callback is sync (std fs, same as the main
+                // session's), so no runtime bridging.
+                let log_path = spawner.sub_log_root.as_ref().map(|root| {
+                    let storage = conga::EventStorage::new(root);
+                    let events_path = root.join(&id).join("events.jsonl");
+                    let log_id = id.clone();
+                    sub_config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+                        storage.append_event_sync(&log_id, ev)
+                    }));
+                    events_path
+                });
+                // The loop persists Assistant/ToolResult only (initial
+                // prompts are seeded pre-loop by contract); frame the run
+                // so the log is self-contained.
+                if let (Some(storage_root), false) =
+                    (spawner.sub_log_root.as_ref(), task.task.is_empty())
+                {
+                    let storage = conga::EventStorage::new(storage_root);
+                    let _ = storage.append_event_sync(
+                        &id,
+                        &SessionEvent::User(AgentMessage::User(UserMessage {
+                            content: vec![ContentBlock::text(task.task.clone())],
+                            timestamp: conga::now(),
+                        })),
+                    );
+                }
 
                 let user_msg = AgentMessage::User(UserMessage {
                     content: vec![ContentBlock::text(task.task.clone())],
@@ -199,11 +240,14 @@ impl SubagentSpawner for HostSubagentSpawner {
                                     task: run_task,
                                     index: run_index,
                                     summary: String::new(),
+                                    output: String::new(),
                                     tool_count: 0,
                                     error: Some(err_msg),
+                                    log_path: log_path.clone().map(|p| p.display().to_string()),
                                 }
                             } else {
-                                let (summary, tool_count) = extract_summary_and_tools(&msgs);
+                                let (summary, tool_count, output) =
+                                    extract_summary_tools_output(&msgs);
                                 emit(SubagentEvent::Completed {
                                     id: run_id.clone(),
                                     index: run_index,
@@ -215,8 +259,10 @@ impl SubagentSpawner for HostSubagentSpawner {
                                     task: run_task,
                                     index: run_index,
                                     summary,
+                                    output,
                                     tool_count,
                                     error: None,
+                                    log_path: log_path.clone().map(|p| p.display().to_string()),
                                 }
                             }
                         }
@@ -232,8 +278,10 @@ impl SubagentSpawner for HostSubagentSpawner {
                                 task: run_task,
                                 index: run_index,
                                 summary: String::new(),
+                                output: String::new(),
                                 tool_count: 0,
                                 error: Some(err_msg),
+                                log_path: log_path.clone().map(|p| p.display().to_string()),
                             }
                         }
                     }
@@ -266,8 +314,10 @@ impl SubagentSpawner for HostSubagentSpawner {
                             task: st.task,
                             index: st.index,
                             summary: String::new(),
+                            output: String::new(),
                             tool_count: 0,
                             error: Some(err_msg),
+                            log_path: None,
                         });
                     }
                 }
@@ -364,19 +414,39 @@ fn map_agent_event(id: &str, ev: &AgentEvent) -> Option<SubagentEvent> {
     }
 }
 
-/// Extract the sub-agent's summary (≤200 chars) + tool-result count.
-///
-/// The LAST assistant message is the sub-agent's final output — we never
-/// search backward past it. When `max_turns` runs out mid-tool-call, the
-/// last assistant ended on `ToolUse` (it wanted to keep going but the loop
-/// exhausted its turn budget). In that case the summary is marked incomplete
-/// so the main agent doesn't mistake an intermediate turn's text for the
-/// sub-agent's conclusion.
-fn extract_summary_and_tools(msgs: &[AgentMessage]) -> (String, usize) {
+/// Extract the sub-agent's summary (≤200 chars), FULL assistant transcript,
+/// and tool-result count. The parent reasons over `output`; `summary` is
+/// for event streams and completion toasts.
+fn extract_summary_tools_output(msgs: &[AgentMessage]) -> (String, usize, String) {
     let tool_count = msgs
         .iter()
         .filter(|m| matches!(m, AgentMessage::ToolResult(_)))
         .count();
+
+    // Full output: every assistant text block, in order, separated.
+    let output: Vec<String> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Assistant(a) => {
+                let text: String = a
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    let output = output.join("\n\n");
 
     let summary = match msgs.iter().rev().find_map(|m| match m {
         AgentMessage::Assistant(a) => Some(a),
@@ -407,9 +477,8 @@ fn extract_summary_and_tools(msgs: &[AgentMessage]) -> (String, usize) {
         None => String::new(),
     };
 
-    (summary, tool_count)
+    (summary, tool_count, output)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +542,7 @@ mod tests {
                 hooks: None,
                 retry: RetryPolicy::off(),
                 persist: None,
+                steer: None,
                 transform_context: None,
             },
         )
@@ -481,9 +551,56 @@ mod tests {
         }))
     }
 
+    /// Persistence: with a sub log root set, every sub-agent run lands in
+    /// `<root>/<id>/events.jsonl` (User + Assistant rows), and the result
+    /// carries the FULL assistant transcript, not a truncated summary.
+    #[tokio::test]
+    async fn subagent_run_persists_and_returns_full_output() {
+        let policy = Arc::new(PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_, _| Box::pin(async { true })),
+        ));
+        let hooks: Arc<dyn conga::HookChain> = Arc::new(HookStack::new(vec![policy]));
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let tmp = tempfile::tempdir().unwrap();
+        let spawner = test_spawner(
+            Arc::new(MockStream(vec![
+                StreamChunk::TextDelta("part one. ".into()),
+                StreamChunk::TextDelta("part two.".into()),
+                StreamChunk::Done,
+            ])),
+            hooks,
+            ev_tx,
+            conga::CancelSignal::new(),
+        )
+        .with_sub_log_root(tmp.path().to_path_buf());
+
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "write a long report".into(),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.output, "part one. part two.");
+
+        let log = r.log_path.as_ref().expect("log path set");
+        let log = std::path::Path::new(log);
+        assert!(log.is_file(), "sub log must exist: {}", log.display());
+        let raw = std::fs::read_to_string(log).unwrap();
+        assert!(
+            raw.contains("\"user\""),
+            "log must hold the task user message: {raw}"
+        );
+        assert!(
+            raw.contains("\"assistant\""),
+            "log must hold the assistant reply: {raw}"
+        );
+    }
+
     /// Security regression: a sub-agent calling `bash` must go through the
-    /// SAME `PermissionPolicy` as the parent — the approver is consulted and
-    /// the call is blocked before any command runs.
     #[tokio::test]
     async fn subagent_tool_calls_go_through_shared_policy() {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));

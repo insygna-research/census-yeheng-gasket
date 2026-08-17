@@ -31,9 +31,11 @@ enum WireEvent {
         request_id: String,
         tool_name: String,
         args: serde_json::Value,
+        preview: Option<String>,
     },
-    /// Reply to a message received while a turn is already running.
-    Busy(String),
+    /// Mid-turn user message accepted into the steer queue; rendered as a
+    /// queued user bubble. The loop injects it before its next LLM call.
+    Queued(String),
     /// Slash-command reply that bypasses `run_turn` (goes through the same
     /// ordered channel as everything else — a single writer means exactly
     /// that, no direct-sender shortcuts). Always followed by `Done` so the
@@ -127,12 +129,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                     request_id,
                     tool_name,
                     args,
+                    preview,
                 } => {
-                    let ev = OutgoingEvent::approval_request(request_id, tool_name, &args);
+                    let ev = OutgoingEvent::approval_request(request_id, tool_name, &args, preview);
                     Some(serde_json::to_string(&ev).unwrap_or_default())
                 }
-                WireEvent::Busy(msg) => {
-                    let ev = OutgoingEvent::busy(msg);
+                WireEvent::Queued(text) => {
+                    let ev = OutgoingEvent::queued(text);
                     Some(serde_json::to_string(&ev).unwrap_or_default())
                 }
                 WireEvent::Reply(ev) => Some(serde_json::to_string(&ev).unwrap_or_default()),
@@ -181,11 +184,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
     let approval_emit: conga_host::ApprovalEmit = {
         let wire = wire_tx.clone();
         Arc::new(
-            move |request_id: String, tool_name: String, args: serde_json::Value| {
+            move |request_id: String,
+                  tool_name: String,
+                  args: serde_json::Value,
+                  preview: Option<String>| {
                 let _ = wire.send(WireEvent::Approval {
                     request_id,
                     tool_name,
                     args,
+                    preview,
                 });
             },
         )
@@ -372,14 +379,22 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) 
                                                     }
                                                 }
                                                 "message" => {
-                                                    // A message during a turn
-                                                    // cannot be accepted. Never
-                                                    // drop user input silently:
-                                                    // tell them.
-                                                    let _ = turn_wire.send(WireEvent::Busy(
-                                                        "The agent is busy processing your previous request; this message was not accepted."
-                                                            .into(),
-                                                    ));
+                                                    // A message during a turn is
+                                                    // STEERED, not rejected: it
+                                                    // enters the loop as a real
+                                                    // User message before the
+                                                    // next LLM call. Ack so the
+                                                    // user sees it queued.
+                                                    if let Some(text) = incoming
+                                                        .content
+                                                        .clone()
+                                                        .filter(|t| !t.trim().is_empty())
+                                                    {
+                                                        host.steer().push(text.clone());
+                                                        let _ = turn_wire.send(
+                                                            WireEvent::Queued(text),
+                                                        );
+                                                    }
                                                 }
                                                 _ => {}
                                             }

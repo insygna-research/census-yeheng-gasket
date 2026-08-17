@@ -25,7 +25,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use conga::types::message::ImageContent;
 use conga::{ContentBlock, RiskLevel, ToolDefinition, ToolError, ToolResult};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -236,12 +235,14 @@ fn content_to_blocks(items: &[McpContent]) -> Vec<ContentBlock> {
         .iter()
         .filter_map(|c| match c.kind.as_str() {
             "text" => c.text.clone().map(ContentBlock::text),
-            "image" => Some(ContentBlock::Image {
-                image: ImageContent {
-                    data: c.data.clone().unwrap_or_default(),
-                    mime_type: c.mime_type.clone().unwrap_or_default(),
-                },
-            }),
+            // Vision is not on conga's wire: providers would silently drop
+            // image blocks. Say so instead of constructing a block the model
+            // never sees.
+            "image" => Some(ContentBlock::text(format!(
+                "[image content omitted: {}, {} bytes of base64]",
+                c.mime_type.as_deref().unwrap_or("unknown mime"),
+                c.data.as_deref().map(str::len).unwrap_or(0),
+            ))),
             _ => Some(ContentBlock::text(format!("{c:?}"))),
         })
         .collect();
@@ -868,14 +869,15 @@ mod tests {
             },
         ];
         let blocks = content_to_blocks(&items);
-        assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"));
         match &blocks[1] {
-            ContentBlock::Image { image } => {
-                assert_eq!(image.data, "base64data");
-                assert_eq!(image.mime_type, "image/png");
+            ContentBlock::Text { text } => {
+                assert_eq!(
+                    text,
+                    "[image content omitted: image/png, 10 bytes of base64]"
+                );
             }
-            _ => panic!("expected Image"),
+            _ => panic!("expected Text"),
         }
     }
 

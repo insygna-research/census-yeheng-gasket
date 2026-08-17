@@ -5,7 +5,6 @@
 pub mod hello;
 pub mod permission_gate;
 pub mod search;
-pub mod todo;
 
 #[cfg(feature = "terminal")]
 pub mod terminal;
@@ -21,11 +20,11 @@ pub fn prod_register(api: &mut dyn conga::ExtensionApi) {
     terminal::register(api);
 }
 
-/// Register every extension in this crate.
+/// Register every extension in this crate. (`todo` moved to the built-in
+/// tool set in conga-host.)
 pub fn register_all(api: &mut dyn ExtensionApi) {
     prod_register(api);
     hello::register(api);
-    todo::register(api);
     permission_gate::register(api);
 }
 

@@ -60,6 +60,46 @@ impl ProviderConfig {
         Self::from_env_with(&|k: &str| std::env::var(k))
     }
 
+    /// Read a prefixed provider config, e.g. prefix `CONGA_FAST_LLM` reads
+    /// `CONGA_FAST_LLM_BASE_URL` / `_KEY` / `_MODEL` / `_API`. Used for the
+    /// sub-agent "fast model" override; proxies fall back to the main
+    /// `CONGA_LLM_PROXY*` knobs (a routing override rarely changes egress).
+    /// `Ok(None)` when the prefix has NO vars set at all; a PARTIAL set
+    /// (some vars present, a required one missing) is an `Err` so typos
+    /// fail loud instead of silently falling back to the main model.
+    pub fn from_env_prefixed(
+        prefix: &str,
+        lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, ConfigError> {
+        let var = |suffix: &str| lookup(&format!("{prefix}_{suffix}")).ok();
+        if var("BASE_URL").is_none()
+            && var("KEY").is_none()
+            && var("MODEL").is_none()
+            && var("API").is_none()
+        {
+            return Ok(None);
+        }
+        let base_url = var("BASE_URL").ok_or(ConfigError::Missing("CONGA_FAST_LLM_BASE_URL"))?;
+        let api_key = var("KEY").ok_or(ConfigError::Missing("CONGA_FAST_LLM_KEY"))?;
+        let model = var("MODEL").ok_or(ConfigError::Missing("CONGA_FAST_LLM_MODEL"))?;
+        let api = match var("API").as_deref() {
+            Some("anthropic") => ProviderApi::Anthropic,
+            _ => ProviderApi::OpenAiCompat,
+        };
+        // Proxy fallback: prefixed vars first, then the main LLM proxy knobs.
+        let generic_proxy = var("PROXY").or_else(|| lookup("CONGA_LLM_PROXY").ok());
+        let http_proxy = var("HTTP_PROXY").or_else(|| lookup("CONGA_LLM_HTTP_PROXY").ok());
+        let https_proxy = var("HTTPS_PROXY").or_else(|| lookup("CONGA_LLM_HTTPS_PROXY").ok());
+        let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
+        Ok(Some(Self {
+            api,
+            base_url,
+            api_key,
+            model,
+            client,
+        }))
+    }
+
     /// Same as [`from_env`](Self::from_env) but with an injectable lookup -
     /// used by tests to avoid mutating process env.
     pub fn from_env_with(
@@ -156,6 +196,41 @@ mod tests {
         assert_eq!(cfg.api_key, "sk-test");
         assert_eq!(cfg.model, "gpt-4o-mini");
         assert_eq!(cfg.api, ProviderApi::OpenAiCompat); // default when CONGA_LLM_API unset
+    }
+
+    #[test]
+    fn prefixed_loader_none_when_unset() {
+        let r = ProviderConfig::from_env_prefixed("CONGA_FAST_LLM", &fake_env(&[])).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn prefixed_loader_full_set() {
+        let r = ProviderConfig::from_env_prefixed(
+            "CONGA_FAST_LLM",
+            &fake_env(&[
+                ("CONGA_FAST_LLM_BASE_URL", "https://fast.x.com/v1"),
+                ("CONGA_FAST_LLM_KEY", "sk-fast"),
+                ("CONGA_FAST_LLM_MODEL", "fast-model"),
+                ("CONGA_FAST_LLM_API", "anthropic"),
+            ]),
+        )
+        .unwrap();
+        let cfg = r.expect("full set must load");
+        assert_eq!(cfg.base_url, "https://fast.x.com/v1");
+        assert_eq!(cfg.model, "fast-model");
+        assert_eq!(cfg.api, ProviderApi::Anthropic);
+    }
+
+    #[test]
+    fn prefixed_loader_partial_set_fails_loud() {
+        // MODEL missing but BASE_URL present: a typo must be an error, not a
+        // silent fallback to the main model.
+        let r = ProviderConfig::from_env_prefixed(
+            "CONGA_FAST_LLM",
+            &fake_env(&[("CONGA_FAST_LLM_BASE_URL", "https://fast.x.com/v1")]),
+        );
+        assert!(r.is_err(), "partial set must fail: {r:?}");
     }
 
     #[test]

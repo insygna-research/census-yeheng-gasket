@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hooks: Some(Arc::new(api)),
         retry: conga::RetryPolicy::default(),
         persist: None,
+        steer: None,
         transform_context: None,
     };
 

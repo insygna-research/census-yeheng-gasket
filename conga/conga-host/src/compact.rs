@@ -8,6 +8,10 @@
 
 use conga::{AgentMessage, ContentBlock, UserMessage};
 
+/// Old ToolResult text blocks are head-truncated to this many chars during
+/// compaction (the newest exchange stays verbatim).
+const TRUNCATED_TOOL_RESULT_CHARS: usize = 400;
+
 /// Default cap on working history size (message count, not tokens).
 pub const DEFAULT_MAX_MESSAGES: usize = 80;
 
@@ -52,6 +56,13 @@ fn atomic_groups(messages: &[AgentMessage]) -> Vec<(usize, usize)> {
 /// Groups are kept whole, so an `Assistant(tool_call)` is never separated from
 /// its trailing `ToolResult`s.
 ///
+/// Harness invariants on top of the plain drop-oldest walk:
+/// - The FIRST group (the original task) is never dropped — an agent that
+///   forgets why it started is worse than an agent with a shorter window.
+/// - Before dropping anything, ToolResult text blocks OUTSIDE the newest
+///   groups are truncated to a head preview: old tool output is usually
+///   spent; the tail is what the model still reasons over.
+///
 /// Under budget (or `max_messages == 0`): clone unchanged.
 pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<AgentMessage> {
     if max_messages == 0 || messages.len() <= max_messages {
@@ -63,11 +74,18 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
 
     // Walk groups from newest backwards, accumulating whole groups until the
     // running message count would exceed the budget. Always keep at least the
-    // final group.
+    // final group. The FIRST group is exempt from the budget: keep it even
+    // when its size alone exceeds what's left.
     let mut kept_msg_count = 0;
     let mut first_kept_group = groups.len();
     for (idx, &(start, end)) in groups.iter().enumerate().rev() {
         let group_len = end - start;
+        if idx == 0 {
+            // Pin the original task; it rides outside the budget.
+            kept_msg_count += group_len;
+            first_kept_group = 0;
+            break;
+        }
         if idx < groups.len() - 1 && kept_msg_count + group_len > budget {
             break;
         }
@@ -76,23 +94,56 @@ pub fn compact_by_count(messages: &[AgentMessage], max_messages: usize) -> Vec<A
     }
 
     let start = groups[first_kept_group].0;
-    let dropped = start;
+    // The pinned first group (groups[0]) stays; only what lies between it
+    // and `start` was actually dropped.
+    let pinned_len = groups[0].1 - groups[0].0;
+    let dropped = start.saturating_sub(pinned_len);
     if dropped == 0 {
         return messages.to_vec();
     }
 
-    let mut out = Vec::with_capacity(kept_msg_count + 1);
+    let mut out: Vec<AgentMessage> = Vec::with_capacity(kept_msg_count + 1);
+    out.push(messages[0].clone()); // pinned original task
     out.push(AgentMessage::User(UserMessage {
         content: vec![ContentBlock::text(format!(
-            "[compacted {dropped} earlier messages]"
+            "[compacted {dropped} earlier messages; original task kept]"
         ))],
         timestamp: conga::now(),
     }));
-    out.extend_from_slice(&messages[start..]);
+    // Truncate old tool results (everything before the final group) to a
+    // head preview; the newest exchange stays verbatim.
+    let newest_group_start = groups[groups.len() - 1].0;
+    for (i, m) in messages[start..].iter().enumerate() {
+        let abs = start + i;
+        if abs < newest_group_start {
+            out.push(truncate_tool_result(m));
+        } else {
+            out.push(m.clone());
+        }
+    }
     out
 }
 
-/// Parse `key` from the lookup as `T`, falling back to `default` on miss or
+/// Head-truncate a message's ToolResult text blocks. Other message kinds
+/// pass through untouched.
+fn truncate_tool_result(m: &AgentMessage) -> AgentMessage {
+    match m {
+        AgentMessage::ToolResult(tr) => {
+            let mut tr = tr.clone();
+            for b in tr.content.iter_mut() {
+                if let ContentBlock::Text { text } = b {
+                    if text.chars().count() > TRUNCATED_TOOL_RESULT_CHARS {
+                        let head: String = text.chars().take(TRUNCATED_TOOL_RESULT_CHARS).collect();
+                        *text = format!("{head}\n[... output truncated by compaction ...]");
+                    }
+                }
+            }
+            AgentMessage::ToolResult(tr)
+        }
+        other => other.clone(),
+    }
+}
+
 /// parse failure. Mirrors the helper in `conga/src/types/context.rs` so
 /// `compact.rs` stays self-contained.
 fn env_parse<T: std::str::FromStr>(
@@ -265,19 +316,26 @@ mod tests {
     fn over_budget_shrinks_and_notices() {
         let msgs: Vec<_> = (0..10).map(|i| user(&format!("m{i}"))).collect();
         let out = compact_by_count(&msgs, 4);
-        // 1 summary + 3 kept = 4
-        assert_eq!(out.len(), 4);
+        // 1 pinned task + 1 notice + 3 kept = 5
+        assert_eq!(out.len(), 5);
         match &out[0] {
             AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => assert_eq!(text, "m0"),
+                _ => panic!(),
+            },
+            _ => panic!("expected pinned original task"),
+        }
+        match &out[1] {
+            AgentMessage::User(u) => match &u.content[0] {
                 ContentBlock::Text { text } => {
-                    assert!(text.contains("compacted 7 earlier messages"));
+                    assert!(text.contains("compacted 6 earlier messages"));
                 }
                 _ => panic!(),
             },
             _ => panic!("expected summary user message"),
         }
         // Tail preserved: m7, m8, m9
-        match &out[3] {
+        match &out[4] {
             AgentMessage::User(u) => match &u.content[0] {
                 ContentBlock::Text { text } => assert_eq!(text, "m9"),
                 _ => panic!(),
@@ -398,12 +456,20 @@ mod tests {
         };
         let out = budget.compact(&msgs);
         // Token-triggered → retain target_pct% (50%) of 10 messages as the
-        // count budget = 5; compact_by_count reserves 1 for the notice, so it
-        // keeps 4 (m6..m9) + 1 notice = 5 total, dropping 6.
-        assert_eq!(out.len(), 5);
+        // count budget = 5; compact_by_count keeps 4 newest (m6..m9) under
+        // the notice slot, plus the pinned original task (m0) = 6 total,
+        // dropping 5 (m1..m5).
+        assert_eq!(out.len(), 6);
         match &out[0] {
             AgentMessage::User(u) => match &u.content[0] {
-                ContentBlock::Text { text } => assert!(text.contains("compacted 6")),
+                ContentBlock::Text { text } => assert!(text.contains("m0"), "original task pinned"),
+                _ => panic!(),
+            },
+            _ => panic!("expected pinned original task"),
+        }
+        match &out[1] {
+            AgentMessage::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => assert!(text.contains("compacted 5")),
                 _ => panic!(),
             },
             _ => panic!("expected summary user message"),
@@ -421,8 +487,11 @@ mod tests {
             last_input_tokens: 0,
         };
         let out = budget.compact(&msgs);
-        // fallback: compact_by_count(msgs, 4) = 1 notice + 3 kept = 4
-        assert_eq!(out.len(), 4);
+        // fallback: compact_by_count(msgs, 4) = 1 pinned task + 1 notice
+        // + 3 kept = 5
+        assert_eq!(out.len(), 5);
+        assert!(matches!(&out[0], AgentMessage::User(u)
+            if matches!(&u.content[0], ContentBlock::Text { text } if text.contains("m0"))));
     }
 
     #[test]

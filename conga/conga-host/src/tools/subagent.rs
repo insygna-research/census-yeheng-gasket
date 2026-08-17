@@ -73,17 +73,29 @@ async fn execute(
 
     let results = spawner.spawn(spawns).await;
 
+    // Full sections: the parent reasons over the complete output, not a
+    // 200-char summary. Log paths let it re-read a transcript on demand.
     let mut summary = results
         .iter()
         .map(|r| {
-            if let Some(err) = &r.error {
+            let mut section = if let Some(err) = &r.error {
                 format!("Subagent {} ({}): ERROR - {}", r.index, r.task, err)
             } else {
-                format!("Subagent {} ({}): {}", r.index, r.task, r.summary)
+                format!("Subagent {} ({}):", r.index, r.task)
+            };
+            if !r.output.trim().is_empty() {
+                section.push('\n');
+                section.push_str(&r.output);
+            } else if r.error.is_none() {
+                section.push_str(&format!(" {}", r.summary));
             }
+            if let Some(log) = &r.log_path {
+                section.push_str(&format!("\n(full log: {log})"));
+            }
+            section
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n\n---\n\n");
     if dropped > 0 {
         summary.push_str(&format!(
             "\n\n(Note: {dropped} additional task(s) beyond the max of 5 were dropped.)"
@@ -94,6 +106,8 @@ async fn execute(
             "\n\n(Note: {invalid} task(s) without a valid 'task' string were skipped.)"
         ));
     }
+    // The combined output can be huge; spill to disk past the cap.
+    let summary = super::spill_or_truncate(&ctx, &summary);
 
     Ok(ToolResult {
         content: vec![ContentBlock::text(summary)],
@@ -101,6 +115,7 @@ async fn execute(
             "subagent_count": results.len(),
             "completed": results.iter().filter(|r| r.error.is_none()).count(),
             "errors": results.iter().filter(|r| r.error.is_some()).count(),
+            "log_paths": results.iter().filter_map(|r| r.log_path.clone()).collect::<Vec<_>>(),
             "dropped": dropped,
             "invalid": invalid,
         }),
@@ -143,8 +158,10 @@ mod tests {
                         task: t.task,
                         index: i + 1,
                         summary: marker.into(),
+                        output: String::new(),
                         tool_count: 0,
                         error: None,
+                        log_path: None,
                     })
                     .collect()
             })

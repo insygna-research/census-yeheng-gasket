@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("persist bridge thread panicked")
             })
         })),
+        steer: None,
         transform_context: None,
     };
     store

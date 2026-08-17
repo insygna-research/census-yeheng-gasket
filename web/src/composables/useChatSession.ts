@@ -294,14 +294,23 @@ export function useChatSession(chatId: { value: string }) {
         isReceiving.value = false;
         showError(msg.message || 'The agent is busy processing a request');
         break;
-      // subagent_*: live events forwarded by the gateway's single ordered
-      // wire channel (event_map::subagent_event_to_ws) while a
-      // spawn_subagents fan-out runs.
-      case 'subagent_all_started':
-        subagentPhase.value = 'running';
+      case 'queued': {
+        // 中途消息已入列（steer）：渲染为待处理用户气泡。循环会在下一
+        // 次 LLM 调用前把它作为真实 User 消息注入并落盘。
+        isReceiving.value = false;
+        chatStore.appendMessage(chatId.value, {
+          id: `queued-${Date.now()}`,
+          role: 'user',
+          content: msg.message,
+          timestamp: Date.now(),
+          pending: true,
+        });
         break;
+      }
       case 'subagent_started':
         handleSubagentStarted(msg, botMsg);
+        break;
+      case 'subagent_all_started':
         break;
       case 'subagent_thinking':
         handleSubagentThinking(msg, botMsg);
@@ -331,6 +340,7 @@ export function useChatSession(chatId: { value: string }) {
           tool_name: msg.tool_name,
           description: msg.description,
           arguments: msg.arguments,
+          preview: msg.preview,
         });
         break;
     }

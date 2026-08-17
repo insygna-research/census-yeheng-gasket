@@ -64,6 +64,11 @@ pub struct AgentLoopConfig {
     /// run (fail loud - storage failures are never silently swallowed).
     #[allow(clippy::type_complexity)]
     pub persist: Option<Arc<dyn Fn(&SessionEvent) -> Result<(), AgentError> + Send + Sync>>,
+    /// Mid-turn user input: transports push text onto this queue while the
+    /// loop runs; the loop drains it at the top of each turn iteration and
+    /// appends each item as a real `User` message (persisted like any
+    /// other). `None` = no steering (bare `agent_loop` and tests).
+    pub steer: Option<crate::steer::SteerQueue>,
     /// Optional transform applied to the message list before EVERY LLM
     /// call — the seam host compaction (or redaction, auditing) hooks
     /// into. Pure wire view: the loop's accumulator, returned messages,
@@ -86,7 +91,10 @@ impl std::fmt::Debug for AgentLoopConfig {
 }
 
 /// Retry policy for a single LLM call. Backoff is exponential:
-/// `initial_delay_ms * 2^(attempt-1)`, capped at `max_delay_ms`. No jitter.
+/// `initial_delay_ms * 2^(attempt-1)`, capped at `max_delay_ms`. When
+/// `jitter` is on, a bounded pseudo-random offset (± delay/4) is applied so
+/// concurrent workers retried by the same clock don't thunder into the
+/// provider in lockstep.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Max retries after the initial attempt (0 = no retry).
@@ -95,6 +103,8 @@ pub struct RetryPolicy {
     pub initial_delay_ms: u64,
     /// Upper bound on backoff delay, in milliseconds.
     pub max_delay_ms: u64,
+    /// Apply bounded jitter to every backoff (default true).
+    pub jitter: bool,
 }
 
 impl Default for RetryPolicy {
@@ -103,6 +113,7 @@ impl Default for RetryPolicy {
             max_retries: 2,
             initial_delay_ms: 500,
             max_delay_ms: 8_000,
+            jitter: true,
         }
     }
 }
@@ -114,6 +125,7 @@ impl RetryPolicy {
             max_retries: 0,
             initial_delay_ms: 0,
             max_delay_ms: 0,
+            jitter: false,
         }
     }
 }
@@ -167,6 +179,7 @@ impl AgentTunables {
                     default_retry.initial_delay_ms,
                 ),
                 max_delay_ms: env_parse(lookup, "CONGA_RETRY_MAX_MS", default_retry.max_delay_ms),
+                jitter: default_retry.jitter,
             },
         }
     }

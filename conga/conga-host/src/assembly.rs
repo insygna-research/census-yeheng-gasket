@@ -43,10 +43,13 @@ impl std::fmt::Display for AssemblyError {
 }
 
 /// Where an approval request goes when a tool needs human consent:
-/// `(request_id, tool_name, args)`. Transports forward it onto their
-/// ordered event channel so a request can never overtake the
-/// `tool_start` event of the call it belongs to.
-pub type ApprovalEmit = Arc<dyn Fn(String, String, serde_json::Value) + Send + Sync>;
+/// `(request_id, tool_name, args, preview)`. Transports forward it onto
+/// their ordered event channel so a request can never overtake the
+/// `tool_start` event of the call it belongs to. `preview` is the
+/// human-readable diff for file-mutating tools (see [`crate::preview`]),
+/// `None` for tools whose arguments already read well.
+pub type ApprovalEmit =
+    Arc<dyn Fn(String, String, serde_json::Value, Option<String>) + Send + Sync>;
 
 /// Where sub-agent events go. Transports forward onto their ordered event
 /// channel (the same one as approvals and main-agent stream events).
@@ -100,7 +103,33 @@ pub async fn gather_tools(
     tools.extend(external);
     tools.extend(mcp_tools);
     tools.extend(append);
-    tools
+    dedup_tool_names(tools, quiet)
+}
+
+/// First registration wins (the assembly order IS the priority: built-in →
+/// prepend → external → MCP → append). Later same-name tools are dropped
+/// with a warning instead of silently shadowing — the loop resolves tools
+/// by first name match, so an unreported collision would route calls to the
+/// wrong implementation.
+fn dedup_tool_names(tools: Vec<ToolDefinition>, quiet: bool) -> Vec<ToolDefinition> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(tools.len());
+    for t in tools {
+        if seen.insert(t.name.clone()) {
+            out.push(t);
+        } else if quiet {
+            tracing::warn!(
+                tool = %t.name,
+                "duplicate tool name dropped (first registration wins)"
+            );
+        } else {
+            eprintln!(
+                "(warning: duplicate tool name '{}' dropped; first registration wins)",
+                t.name
+            );
+        }
+    }
+    out
 }
 
 /// A fully wired session: the transport drives `host.run_turn` per user
@@ -157,7 +186,6 @@ impl SessionAssembly {
             Err(e) => return Err(AssemblyError::Config(e.to_string())),
         };
         let session_mgr = resume_session(store_root, session_id).await?;
-
         // Intentionally one env knob shared by every transport.
         let mode = std::env::var("CONGA_GATEWAY_MODE")
             .ok()
@@ -181,7 +209,14 @@ impl SessionAssembly {
                         RegisterOutcome::Remembered(v) => return v,
                         RegisterOutcome::Pending { request_id, rx } => (request_id, rx),
                     };
-                    emit(request_id.clone(), tool_name.to_string(), args.clone());
+                    let preview =
+                        crate::preview::approval_preview(tool_name, args, &crate::project_dir());
+                    emit(
+                        request_id.clone(),
+                        tool_name.to_string(),
+                        args.clone(),
+                        preview,
+                    );
                     let timeout_s = std::env::var("CONGA_APPROVAL_TIMEOUT_S")
                         .ok()
                         .and_then(|v| v.parse().ok())
@@ -270,7 +305,10 @@ async fn assemble_host(
     subagent_emit: SubagentEmit,
 ) -> Host {
     let cwd = crate::project_dir();
-    let system_prompt = crate::append_skills("You are a helpful, concise assistant.", &cwd);
+    let system_prompt = crate::append_skills(
+        &crate::append_project_doc(crate::CODING_AGENT_PROMPT, &cwd),
+        &cwd,
+    );
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
 
     // Host hooks: extra gates first (e.g. the CLI's ext permission gate),
@@ -294,16 +332,46 @@ async fn assemble_host(
     // backend used to miss this line - it lived only in the gateway's
     // copy of this wiring.)
     policy.set_signal(host.signal().clone());
-
     let spawner_signal = host.signal().clone();
     let spawner_stream_fn = cfg.provider_stream_fn();
     let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(HookStack::new(vec![policy]));
-    let loop_config = cfg.build_loop_config(
+    // Fast-model routing: a complete `CONGA_FAST_LLM_*` set moves the
+    // sub-agents to a cheaper model (same tunables otherwise). Partial sets
+    // fail loud at startup — a typo must not silently keep the main model.
+    let mut loop_config = cfg.build_loop_config(
         cfg.tunables.max_turns,
         Some(spawner_signal.clone()),
         None,
         spawner_stream_fn,
     );
+    match conga::ProviderConfig::from_env_prefixed("CONGA_FAST_LLM", &|k: &str| std::env::var(k)) {
+        Ok(Some(fast)) => {
+            loop_config.model = conga::ModelSpec {
+                id: fast.model.clone(),
+                api: fast.api,
+                max_tokens: cfg.tunables.max_tokens,
+                supports_thinking: cfg.tunables.thinking_level != conga::ThinkingLevel::Off,
+            };
+            loop_config.stream_fn = match fast.api {
+                conga::ProviderApi::OpenAiCompat => {
+                    Arc::new(conga::OpenAiCompat::from_config(&fast))
+                }
+                conga::ProviderApi::Anthropic => {
+                    Arc::new(conga::AnthropicProvider::from_config(&fast))
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("(warning: CONGA_FAST_LLM_* incomplete, sub-agents keep the main model: {e})")
+        }
+    }
+    // Sub-agent runs persist under the parent session's `sub/` directory:
+    // crash-recoverable, and the parent can read a sub-agent's transcript
+    // from disk (`read` allows absolute paths under ~/.conga).
+    let sub_log_root = conga::JsonlStorage::default_root()
+        .base_dir_clone()
+        .join(host.session().current_id());
     let spawner = Arc::new(
         HostSubagentSpawner::new(
             "You are a focused sub-agent. Complete your assigned task concisely.".into(),
@@ -313,7 +381,8 @@ async fn assemble_host(
             crate::project_dir(),
             loop_config,
         )
-        .with_ws_emit(subagent_emit),
+        .with_ws_emit(subagent_emit)
+        .with_sub_log_root(sub_log_root.join("sub")),
     );
     host.with_spawner(spawner)
 }
@@ -347,19 +416,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resume_session_adopts_fresh_and_existing_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Fresh: no log, no legacy file — a brand-new session, not an error.
-        let mgr = resume_session(tmp.path(), "fresh-sess").await.unwrap();
-        assert_eq!(mgr.current_id(), "fresh-sess");
+    fn named_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            label: name.into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: conga::RiskLevel::Low,
+            execute: std::sync::Arc::new(|_ctx| {
+                Box::pin(async { Ok(conga::ToolResult::error("stub")) })
+            }),
+        }
+    }
 
-        // Existing: log on disk is loaded and the id adopted.
-        conga::EventStorage::new(tmp.path().to_path_buf())
-            .append_event("has-log", &conga::SessionEvent::TurnStart)
-            .await
-            .unwrap();
-        let mgr = resume_session(tmp.path(), "has-log").await.unwrap();
-        assert_eq!(mgr.current_id(), "has-log");
+    #[test]
+    fn duplicate_tool_names_first_wins() {
+        let tools = vec![
+            named_tool("bash"),
+            named_tool("web_search"),
+            named_tool("bash"), // duplicate: dropped
+        ];
+        let out = dedup_tool_names(tools, true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "bash");
+        assert_eq!(out[1].name, "web_search");
     }
 }

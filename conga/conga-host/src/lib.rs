@@ -19,7 +19,9 @@ pub mod external_tool;
 pub mod hooks;
 pub mod mcp;
 pub mod permission;
+pub mod preview;
 pub mod printer;
+pub mod prompt;
 pub mod proxy;
 pub mod session;
 pub mod session_api;
@@ -40,6 +42,7 @@ pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
+pub use prompt::{append_project_doc, env_snapshot, CODING_AGENT_PROMPT};
 pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use session::{SessionInfo, SessionManager};
 #[cfg(feature = "session-index")]
@@ -102,6 +105,10 @@ pub struct Host {
     /// assistant usage from its tail, so token-aware compaction survives
     /// restarts by construction.
     budget: ContextBudget,
+    /// Mid-turn user input queue: transports push here while a turn runs;
+    /// `run_turn` hands it to the loop, which injects each item as a real
+    /// User message at the next safe point.
+    steer: conga::SteerQueue,
     /// Turn serialization slot: run_turn acquires it on entry and releases
     /// it on completion or drop. The event log's format contract assumes a
     /// single writer per session, and one Host drives one session — so a
@@ -136,6 +143,7 @@ impl Host {
             stream_fn: cfg.provider_stream_fn(),
             max_turns: cfg.tunables.max_turns,
             budget: ContextBudget::from_env(),
+            steer: conga::SteerQueue::new(),
             cfg,
             turn_in_flight: AtomicBool::new(false),
             session,
@@ -144,6 +152,13 @@ impl Host {
             system_prompt,
             tools,
         }
+    }
+
+    /// The shared mid-turn input queue. Transports clone this handle and
+    /// push user text while a turn runs; the loop injects it as User
+    /// messages before the next LLM call.
+    pub fn steer(&self) -> conga::SteerQueue {
+        self.steer.clone()
     }
 
     /// Replace the provider stream_fn with a fake (tests) or custom one.
@@ -292,9 +307,24 @@ impl Host {
         // results for tool calls that never got one before feeding the loop.
         repair_unanswered_tool_calls(&mut history);
 
+        // Per-turn environment block: git status / diffstat drift as the
+        // session progresses. Built fresh each turn (blocking git calls are
+        // capped and timeout-guarded inside `env_snapshot`); appended, never
+        // persisted — the static prompt in `self.system_prompt` stays the
+        // durable part.
+        let snapshot = crate::prompt::env_snapshot(&self.cwd);
+        let turn_prompt = if snapshot.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            format!(
+                "{}\n\n<environment>\n{}\n</environment>",
+                self.system_prompt, snapshot
+            )
+        };
+
         let (context, mut config) = self.cfg.prepare_turn(
             TurnInputs {
-                system_prompt: &self.system_prompt,
+                system_prompt: &turn_prompt,
                 history: &history,
                 tools: &self.tools,
                 cwd: &self.cwd,
@@ -309,6 +339,7 @@ impl Host {
         config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
             Ok(budget.compact(msgs))
         }));
+        config.steer = Some(self.steer.clone());
 
         let outcome = conga::run_agent_loop(vec![user], context, config, |ev| {
             on_event(ev);

@@ -7,14 +7,16 @@ pub mod grep;
 pub mod list;
 pub mod read;
 pub mod sandbox;
+pub mod shell;
 pub mod subagent;
+pub mod todo;
 pub mod write;
 
 use std::path::{Component, Path, PathBuf};
 
 use conga::types::tool::ToolDefinition;
 
-/// The 8 built-in tools, ready to drop into `AgentContext.tools`.
+/// The 9 built-in tools, ready to drop into `AgentContext.tools`.
 /// `spawn_subagents` is built WITHOUT a spawner here; hosts wire their own
 /// via `Host::with_spawner`, which replaces the tool in their list.
 pub fn built_in_tools() -> Vec<ToolDefinition> {
@@ -26,6 +28,7 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
         list::tool(),
         grep::tool(),
         fetch::tool(),
+        todo::tool(),
         subagent::tool(None),
     ]
 }

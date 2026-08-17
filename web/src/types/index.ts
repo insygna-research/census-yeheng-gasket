@@ -74,7 +74,8 @@ export type WsMessage =
   | { type: 'error'; content?: string; message?: string }
   | { type: 'done'; usage_in?: number; usage_out?: number; elapsed_ms?: number }
   | { type: 'busy'; content?: string; message?: string }
-  | { type: 'approval_request'; id: string; tool_name: string; description: string; arguments: string }
+  | { type: 'queued'; message: string }
+  | { type: 'approval_request'; id: string; tool_name: string; description: string; arguments: string; preview?: string }
   // ── subagent_* (all 9 wire variants; Usage never leaves the server) ──
   | SubagentWsMessage;
 
@@ -84,7 +85,7 @@ export type WsMessage =
  */
 const WS_MESSAGE_TYPES = new Set([
   'thinking', 'content', 'text', 'tool_start', 'tool_end', 'error', 'done',
-  'busy', 'approval_request',
+  'busy', 'queued', 'approval_request',
   'subagent_all_started', 'subagent_synthesizing', 'subagent_started',
   'subagent_thinking', 'subagent_content', 'subagent_tool_start',
   'subagent_tool_end', 'subagent_completed', 'subagent_error',
@@ -201,6 +202,8 @@ export interface ApprovalRequest {
   tool_name: string;
   description: string;
   arguments?: string;
+  /** Human-readable diff preview for file-mutating tools (edit/write). */
+  preview?: string;
 }
 
 export interface ApprovalResponse {
