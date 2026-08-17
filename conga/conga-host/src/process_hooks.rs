@@ -172,6 +172,11 @@ impl ProcessHookChain {
         Self { hooks, cwd: None }
     }
 
+    /// Number of loaded hooks (for the assembly log line).
+    pub fn len(&self) -> usize {
+        self.hooks.len()
+    }
+
     /// Production entry: global `~/.conga/hooks.json` + project
     /// `<project_dir>/.conga/hooks.json`. `None` when no hooks are
     /// configured (nothing pushed into the stack — zero overhead).

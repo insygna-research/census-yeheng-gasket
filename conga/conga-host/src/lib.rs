@@ -49,6 +49,7 @@ pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
+pub use process_hooks::ProcessHookChain;
 pub use prompt::{append_project_doc, env_snapshot, CODING_AGENT_PROMPT};
 pub use proxy::{apply_tool_proxy, set_tool_proxy, tool_proxy, validate_tool_proxy};
 pub use session::{SessionInfo, SessionManager};

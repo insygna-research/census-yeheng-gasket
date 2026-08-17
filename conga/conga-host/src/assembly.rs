@@ -340,6 +340,18 @@ async fn assemble_host(
     for h in extra_hooks {
         hook_stack.push(h);
     }
+    // Process-out PreToolUse hooks (Claude-compatible protocol) sit between
+    // in-process gates and the policy: they are repo-shippable extra gates,
+    // and the policy stays last so a failed/timed-out hook failing open can
+    // never bypass the built-in floor gate. Loaded per assembly (same
+    // lifecycle as skills); None when no hooks.json exists anywhere.
+    if let Some(process_chain) = crate::process_hooks::ProcessHookChain::discover(&cwd) {
+        tracing::info!(
+            hooks = process_chain.len(),
+            "process hooks installed (PreToolUse)"
+        );
+        hook_stack.push(process_chain);
+    }
     hook_stack.push(policy.clone());
     let spawner_hooks: Arc<dyn conga::HookChain> = Arc::new(hook_stack);
 
