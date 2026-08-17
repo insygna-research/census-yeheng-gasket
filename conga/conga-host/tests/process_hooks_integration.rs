@@ -51,6 +51,14 @@ impl StreamFn for OneToolCallThenText {
 
 #[tokio::test]
 async fn blocking_process_hook_stops_tool_call_in_agent_loop() {
+    // Hermetic HOME: `discover()` also loads a developer-global
+    // `~/.conga/hooks.json` (via dirs::home_dir → $HOME); a global hook
+    // matching `bash` would change the verdict under test. Pin $HOME to an
+    // empty tempdir for this test's duration and restore it on every path.
+    // (This binary holds exactly one test, so a parallel test racing on the
+    // same env var is not a concern; the comment stays true while it does.)
+    let _home_guard = tempdir_env_home(); // Drop restores $HOME (panic-safe)
+
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".conga")).unwrap();
     std::fs::write(
@@ -152,4 +160,32 @@ async fn blocking_process_hook_stops_tool_call_in_agent_loop() {
         !ran.load(Ordering::SeqCst),
         "tool body must never run when the hook blocks"
     );
+}
+
+/// Point `$HOME` at an empty tempdir until dropped; `Drop` restores the
+/// original value (or removes it if unset), so panics unwind with the env
+/// intact. Safe here because this test binary runs exactly one test — no
+/// sibling race on the same var. (Edition 2021: `set_var` is safe.)
+struct HomeGuard {
+    _dir: tempfile::TempDir, // keeps the scratch dir alive; removed on drop
+    prior: Option<std::ffi::OsString>,
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+fn tempdir_env_home() -> HomeGuard {
+    // dirs::home_dir() reads $HOME on unix; an empty dir means no global
+    // hooks.json, so discover() sees only the project file. Capture the
+    // prior value BEFORE overwriting it.
+    let prior = std::env::var_os("HOME");
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", dir.path());
+    HomeGuard { _dir: dir, prior }
 }

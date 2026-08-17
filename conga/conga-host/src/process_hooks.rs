@@ -177,6 +177,12 @@ impl ProcessHookChain {
         self.hooks.len()
     }
 
+    /// Paired with `len` per the std collection convention (and clippy's
+    /// `len_without_is_empty`); `discover()` already returns None for this.
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+    }
+
     /// Production entry: global `~/.conga/hooks.json` + project
     /// `<project_dir>/.conga/hooks.json`. `None` when no hooks are
     /// configured (nothing pushed into the stack — zero overhead).
@@ -473,9 +479,7 @@ mod tests {
         // PreToolUse hooks are collected (forward compatibility).
         std::fs::write(
             g.path().join("hooks.json"),
-            format!(
-                "{{\"PostToolUse\": [{{\"hooks\": [{{\"command\": \"x\"}}]}}], \"PreToolUse\": [{{\"hooks\": [{{\"command\": \"y\"}}]}}]}}"
-            ),
+            r#"{"PostToolUse": [{"hooks": [{"command": "x"}]}], "PreToolUse": [{"hooks": [{"command": "y"}]}]}"#,
         )
         .unwrap();
         let hooks = load_process_hooks(g.path(), p.path());
