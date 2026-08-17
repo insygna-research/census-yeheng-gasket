@@ -226,10 +226,14 @@ export interface LlmSettingsGroupView {
 export interface EnvSettingsView {
   llm: LlmSettingsGroupView | null;
   fastLlm: LlmSettingsGroupView | null;
+  /** Custom base instructions; empty string = built-in prompt. */
+  systemPrompt: string;
 }
 
-/** PUT body: `null` group clears it (env config applies again). */
+/** PUT body: `null` group clears it (env config applies again). An absent
+ *  `systemPrompt` keeps the stored one; blank clears it. */
 export interface EnvSettingsPayload {
   llm: LlmSettingsGroup | null;
   fastLlm: LlmSettingsGroup | null;
+  systemPrompt?: string;
 }

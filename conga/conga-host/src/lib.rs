@@ -343,25 +343,37 @@ impl Host {
         repair_unanswered_tool_calls(&mut history);
 
         // Per-turn environment block: git status / diffstat drift as the
-        // session progresses. Built fresh each turn (blocking git calls are
-        // capped and timeout-guarded inside `env_snapshot`); appended, never
-        // persisted — the static prompt in `self.system_prompt` stays the
-        // durable part.
+        // session progresses. Built fresh each turn (blocking git calls
+        // are capped and timeout-guarded inside `env_snapshot`);
+        // appended, never persisted - the static prompt in
+        // `self.system_prompt` stays the durable part.
         let snapshot = crate::prompt::env_snapshot(&self.cwd);
+        // Per-turn settings: re-read the file every turn so a UI save
+        // reaches the very next LLM call - both the provider AND the
+        // custom base prompt (a half-applied switch would be worse than
+        // none). Injected stream_fn hosts keep their wired prompt.
+        let settings = if self.stream_fn_overridden {
+            crate::settings::EnvSettings::default()
+        } else {
+            crate::settings::load_settings()
+        };
+        let base_prompt = crate::prompt::with_custom_base_prompt(
+            &self.system_prompt,
+            settings.system_prompt.as_deref(),
+        );
         let turn_prompt = if snapshot.is_empty() {
-            self.system_prompt.clone()
+            base_prompt
         } else {
             format!(
                 "{}\n\n<environment>\n{}\n</environment>",
-                self.system_prompt, snapshot
+                base_prompt, snapshot
             )
         };
         // Per-turn LLM settings: the web UI persists env overrides to
         // ~/.conga/settings.json; re-resolve the provider EVERY turn so a
         // UI save reaches the very next LLM call (model id + stream_fn
-        // together — a half-applied switch would be worse than none).
-        let (turn_cfg, turn_stream_fn) =
-            self.resolve_turn_provider(&crate::settings::load_settings());
+        // together - a half-applied switch would be worse than none).
+        let (turn_cfg, turn_stream_fn) = self.resolve_turn_provider(&settings);
 
         let (context, mut config) = turn_cfg.prepare_turn(
             TurnInputs {
@@ -561,8 +573,8 @@ mod tests {
                 api: "openai".into(),
             }),
             fast_llm: None,
+            system_prompt: None,
         };
-
         // No injection → settings win (provider + stream_fn swapped).
         let (cfg, _) = make_host(false).resolve_turn_provider(&settings);
         assert_eq!(cfg.provider.base_url, "https://settings.example/v1");

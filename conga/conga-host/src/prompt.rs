@@ -57,6 +57,33 @@ Core rules:
   Claims about files, commands, or test results must be things you actually
   observed — mark inferences as such.";
 
+/// Apply a custom base prompt over an already-assembled static prompt.
+/// The static prompt is `built-in + project doc + skills` (see
+/// [`crate::assembly`]); a custom prompt replaces ONLY the built-in
+/// prefix - the project doc and skills sections ride along untouched, so
+/// harness context survives a persona swap.
+///
+/// `custom` blank or `None` -> the assembled prompt unchanged.
+pub fn with_custom_base_prompt(assembled: &str, custom: Option<&str>) -> String {
+    let Some(custom) = custom.map(str::trim).filter(|c| !c.is_empty()) else {
+        return assembled.to_string();
+    };
+    // The earliest appended section wins: project doc when present, else
+    // skills, else nothing (bare built-in prompt).
+    let tail = TAIL_MARKERS.iter().filter_map(|m| assembled.find(m)).min();
+    match tail {
+        // Slice from just past the leading "\n\n" so the kept tail
+        // starts with "## ..." and the format adds exactly one blank
+        // line between custom and tail.
+        Some(i) => format!("{custom}\n\n{}", &assembled[i + 2..]),
+        None => custom.to_string(),
+    }
+}
+
+/// Opening text of the sections `append_project_doc` / `append_skills`
+/// append after the built-in head.
+const TAIL_MARKERS: [&str; 2] = ["\n\n## Project instructions (", "\n\n## Skills\n"];
+
 /// Append the nearest project doc (`AGENTS.md`, then `CLAUDE.md`) found at
 /// or above `cwd`. First hit wins; nothing found → `base` unchanged.
 pub fn append_project_doc(base: &str, cwd: &Path) -> String {
@@ -292,5 +319,41 @@ mod tests {
         assert_eq!(d.len(), 10, "{d}");
         assert_eq!(&d[4..5], "-");
         assert_eq!(&d[7..8], "-");
+    }
+
+    #[test]
+    fn custom_prompt_swaps_head_keeps_tail() {
+        let assembled = format!(
+            "{}\n\n## Project instructions (/repo/AGENTS.md)\nBe terse.\n\n## Skills\n\n- name: x",
+            CODING_AGENT_PROMPT
+        );
+        let out = with_custom_base_prompt(&assembled, Some("You are a pirate."));
+        assert!(
+            out.starts_with("You are a pirate.\n\n## Project instructions"),
+            "{out}"
+        );
+        assert!(!out.contains("software engineering agent"), "{out}");
+        assert!(out.contains("Be terse."), "{out}");
+        assert!(out.ends_with("- name: x"), "{out}");
+    }
+
+    #[test]
+    fn custom_prompt_skills_only_tail() {
+        // No project doc: skills section is still preserved.
+        let assembled = format!("{CODING_AGENT_PROMPT}\n\n## Skills\n\n- name: x");
+        let out = with_custom_base_prompt(&assembled, Some("  custom  "));
+        assert_eq!(out, "custom\n\n## Skills\n\n- name: x");
+    }
+
+    #[test]
+    fn custom_prompt_blank_or_none_keeps_built_in() {
+        let assembled = format!("{CODING_AGENT_PROMPT}\n\n## Skills\n\n- name: x");
+        assert_eq!(with_custom_base_prompt(&assembled, None), assembled);
+        assert_eq!(with_custom_base_prompt(&assembled, Some("  ")), assembled);
+        // bare prompt with no appended sections: custom replaces it whole
+        assert_eq!(
+            with_custom_base_prompt(CODING_AGENT_PROMPT, Some("plain")),
+            "plain"
+        );
     }
 }

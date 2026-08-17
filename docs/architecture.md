@@ -342,7 +342,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | `event_map.rs` | `AgentEvent` → `OutgoingEvent`(WS JSON)映射,含 10 种 `SubagentEvent` 转发 | `event_to_ws` / `subagent_event_to_ws` |
 | `approval.rs` | 审批登记(`ApprovalRegistry`):在途审批 + "remember" 缓存,三路 select 等待决策 | `ApprovalRegistry` |
 | `subagent.rs` | 子 agent 编排:`spawn_subagents` 工具的 host 侧 spawner(子日志持久化、全文结果提取) | `HostSubagentSpawner` |
-| `settings.rs` | **web UI LLM 设置**:`~/.conga/settings.json` 读写(原子写、组校验、key 掩码、PUT 合并);`run_turn` 每轮经 `effective_provider` 重解析,fast 路由优先读它 | `EnvSettings` / `put_settings` / `load_settings` |
+| `settings.rs` | **web UI LLM 设置**:`~/.conga/settings.json` 读写(原子写、组校验、key 掩码、PUT 合并);`run_turn` 每轮经 `effective_provider` 重解析,fast 路由优先读它;`systemPrompt` 自定义基础指令(≤64KB,空=内置) | `EnvSettings` / `put_settings` / `load_settings` |
 
 ### 6.3 `install_ctrl_c`(`lib.rs:328`)
 

@@ -55,3 +55,20 @@ export function renderMessageContent(content: string, isStreaming: boolean): str
     return `<pre class="whitespace-pre-wrap break-words">${escapeHtml(content)}</pre>`;
   }
 }
+
+/**
+ * Render a standalone markdown block (settings previews) to sanitized
+ * HTML. Falls back to escaped text when parsing fails or the input is
+ * oversized - same policy as `renderMessageContent` minus streaming.
+ */
+export function renderMarkdownBlock(content: string): string {
+  if (!content) return '';
+  if (content.length > MAX_MARKDOWN_LENGTH) {
+    return `<pre class="whitespace-pre-wrap break-words">${escapeHtml(content)}</pre>`;
+  }
+  try {
+    return DOMPurify.sanitize(marked.parse(content) as string);
+  } catch {
+    return `<pre class="whitespace-pre-wrap break-words">${escapeHtml(content)}</pre>`;
+  }
+}

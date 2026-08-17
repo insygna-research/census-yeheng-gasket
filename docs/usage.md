@@ -70,7 +70,8 @@ ChatHeader 的齿轮按钮(**Model Settings**)可以不碰 `.env` 直接配置 L
 - **优先级**:`settings.json` > 进程 env(`.env`)。浏览器端走 `GET/PUT /api/settings`,桌面端走 Tauri IPC,同一份文件。
 - **安全**:API key 从不回传——GET 只返回 `apiKeySet`/`apiKeyHint`(`sk-…ab12` 掩码);PUT 留空 key 表示"保留已存的"。
 - **组语义**:取消勾选 Main/Fast = 清除该组(env 配置重新生效);Fast 组控制子代理模型,同样优先于 `CONGA_FAST_LLM_*`。
-- 手动编辑文件也可,格式:`{"llm":{"baseUrl":...,"apiKey":...,"model":...,"api":"openai"},"fastLlm":{...}}`;损坏文件会被忽略并回退 env(告警在日志)。
+- **System prompt**:同一对话框下方的 **System prompt** 编辑器(markdown)替换内置基础指令(`CODING_AGENT_PROMPT`);AGENTS.md/CLAUDE.md 项目文档、技能目录、`<environment>` 快照仍然自动附加。Preview 按钮实时预览 markdown 渲染,Reset 清空回到内置。留空 = 内置;上限 64 KB。子代理不受影响(保持内置纪律 prompt)。
+- 手动编辑文件也可,格式:`{"llm":{"baseUrl":...,"apiKey":...,"model":...,"api":"openai"},"fastLlm":{...},"systemPrompt":"# 自定义指令\n..."}`;损坏文件会被忽略并回退 env(告警在日志)。
 
 ### 3.2 Provider 选择
 

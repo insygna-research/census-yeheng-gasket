@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 use conga::ProviderConfig;
 
-/// One LLM connection group (the `CONGA_LLM_*` / `CONGA_FAST_LLM_*` vars a
-/// user would set in a shell, now editable in the web UI). All fields are
-/// plain strings; validation happens in [`LlmGroup::validate`].
+/// Cap for the custom system prompt (markdown). Generous vs. the 16 KB
+/// project-doc cap: the prompt is the user's own and replaces the
+/// built-in text, but a runaway paste must not eat the context window.
+const MAX_CUSTOM_PROMPT_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LlmGroup {
@@ -34,6 +36,10 @@ pub struct EnvSettings {
     pub llm: Option<LlmGroup>,
     /// Sub-agent fast model; `None` = main model / env prefix.
     pub fast_llm: Option<LlmGroup>,
+    /// Custom base instructions (markdown): replaces the built-in
+    /// `CODING_AGENT_PROMPT` prefix while project doc / skills / env
+    /// snapshot stay appended. `None` or blank = built-in prompt.
+    pub system_prompt: Option<String>,
 }
 
 impl LlmGroup {
@@ -164,8 +170,9 @@ pub fn mask_key(key: &str) -> String {
 }
 
 /// The GET view: same shape as [`EnvSettings`] but the raw `api_key` is
-/// replaced by `apiKeySet` + `apiKeyHint` — the secret never crosses the
-/// API (the gateway listens on 0.0.0.0; CORS is open).
+/// replaced by `apiKeySet` + `apiKeyHint` - the secret never crosses the
+/// API (the gateway listens on 0.0.0.0; CORS is open). `systemPrompt` is
+/// not a secret and round-trips verbatim.
 pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
     fn group(g: &Option<LlmGroup>) -> serde_json::Value {
         match g {
@@ -179,7 +186,11 @@ pub fn settings_to_masked_json(s: &EnvSettings) -> serde_json::Value {
             }),
         }
     }
-    serde_json::json!({ "llm": group(&s.llm), "fastLlm": group(&s.fast_llm) })
+    serde_json::json!({
+        "llm": group(&s.llm),
+        "fastLlm": group(&s.fast_llm),
+        "systemPrompt": s.system_prompt.as_deref().unwrap_or(""),
+    })
 }
 
 /// Full PUT flow: parse the payload, merge (blank `apiKey` = keep stored),
@@ -195,7 +206,8 @@ pub fn put_settings(payload: &serde_json::Value) -> Result<serde_json::Value, St
 
 /// Merge a PUT payload into the current settings. A `None` group clears
 /// it (back to env); a present group replaces it, except a blank
-/// `api_key` inherits the stored key (which must then exist).
+/// `api_key` inherits the stored key (which must then exist). The custom
+/// prompt is stored trimmed; blank clears it (built-in prompt back).
 fn merge_put(current: &EnvSettings, incoming: EnvSettings) -> Result<EnvSettings, String> {
     let merge_group = |name: &str,
                        new: Option<LlmGroup>,
@@ -215,9 +227,27 @@ fn merge_put(current: &EnvSettings, incoming: EnvSettings) -> Result<EnvSettings
         g.validate().map_err(|e| format!("{name}: {e}"))?;
         Ok(Some(g))
     };
+    let system_prompt = match incoming.system_prompt {
+        None => current.system_prompt.clone(), // absent key: keep stored
+        Some(p) => {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                None // blank clears: built-in prompt applies again
+            } else {
+                if trimmed.len() > MAX_CUSTOM_PROMPT_BYTES {
+                    return Err(format!(
+                        "systemPrompt: over {MAX_CUSTOM_PROMPT_BYTES} bytes (got {})",
+                        trimmed.len()
+                    ));
+                }
+                Some(trimmed.to_string())
+            }
+        }
+    };
     Ok(EnvSettings {
         llm: merge_group("llm", incoming.llm, &current.llm)?,
         fast_llm: merge_group("fastLlm", incoming.fast_llm, &current.fast_llm)?,
+        system_prompt,
     })
 }
 
@@ -241,6 +271,7 @@ mod tests {
         let s = EnvSettings {
             llm: Some(group("https://a.x/v1", "sk-1", "m1", "openai")),
             fast_llm: Some(group("https://b.x/v1", "sk-2", "m2", "anthropic")),
+            system_prompt: None,
         };
         save_settings_at(&path, &s).unwrap();
         assert_eq!(load_settings_at(&path), s);
@@ -268,6 +299,7 @@ mod tests {
         let s = EnvSettings {
             llm: Some(group("https://a.x/v1", "sk-secret-key-1234", "m1", "")),
             fast_llm: None,
+            system_prompt: None,
         };
         let v = settings_to_masked_json(&s).to_string();
         assert!(!v.contains("sk-secret-key-1234"), "raw key leaked: {v}");
@@ -301,6 +333,7 @@ mod tests {
         let s = EnvSettings {
             llm: Some(group("https://a.x/v1", "sk-1", "m1", "anthropic")),
             fast_llm: None,
+            system_prompt: None,
         };
         let p = effective_provider(&s).unwrap();
         assert_eq!(p.base_url, "https://a.x/v1");
@@ -314,10 +347,12 @@ mod tests {
         let current = EnvSettings {
             llm: Some(group("https://old.x", "sk-stored", "old-model", "")),
             fast_llm: None,
+            system_prompt: None,
         };
         let incoming = EnvSettings {
             llm: Some(group("https://new.x", "", "new-model", "")),
             fast_llm: None,
+            system_prompt: None,
         };
         let merged = merge_put(&current, incoming).unwrap();
         let g = merged.llm.unwrap();
@@ -334,6 +369,7 @@ mod tests {
         let incoming = EnvSettings {
             llm: Some(group("https://new.x", "", "m", "")),
             fast_llm: None,
+            system_prompt: None,
         };
         let err = merge_put(&EnvSettings::default(), incoming).unwrap_err();
         assert!(err.contains("apiKey is required"), "{err}");
@@ -344,6 +380,7 @@ mod tests {
         let current = EnvSettings {
             llm: Some(group("https://old.x", "sk", "m", "")),
             fast_llm: Some(group("https://f.x", "sk", "m", "")),
+            system_prompt: None,
         };
         let merged = merge_put(&current, EnvSettings::default()).unwrap();
         assert!(merged.llm.is_none() && merged.fast_llm.is_none());
@@ -356,6 +393,7 @@ mod tests {
         let incoming = EnvSettings {
             llm: None,
             fast_llm: Some(group("notaurl", "sk", "m", "")),
+            system_prompt: None,
         };
         let err = merge_put(&current, incoming).unwrap_err();
         assert!(err.starts_with("fastLlm:"), "{err}");
@@ -369,5 +407,70 @@ mod tests {
         // payload parsing errors surface as strings.
         let err = put_settings(&serde_json::json!({"llm": 42})).unwrap_err();
         assert!(err.contains("invalid settings payload"), "{err}");
+    }
+
+    #[test]
+    fn merge_prompt_trims_and_stores() {
+        let incoming = EnvSettings {
+            system_prompt: Some("  You are a pirate.  ".into()),
+            ..EnvSettings::default()
+        };
+        let merged = merge_put(&EnvSettings::default(), incoming).unwrap();
+        assert_eq!(merged.system_prompt.as_deref(), Some("You are a pirate."));
+    }
+
+    #[test]
+    fn merge_prompt_blank_clears_absent_keeps() {
+        let current = EnvSettings {
+            system_prompt: Some("stored".into()),
+            ..EnvSettings::default()
+        };
+        // blank string clears
+        let merged = merge_put(
+            &current,
+            EnvSettings {
+                system_prompt: Some("   ".into()),
+                ..EnvSettings::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.system_prompt.is_none());
+        // absent key keeps the stored one
+        let merged = merge_put(
+            &current,
+            EnvSettings {
+                system_prompt: None,
+                ..EnvSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.system_prompt.as_deref(), Some("stored"));
+    }
+
+    #[test]
+    fn merge_prompt_rejects_oversized() {
+        let err = merge_put(
+            &EnvSettings::default(),
+            EnvSettings {
+                system_prompt: Some("x".repeat(MAX_CUSTOM_PROMPT_BYTES + 1)),
+                ..EnvSettings::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.starts_with("systemPrompt:"), "{err}");
+    }
+
+    #[test]
+    fn masked_view_carries_prompt_verbatim() {
+        let s = EnvSettings {
+            system_prompt: Some("# custom\n\n- keep **markdown**".into()),
+            ..EnvSettings::default()
+        };
+        let v = settings_to_masked_json(&s).to_string();
+        assert!(v.contains("# custom"), "{v}");
+        assert!(v.contains("\"systemPrompt\":\""), "{v}");
+        // absent -> empty string (not null) so the frontend stays simple
+        let empty = settings_to_masked_json(&EnvSettings::default()).to_string();
+        assert!(empty.contains("\"systemPrompt\":\"\""), "{empty}");
     }
 }

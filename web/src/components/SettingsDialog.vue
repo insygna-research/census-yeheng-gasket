@@ -3,6 +3,7 @@ import { ref, watch } from 'vue';
 import { Check, Cpu, Loader2, X } from 'lucide-vue-next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { renderMarkdownBlock } from '@/lib/markdown';
 import { fetchEnvSettings, saveEnvSettings } from '@/lib/backend';
 import type { EnvSettingsView, LlmSettingsGroup } from '@/types';
 
@@ -32,9 +33,11 @@ const emptyGroup = (): EditableGroup => ({
 
 const llm = ref<EditableGroup>(emptyGroup());
 const fast = ref<EditableGroup>(emptyGroup());
+const systemPrompt = ref('');
+const previewing = ref(false);
+const previewHtml = ref('');
 const error = ref('');
 const saving = ref(false);
-
 const adopt = (view: EnvSettingsView | null) => {
   const fromView = (g: EnvSettingsView['llm']): EditableGroup => {
     if (!g) return emptyGroup();
@@ -50,6 +53,7 @@ const adopt = (view: EnvSettingsView | null) => {
   };
   llm.value = fromView(view?.llm ?? null);
   fast.value = fromView(view?.fastLlm ?? null);
+  systemPrompt.value = view?.systemPrompt ?? '';
 };
 
 // Reload the stored (masked) view each time the dialog opens.
@@ -58,12 +62,15 @@ watch(
   async open => {
     if (open) {
       error.value = '';
+      previewing.value = false;
+      previewHtml.value = '';
       const view = await fetchEnvSettings();
       if (view) {
         adopt(view);
       } else {
         llm.value = emptyGroup();
         fast.value = emptyGroup();
+        systemPrompt.value = '';
       }
     }
   }
@@ -102,6 +109,7 @@ const save = async () => {
   const result = await saveEnvSettings({
     llm: toPayloadGroup(llm.value),
     fastLlm: toPayloadGroup(fast.value),
+    systemPrompt: systemPrompt.value.trim(),
   });
   saving.value = false;
   if ('error' in result) {
@@ -110,6 +118,16 @@ const save = async () => {
   }
   adopt(result.view);
   emit('close');
+};
+
+// Toggle Edit/Preview; the preview re-renders on every toggle.
+const togglePreview = () => {
+  if (previewing.value) {
+    previewing.value = false;
+    return;
+  }
+  previewHtml.value = renderMarkdownBlock(systemPrompt.value);
+  previewing.value = true;
 };
 </script>
 
@@ -198,6 +216,52 @@ const save = async () => {
                 class="text-xs"
               />
             </template>
+          </div>
+
+          <!-- Custom system prompt -->
+          <div class="space-y-2 rounded-xl border border-border p-3">
+            <div class="flex items-center justify-between gap-2">
+              <div class="min-w-0">
+                <p class="text-xs font-medium text-foreground">System prompt</p>
+                <p class="text-[11px] text-muted-foreground truncate">
+                  Replaces the built-in base instructions; project doc / skills / environment
+                  stay appended. Empty = built-in.
+                </p>
+              </div>
+              <div class="flex gap-1 shrink-0">
+                <button
+                  class="px-2 py-1 rounded-md text-[11px] th-hover th-text-muted hover:th-text"
+                  :class="{ 'bg-accent th-text': previewing }"
+                  title="Toggle markdown preview"
+                  @click="togglePreview"
+                >
+                  {{ previewing ? 'Edit' : 'Preview' }}
+                </button>
+                <button
+                  class="px-2 py-1 rounded-md text-[11px] th-hover th-text-muted hover:th-text"
+                  title="Clear back to the built-in prompt"
+                  @click="systemPrompt = ''; previewing = false"
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+            <textarea
+              v-if="!previewing"
+              v-model="systemPrompt"
+              rows="8"
+              spellcheck="false"
+              placeholder="# Custom instructions (markdown)&#10;&#10;You are ..."
+              class="w-full rounded-lg border border-border bg-background px-3 py-2 text-xs font-mono th-text resize-y min-h-[120px] focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+            <div
+              v-else
+              class="prose prose-sm max-w-none rounded-lg border border-border bg-background px-3 py-2 text-xs overflow-auto min-h-[120px] max-h-64"
+              v-html="previewHtml"
+            />
+            <p v-if="previewing && !systemPrompt.trim()" class="text-[11px] text-muted-foreground">
+              (empty - the built-in prompt applies)
+            </p>
           </div>
 
           <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
