@@ -1,5 +1,7 @@
 import DOMPurify from 'dompurify';
-import hljs from 'highlight.js';
+// Common-language subset (~38 languages) instead of the full 192-language
+// bundle — the full build adds ~900KB to the eager main chunk.
+import hljs from 'highlight.js/lib/common';
 import { marked } from 'marked';
 
 // Maximum characters to parse as markdown; beyond this render as plain text.

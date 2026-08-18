@@ -48,7 +48,7 @@ const renderMermaid = async () => {
       const source = decodeURIComponent((el as HTMLElement).dataset.source || '');
       if (!source) continue;
       const { svg } = await mermaidModule.default.render(
-        `mermaid-${Math.random().toString(36).substr(2, 9)}`,
+        `mermaid-${Math.random().toString(36).slice(2, 11)}`,
         source
       );
       (el as HTMLElement).innerHTML = svg;
@@ -60,12 +60,17 @@ const renderMermaid = async () => {
   }
 };
 
-const parsedContent = computed(() => renderMessageContent(props.message.content, props.isReceiving));
+// Only the in-flight bubble takes the cheap escaped-text path — keying on
+// the session-level isReceiving would strip markdown from every historical
+// message for the whole turn and re-parse the entire transcript on `done`.
+const isStreaming = computed(() => props.isLastBotMessage && props.isReceiving);
+
+const parsedContent = computed(() => renderMessageContent(props.message.content, isStreaming.value));
 
 // Render mermaid when the component is mounted/updated and not actively streaming.
 // We skip rendering during streaming to avoid flooding the renderer with
 // partial diagram sources that may be syntactically invalid.
-const shouldRenderMermaid = computed(() => !props.isReceiving);
+const shouldRenderMermaid = computed(() => !isStreaming.value);
 
 watch(shouldRenderMermaid, (canRender) => {
   if (canRender) renderMermaid();
@@ -98,8 +103,6 @@ const formatElapsed = (ms: number): string => {
   const rem = Math.round(s % 60);
   return `${m}m ${rem}s`;
 };
-
-const isStreaming = computed(() => props.isLastBotMessage && props.isReceiving);
 </script>
 
 <template>

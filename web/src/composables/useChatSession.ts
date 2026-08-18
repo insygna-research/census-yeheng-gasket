@@ -586,9 +586,13 @@ export function useChatSession(chatId: { value: string }) {
   // down the old session's socket (the gateway then cancels its turn), so
   // reset that session's latched flags; in Tauri mode the broadcast channel
   // keeps streaming into the old session and its state stays live.
+  // Only fetch when already connected: a fresh connect flips isConnected
+  // false→true right after, and the watcher above is the single hydration
+  // point for that edge — fetching here too would double the transcript
+  // request on every startup and browser-mode switch.
   watch(() => chatId.value, (_newId, oldId) => {
     if (oldId && !isTauri) abortTurnState(oldId);
-    fetchMessages();
+    if (isConnected.value) fetchMessages();
   }, { immediate: true });
 
   const forceCompact = async () => {
@@ -698,6 +702,7 @@ export function useChatSession(chatId: { value: string }) {
     // deltas are real transcript content), and stop every timer.
     if (deltaRafId !== null) cancelAnimationFrame(deltaRafId);
     flushDeltas();
+    if (errorBannerTimer) clearTimeout(errorBannerTimer);
     for (const st of turnStates.values()) {
       Object.values(st.subagentTimers).forEach(clearTimeout);
       st.subagentTimers = {};

@@ -80,15 +80,22 @@ const onKeydown = (event: KeyboardEvent) => {
 };
 
 watch(() => messages.value.length, () => scrollToBottom());
+// Follow the stream: message count is unchanged while a turn streams, so
+// track the active bot message's content growth. scrollToBottom's
+// userScrolledUp guard keeps a deliberate scroll-up from being yanked back.
+const streamingLength = computed(() => {
+  const msgs = messages.value;
+  const last = msgs[msgs.length - 1];
+  return last && last.role === 'bot' ? last.content.length : 0;
+});
+watch(streamingLength, () => scrollToBottom());
 watch(() => props.chatId, () => {
-  session.fetchContext();
   userScrolledUp.value = false;
   nextTick(() => scrollToBottom(true));
 });
 
 onMounted(() => {
   session.connect();
-  session.fetchContext();
   nextTick(() => scrollToBottom(true));
   setupScrollObserver();
   window.addEventListener('keydown', onKeydown);

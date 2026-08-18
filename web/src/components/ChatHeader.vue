@@ -9,11 +9,13 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from 'radix-vue';
-import { computed, ref } from 'vue';
+import { computed, defineAsyncComponent, ref } from 'vue';
 import { Cpu, Loader2, Moon, MoreVertical, Palette, RotateCcw, Settings, Sun, Trash2, Check } from 'lucide-vue-next';
-import SettingsDialog from './SettingsDialog.vue';
 import { useTheme, type ThemeHue, type MarkdownStyle } from '../composables/useTheme';
 import type { ContextStats } from '@/types';
+
+// Settings UI is opened rarely — split it out of the eager main chunk.
+const SettingsDialog = defineAsyncComponent(() => import('./SettingsDialog.vue'));
 
 const props = defineProps<{
   chatTitle: string;
