@@ -13,11 +13,13 @@ The **host binary** is the composition root: it calls each linked crate's
 `register` at startup, often behind Cargo features. There is **no** `.so`
 loading, no ABI version, no hot-unload.
 
-Official examples: workspace crate **`conga-ext`** (`hello`, `todo`,
-`search`, `permission_gate`). CLI: `cargo run -p conga-cli --features ext`.
+Official examples: workspace crate **`conga-ext`** (`hello`, `search`,
+`permission_gate`, `terminal`). `terminal` is gated behind the `terminal`
+Cargo feature. CLI: `cargo run -p conga-cli --features ext`.
 
 Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep` /
-`fetch`) live in `conga` and are not extension crates.
+`fetch` / `todo` / `spawn_subagents`) live in `conga-host`
+(`conga_host::built_in_tools`) and are not extension crates.
 
 ---
 
@@ -25,9 +27,9 @@ Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep` /
 
 ```rust
 let mut api = ExtensionApiImpl::new();
-conga_ext::register_all(&mut api); // or hello::register / todo::register
+conga_ext::register_all(&mut api); // or hello::register / permission_gate::register
 
-let mut tools = conga::built_in_tools();
+let mut tools = conga_host::built_in_tools();
 tools.extend(std::mem::take(&mut api.tools));
 
 let config = AgentLoopConfig {
@@ -48,7 +50,7 @@ That is the static-world substitute for a plugin marketplace.
 
 | Method | What it does | Example |
 |---|---|---|
-| `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello`, `todo` |
+| `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello` |
 | `register_before_tool_call(handler)` | block / modify args before run | `permission_gate` |
 | `register_after_tool_call(handler)` | rewrite tool result | — |
 
@@ -73,7 +75,7 @@ pub fn register(api: &mut dyn ExtensionApi) {
             "properties": { "name": { "type": "string" } },
             "required": ["name"]
         }),
-        risk: RiskLevel::High,
+        risk: RiskLevel::Low,
         execute: Arc::new(|ctx| Box::pin(async move {
             let name = ctx.args["name"].as_str().unwrap_or("world");
             Ok(ToolResult {
@@ -93,11 +95,11 @@ pub fn register(api: &mut dyn ExtensionApi) {
 
 ---
 
-## Example 2: `todo` — private state files
+## Example 2: `todo` - private state files
 
-Source: `conga-ext/src/todo.rs`.
-
-State lives under `ToolContext.state_dir`
+`todo` was the original extension demo but has since moved to the built-in
+tool set (`conga-host/src/tools/todo.rs`); the `state_dir` pattern it uses
+applies to extension tools too. State lives under `ToolContext.state_dir`
 (`~/.conga/tool_state/<session_id>/<tool_name>/`), not in a shared map.
 
 ---
@@ -120,14 +122,14 @@ Note: production CLI already uses `conga_host::PermissionPolicy` as a
 # conga-cli already wires this:
 conga-ext = { workspace = true, optional = true }
 [features]
-ext = ["dep:conga-ext"]
+ext = ["dep:conga-ext", "conga-ext?/terminal"]
 ```
 
 ```rust
 #[cfg(feature = "ext")]
 {
     conga_ext::hello::register(&mut api);
-    conga_ext::todo::register(&mut api);
+    conga_ext::permission_gate::register(&mut api);
 }
 ```
 
@@ -138,8 +140,7 @@ Do **not** split built-in tools into per-tool features.
 ## Run the examples
 
 ```bash
-cargo run -p conga --example plugins
-cargo test -p conga --test plugins_example
+cargo test -p conga-ext
 ```
 
 ---
@@ -163,5 +164,5 @@ Does **not** expose `ExtensionApi` over the wire.
 
 - Extension = `pub fn register(&mut dyn ExtensionApi)` in a normal Rust crate.
 - Host links crates and calls `register` (features optional).
-- Built-ins stay in core; no cdylib, no ABI handshake, no unload.
+- Built-ins stay in `conga-host`; no cdylib, no ABI handshake, no unload.
 - Non-Rust tools: stdio JSONL external process + optional `/reload-tools`.

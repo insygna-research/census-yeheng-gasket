@@ -575,7 +575,10 @@ mod tests {
         // the earlier two live outside the messages array).
         for m in &msgs[..msgs.len() - 1] {
             let s = serde_json::to_string(m).unwrap();
-            assert!(!s.contains("cache_control"), "non-final message marked: {s}");
+            assert!(
+                !s.contains("cache_control"),
+                "non-final message marked: {s}"
+            );
         }
     }
 

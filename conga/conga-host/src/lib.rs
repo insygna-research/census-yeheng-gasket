@@ -397,9 +397,7 @@ impl Host {
         let user_content = if snapshot.is_empty() {
             user_msg.to_string()
         } else {
-            format!(
-                "{user_msg}\n\n<environment>\n{snapshot}\n</environment>"
-            )
+            format!("{user_msg}\n\n<environment>\n{snapshot}\n</environment>")
         };
         let user = AgentMessage::User(UserMessage {
             content: vec![ContentBlock::text(user_content)],

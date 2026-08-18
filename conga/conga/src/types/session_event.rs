@@ -158,8 +158,7 @@ pub struct CacheStats {
 impl CacheStats {
     /// `cache_read / input` over the session; `None` before any usage.
     pub fn hit_rate(&self) -> Option<f64> {
-        (self.input_tokens > 0)
-            .then(|| self.cache_read_tokens as f64 / self.input_tokens as f64)
+        (self.input_tokens > 0).then(|| self.cache_read_tokens as f64 / self.input_tokens as f64)
     }
 }
 
@@ -170,23 +169,18 @@ pub fn cache_stats(log: &[SessionEvent]) -> CacheStats {
         .iter()
         .rposition(|ev| matches!(ev, SessionEvent::Cleared))
         .map_or(0, |i| i + 1);
-    log[from..]
-        .iter()
-        .fold(CacheStats::default(), |mut s, ev| {
-            if let SessionEvent::Assistant {
-                usage: Some(u), ..
-            } = ev
-            {
-                s.input_tokens += u.input_tokens;
-                s.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
-                s.cache_write_tokens += u.cache_write_tokens.unwrap_or(0);
-                s.calls += 1;
-                if u.cache_read_tokens.is_some() || u.cache_write_tokens.is_some() {
-                    s.cache_reporting_calls += 1;
-                }
+    log[from..].iter().fold(CacheStats::default(), |mut s, ev| {
+        if let SessionEvent::Assistant { usage: Some(u), .. } = ev {
+            s.input_tokens += u.input_tokens;
+            s.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
+            s.cache_write_tokens += u.cache_write_tokens.unwrap_or(0);
+            s.calls += 1;
+            if u.cache_read_tokens.is_some() || u.cache_write_tokens.is_some() {
+                s.cache_reporting_calls += 1;
             }
-            s
-        })
+        }
+        s
+    })
 }
 
 /// Synthesize error `ToolResult`s for tool calls whose turn ended before a

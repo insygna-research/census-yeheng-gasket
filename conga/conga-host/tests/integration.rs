@@ -19,11 +19,11 @@ use conga::{
     derive_messages, AgentMessage, AssistantMessage, CancelCause, ContentBlock, EventStorage,
     SessionEvent, StopReason, StreamChunk, ToolResultMessage, TurnEndReason, UserMessage,
 };
-use parking_lot::Mutex;
 use conga_host::{
     ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
     TurnSummary,
 };
+use parking_lot::Mutex;
 
 fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
     let map: std::collections::HashMap<String, String> = pairs
@@ -673,9 +673,10 @@ impl conga::StreamFn for PrefixCaptureStream {
         self.seen
             .lock()
             .push((system.to_string(), messages.to_vec()));
-        let chunks = self.scripts.lock().pop_front().expect(
-            "PrefixCaptureStream: script underflow — fewer scripts than stream() calls",
-        );
+        let chunks =
+            self.scripts.lock().pop_front().expect(
+                "PrefixCaptureStream: script underflow — fewer scripts than stream() calls",
+            );
         Box::pin(futures_util::stream::iter(chunks))
     }
 }
@@ -772,7 +773,8 @@ async fn consecutive_requests_are_prefix_stable_and_env_stays_out_of_system() {
     // assistant — that message is persisted by this very provider call
     // (after streaming), so it cannot have been in the request.
     assert_eq!(
-        &seen[2].1, &projected[..projected.len() - 1],
+        &seen[2].1,
+        &projected[..projected.len() - 1],
         "the request history must equal the log projection"
     );
 }
