@@ -56,8 +56,8 @@ pub use session::{SessionInfo, SessionManager};
 #[cfg(feature = "session-index")]
 pub use session_api::search_sessions;
 pub use session_api::{
-    delete_session, list_sessions, rename_session, session_messages, SessionApiError,
-    SessionListItem,
+    delete_session, list_sessions, rename_session, session_cache_stats, session_messages,
+    SessionApiError, SessionListItem,
 };
 pub use session_cleanup::{cleanup_session_resources, register_hook, run_hooks};
 pub use skills::append_skills;
@@ -291,12 +291,13 @@ impl Host {
     /// Assistant/ToolResult as it happens via the injected persist closure —
     /// so a crash or failed turn keeps every side effect that already
     /// happened, instead of rolling back to a pre-turn transcript.
-    /// Flow: persist(TurnStart) → persist(User) → history =
-    /// derive_messages(load_events) → repair dangling tool calls →
-    /// prepare_turn → run_agent_loop (budget.compact runs inside the loop's
-    /// `transform_context` seam before EVERY LLM call — a wire view only;
-    /// the log stays append-only full) → persist(TurnEnd{reason}) →
-    /// [`TurnSummary`].
+    /// Flow: persist(TurnStart) → restore budget from the log tail →
+    /// history = derive_messages(load_events) → repair dangling tool calls →
+    /// [over budget: persist ONE `Compacted` checkpoint, restart history
+    /// from it] → persist(User, with the per-turn environment snapshot
+    /// embedded — send-what-you-persist keeps the provider prompt-cache
+    /// prefix byte-stable) → prepare_turn → run_agent_loop →
+    /// persist(TurnEnd{reason}) → [`TurnSummary`].
     ///
     /// `on_event` receives every [`AgentEvent`](conga::AgentEvent)
     /// as it happens (streaming text, tool calls, usage, errors).
@@ -321,19 +322,16 @@ impl Host {
         // corruption, then frame the turn.
         let events = self.session.open_or_migrate(&sid).await?;
         self.session.append_event(&SessionEvent::TurnStart).await?;
-        let user = AgentMessage::User(UserMessage {
-            content: vec![ContentBlock::text(user_msg.to_string())],
-            timestamp: conga::now(),
-        });
-        self.session
-            .append_event(&SessionEvent::User(user.clone()))
-            .await?;
 
         // Restore the token budget from the log tail (the last persisted
-        // assistant usage) — scoped to the post-clear slice: a cleared
-        // conversation is empty, so a pre-clear usage snapshot would
-        // over-estimate and trigger compaction against history that no
-        // longer exists.
+        // assistant usage) — scoped to the post-checkpoint slice (past the
+        // last Cleared/Compacted): a cleared conversation is empty and a
+        // compacted one is only as big as its checkpoint, so a
+        // pre-checkpoint usage snapshot would over-estimate and trigger
+        // compaction against history that no longer exists. No usage after
+        // the checkpoint (e.g. the turn right after one) simply means
+        // occupancy is unknown-yet-small; the next provider report sets it
+        // straight — that is the hysteresis.
         let live = conga::live_range_start(&events);
         let mut budget = self.budget.clone();
         if let Some(input_tokens) = events[live..].iter().rev().find_map(|ev| match ev {
@@ -348,12 +346,6 @@ impl Host {
         // results for tool calls that never got one before feeding the loop.
         repair_unanswered_tool_calls(&mut history);
 
-        // Per-turn environment block: git status / diffstat drift as the
-        // session progresses. Built fresh each turn (async git subprocess
-        // calls are capped and timeout-guarded inside `env_snapshot`);
-        // appended, never persisted - the static prompt in
-        // `self.system_prompt` stays the durable part.
-        let snapshot = crate::prompt::env_snapshot(&self.cwd).await;
         // Per-turn settings: re-read the file every turn so a UI save
         // reaches the very next LLM call - both the provider AND the
         // custom base prompt (a half-applied switch would be worse than
@@ -363,32 +355,75 @@ impl Host {
         } else {
             crate::settings::load_settings_async().await
         };
+        // A saved `maxTokens` overrides the env-derived context window on
+        // the very next turn — the budget is per-turn state cloned above,
+        // so this never needs a restart. Absent = keep the env window.
+        // Applied BEFORE the compaction decision so the override reaches
+        // this turn's checkpoint, not the next one's.
+        if let Some(n) = settings.max_tokens {
+            budget.set_window(n);
+        }
+
+        // Over budget: append ONE `Compacted` checkpoint and restart the
+        // projection from it. The compacted view is persisted — an append,
+        // never a rewrite — so every later turn replays the same prefix
+        // bytes. This replaces the old per-request `transform_context`
+        // wire view, which oscillated between the compacted view and the
+        // full history (compact one turn, borrow back the next) and missed
+        // the provider prompt cache on every one of those turns.
+        if let Compacted::Owned(view) = budget.compact(&history) {
+            // view = [pinned task, notice, kept...]; history = [pinned,
+            // dropped..., kept...] → dropped = history.len() - view.len() + 1
+            // (the notice occupies one slot).
+            let dropped = history.len() - view.len() + 1;
+            self.session
+                .append_event(&SessionEvent::Compacted {
+                    base: view.clone(),
+                    dropped,
+                })
+                .await?;
+            history = view;
+        }
+
+        // Per-turn environment block: git status / diffstat drift as the
+        // session progresses. Built fresh each turn (async git subprocess
+        // calls are capped and timeout-guarded inside `env_snapshot`) and
+        // embedded in the PERSISTED user message — the request tail is
+        // exactly what the log replays. The system prompt stays
+        // byte-stable across turns, so the provider's cached prefix
+        // (tools + system + history) survives; volatile env rides in the
+        // request tail instead of poisoning the prefix from the top.
+        let snapshot = crate::prompt::env_snapshot(&self.cwd).await;
+        let user_content = if snapshot.is_empty() {
+            user_msg.to_string()
+        } else {
+            format!(
+                "{user_msg}\n\n<environment>\n{snapshot}\n</environment>"
+            )
+        };
+        let user = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(user_content)],
+            timestamp: conga::now(),
+        });
+        // Appended AFTER any Compacted checkpoint so the projection reads
+        // [checkpoint base, user, ...] — the current task always survives
+        // compaction.
+        self.session
+            .append_event(&SessionEvent::User(user.clone()))
+            .await?;
+
         let base_prompt = crate::prompt::with_custom_base_prompt(
             &self.system_prompt,
             settings.system_prompt.as_deref(),
         );
-        let turn_prompt = if snapshot.is_empty() {
-            base_prompt
-        } else {
-            format!(
-                "{}\n\n<environment>\n{}\n</environment>",
-                base_prompt, snapshot
-            )
-        };
         // Per-turn LLM settings: the web UI persists env overrides to
         // ~/.conga/settings.json; re-resolve the provider EVERY turn so a
         // UI save reaches the very next LLM call (model id + stream_fn
         // together - a half-applied switch would be worse than none).
         let (turn_cfg, turn_stream_fn) = self.resolve_turn_provider(&settings);
-        // A saved `maxTokens` overrides the env-derived context window on
-        // the very next turn — the budget is per-turn state cloned above,
-        // so this never needs a restart. Absent = keep the env window.
-        if let Some(n) = settings.max_tokens {
-            budget.set_window(n);
-        }
         let (context, mut config) = turn_cfg.prepare_turn(
             TurnInputs {
-                system_prompt: &turn_prompt,
+                system_prompt: &base_prompt,
                 history: &history,
                 tools: &self.tools,
                 cwd: &self.cwd,
@@ -400,12 +435,6 @@ impl Host {
             self.max_turns,
             Some(self.session.persist_fn()),
         );
-        config.transform_context = Some(Arc::new(move |msgs: &[AgentMessage]| {
-            let view = budget.compact(msgs);
-            // The under-budget path borrows the accumulator: this clone
-            // only runs when compaction actually dropped something.
-            Ok(view.into_owned())
-        }));
         config.steer = Some(self.steer.clone());
 
         let outcome = conga::run_agent_loop(vec![user], context, config, |ev| {

@@ -43,8 +43,8 @@ use dashmap::DashMap;
 use tracing::info;
 
 use crate::api::{
-    compact_context, delete_session, get_commands, get_context, get_messages, get_settings,
-    list_sessions, put_settings, rename_session, search_sessions,
+    compact_context, delete_session, get_cache_stats, get_commands, get_context, get_messages,
+    get_settings, list_sessions, put_settings, rename_session, search_sessions,
 };
 use crate::state::AppState;
 use crate::ws::ws_handler;
@@ -90,6 +90,7 @@ async fn main() {
         .route("/api/sessions/{key}/context", get(get_context))
         .route("/api/sessions/{key}/context/compact", post(compact_context))
         .route("/api/sessions/{key}/messages", get(get_messages))
+        .route("/api/sessions/{key}/cache", get(get_cache_stats))
         .route("/api/sessions/{key}/name", put(rename_session))
         .route("/api/sessions/{key}", delete(delete_session))
         .fallback_service(

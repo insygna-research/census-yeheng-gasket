@@ -106,10 +106,12 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     };
 
     let count = matches.len();
+    // Spill oversize match sets at birth (same freeze-at-birth contract as
+    // bash/read: the persisted text is final; nothing rewrites it later).
     let body = if matches.is_empty() {
         "(no matches)".to_string()
     } else {
-        matches.join("\n")
+        super::spill_or_truncate(&ctx, &matches.join("\n"))
     };
 
     Ok(ToolResult {

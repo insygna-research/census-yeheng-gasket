@@ -108,7 +108,23 @@ fn build_request_body(
     system_prompt: &str,
     tools: &[ToolDefinition],
 ) -> serde_json::Value {
-    let msgs = fold_same_role(messages.iter().filter_map(convert_message).collect());
+    let mut msgs = fold_same_role(messages.iter().filter_map(convert_message).collect());
+    // Third breakpoint on the FINAL message: everything before it (tools +
+    // system + the entire prior history) is written to the provider cache
+    // this request and read back on every subsequent one. The final
+    // message is the only uncached bytes — it becomes prefix on the next
+    // request. A breakpoint any earlier (e.g. the second-to-last message)
+    // would leave the newest exchange permanently uncached: written, never
+    // read. Three breakpoints total, inside Anthropic's 4-mark limit.
+    if let Some(last) = msgs.last_mut() {
+        if let Some(block) = last
+            .get_mut("content")
+            .and_then(|c| c.as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+        {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
 
     let mut body = json!({
         "model": model.id,
@@ -530,6 +546,37 @@ mod tests {
         // the (last) tool carries a cache breakpoint.
         let tools_arr = body["tools"].as_array().expect("tools is array");
         assert_eq!(tools_arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_marks_final_message_block() {
+        // The third breakpoint rides on the LAST content block of the
+        // LAST message (after same-role folding), so the whole prior
+        // conversation is cache-written this request and read next one.
+        use crate::types::context::{ModelSpec, ProviderApi};
+        let model = ModelSpec {
+            id: "claude".into(),
+            api: ProviderApi::Anthropic,
+            max_tokens: 1024,
+        };
+        let messages = vec![
+            AgentMessage::user("first"),
+            AgentMessage::assistant_text("second"),
+            AgentMessage::user("third"),
+        ];
+        let body = build_request_body(&model, &messages, "", &[]);
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 3);
+        let last = msgs.last().unwrap();
+        let blocks = last["content"].as_array().expect("content array");
+        let block = blocks.last().unwrap();
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+        // No breakpoint on non-final messages (3 total with tools/system —
+        // the earlier two live outside the messages array).
+        for m in &msgs[..msgs.len() - 1] {
+            let s = serde_json::to_string(m).unwrap();
+            assert!(!s.contains("cache_control"), "non-final message marked: {s}");
+        }
     }
 
     // ── Role-alternation folding (Anthropic 400s on adjacent same roles) ──

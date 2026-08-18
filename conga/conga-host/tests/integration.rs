@@ -10,6 +10,7 @@
 //! and is then deleted.
 mod common;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::FakeStream;
@@ -18,6 +19,7 @@ use conga::{
     derive_messages, AgentMessage, AssistantMessage, CancelCause, ContentBlock, EventStorage,
     SessionEvent, StopReason, StreamChunk, ToolResultMessage, TurnEndReason, UserMessage,
 };
+use parking_lot::Mutex;
 use conga_host::{
     ConfigLoader, EventPrinter, Host, HostConfig, Mode, PermissionPolicy, SessionManager,
     TurnSummary,
@@ -526,29 +528,57 @@ async fn corrupted_session_errors_instead_of_adopting() {
     );
 }
 
-/// Mid-turn compaction through the `transform_context` seam: within ONE
-/// turn the working transcript grows with every assistant+tool-result
-/// pair, and the wire view handed to the provider must be re-compacted
-/// before EVERY call — not just once at turn start.
+/// Compaction is a TURN-BOUNDARY checkpoint, not a per-call wire view:
+/// when the restored budget is over threshold at turn start, ONE
+/// `Compacted` event is appended and the provider sees that view for the
+/// whole turn. Mid-turn growth appends AFTER the checkpoint (prefix-stable
+/// within the turn — the property that keeps the provider prompt cache
+/// warm), and the pre-checkpoint rows stay on disk (append-only intact).
+/// This replaces the old `transform_context` wire view, which re-compacted
+/// before every LLM call and oscillated between compacted and full
+/// history, missing the cache every turn.
 #[tokio::test]
-async fn run_turn_compacts_before_every_llm_call() {
+async fn compaction_checkpoints_at_turn_start_and_pins_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir_in(".").unwrap();
     let rel = format!(
         "{}/c.txt",
         work.path().file_name().unwrap().to_string_lossy()
     );
-
     let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let sid = session.current_id().to_string();
+
+    // Seed a long history: 30 single-user-message groups plus a final
+    // Assistant carrying a usage row far over the (default) window — the
+    // next turn's budget restore must see over-threshold and checkpoint.
+    for i in 0..30 {
+        session
+            .append_event(&SessionEvent::User(user_msg(&format!("m{i}"))))
+            .await
+            .unwrap();
+    }
+    session
+        .append_event(&SessionEvent::Assistant {
+            message: AgentMessage::assistant_text("big turn"),
+            usage: Some(conga::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 1,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+        })
+        .await
+        .unwrap();
+
     let fake = Arc::new(FakeStream::new(vec![
         vec![write_call("t1", &rel, "one"), StreamChunk::Done],
-        vec![write_call("t2", &rel, "two"), StreamChunk::Done],
         vec![StreamChunk::TextDelta("done".into()), StreamChunk::Done],
+        // Turn 2: proves the checkpoint is replayed, not re-derived.
+        vec![StreamChunk::TextDelta("done2".into()), StreamChunk::Done],
     ]));
     let stream_fn: Arc<dyn conga::StreamFn> = fake.clone();
-    // No recorded usage → count-fallback path with a tiny cap of 3.
-    let budget =
-        conga_host::ContextBudget::from_env_with(&fake_env(&[("CONGA_COMPACT_MAX_MESSAGES", "3")]));
+    // Defaults: window 128k, threshold 80% → 1M input tokens is over.
+    let budget = conga_host::ContextBudget::from_env_with(&fake_env(&[]));
     let host = Host::new(
         test_cfg(true),
         session,
@@ -563,47 +593,188 @@ async fn run_turn_compacts_before_every_llm_call() {
     assert!(matches!(summary.reason, TurnEndReason::Completed));
 
     let seen = fake.seen();
-    assert_eq!(seen.len(), 3, "three LLM calls expected");
-    // Call 1: history is just the user prompt.
-    assert_eq!(seen[0].len(), 1);
-    // Call 2: user + assistant + tool_result = 3, still within cap.
-    assert_eq!(seen[1].len(), 3);
-    // Call 3: history is 5 (user + 2×(assistant+tool_result)); the wire
-    // view must be compacted — pinned task + notice + kept tail under the
-    // cap (pinned task rides outside the budget, so ≤ 3 + 1).
-    assert!(
-        seen[2].len() <= 4,
-        "third call must be compacted, got {}",
-        seen[2].len()
+    assert_eq!(seen.len(), 2, "two LLM calls in turn 1");
+    // Turn-start checkpoint: 31 seeded messages compacted to the 50%
+    // target (pinned m0 + notice + 14 newest = 16) + the current user.
+    assert_eq!(
+        seen[0].len(),
+        17,
+        "call 1 must be the compacted view + current user, got {}",
+        seen[0].len()
     );
-    let first = match &seen[2][0] {
-        AgentMessage::User(u) => match &u.content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            _ => panic!("expected text"),
-        },
-        _ => panic!("expected pinned task or notice first, got {:?}", seen[2][0]),
-    };
-    // Either the pinned original task ("go") leads and the notice follows,
-    // or (degenerate single-group history) the notice leads.
-    assert!(
-        first == "go" || first.starts_with("[compacted"),
-        "expected pinned task or compaction notice, got: {first}"
-    );
-    let has_notice = seen[2].iter().any(|m| {
-        matches!(m, AgentMessage::User(u)
-        if matches!(&u.content[0], ContentBlock::Text { text } if text.starts_with("[compacted")))
-    });
-    assert!(has_notice, "compaction notice must be present: {first:?}");
-    // The on-disk log keeps the FULL transcript: every assistant message,
-    // uncompacted — the seam is a wire view only.
-    let sid = host.session().current_id().to_string();
+    // Mid-turn growth is pure append: call 2 = call 1 + assistant +
+    // tool_result, byte-identical prefix (no per-call re-compaction).
+    assert_eq!(seen[1].len(), seen[0].len() + 2);
+    assert_eq!(&seen[1][..seen[0].len()], &seen[0][..]);
+
+    host.run_turn("again", |_| {}).await.unwrap();
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 3, "one LLM call in turn 2");
+    // Turn 2 replays the SAME checkpoint bytes: its request prefixes with
+    // turn 1's final request (appended assistant/tool_result/user only).
+    // The pre-checkpoint 1M usage row is out of the post-checkpoint scan
+    // scope, so occupancy resets to unknown → no re-compaction churn.
+    assert_eq!(&seen[2][..seen[1].len()], &seen[1][..]);
+
+    // The log keeps every pre-checkpoint row AND the checkpoint itself.
     let reopen = SessionManager::with_root(tmp.path().to_path_buf());
     let events = reopen.open_or_migrate(&sid).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, SessionEvent::Compacted { dropped, .. } if *dropped > 0)),
+        "a Compacted checkpoint must be persisted"
+    );
     let assistants = events
         .iter()
         .filter(|ev| matches!(ev, SessionEvent::Assistant { .. }))
         .count();
-    assert_eq!(assistants, 3, "log keeps every assistant, uncompacted");
+    assert_eq!(
+        assistants, 4,
+        "seeded + 2 turn-1 + 1 turn-2 assistants, all kept uncompacted"
+    );
+    // derive_messages restarts from the checkpoint: the projected view is
+    // the compacted base + post-checkpoint rows — never the full 31.
+    // base(16) + user("go") + asst + result + asst + user("again") + asst.
+    assert_eq!(derive_messages(&events).len(), 22);
+}
+
+/// Records `(system, messages)` per provider call. The prefix-stability
+/// guard asserts on exactly what the provider would cache — the message
+/// list AND the system prompt — so both must be captured (FakeStream
+/// records messages only).
+struct PrefixCaptureStream {
+    scripts: Mutex<VecDeque<Vec<StreamChunk>>>,
+    seen: Mutex<Vec<(String, Vec<AgentMessage>)>>,
+}
+
+impl PrefixCaptureStream {
+    fn new(scripts: Vec<Vec<StreamChunk>>) -> Self {
+        Self {
+            scripts: Mutex::new(scripts.into()),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<(String, Vec<AgentMessage>)> {
+        self.seen.lock().clone()
+    }
+}
+
+impl conga::StreamFn for PrefixCaptureStream {
+    fn stream(
+        &self,
+        _model: &conga::ModelSpec,
+        messages: &[AgentMessage],
+        system: &str,
+        _tools: &[conga::ToolDefinition],
+        _signal: Option<conga::CancelSignal>,
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = conga::StreamChunk> + Send>> {
+        self.seen
+            .lock()
+            .push((system.to_string(), messages.to_vec()));
+        let chunks = self.scripts.lock().pop_front().expect(
+            "PrefixCaptureStream: script underflow — fewer scripts than stream() calls",
+        );
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+}
+
+/// THE guard: what the provider is asked to cache must be byte-stable
+/// across consecutive requests. Four invariants, one test:
+///
+/// 1. The system prompt is IDENTICAL on every provider call of every
+///    turn (static head — a per-turn env block in there would invalidate
+///    the cache from the top on every turn).
+/// 2. The system prompt carries NO dynamic env (no UTC date, no git
+///    status, no `<environment>` tag).
+/// 3. Every request's message list is a strict PREFIX-EXTENSION of the
+///    previous one (within a turn and across turns): request N's exact
+///    messages reappear, untouched, at the head of request N+1. That is
+///    the byte-level precondition for prefix-cache hits.
+/// 4. Send-what-you-persist: the volatile env rides INSIDE the persisted
+///    user message (its tail), and the request history equals the log's
+///    projection — replay and request are the same bytes.
+#[tokio::test]
+async fn consecutive_requests_are_prefix_stable_and_env_stays_out_of_system() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir_in(".").unwrap();
+    let rel = format!(
+        "{}/g.txt",
+        work.path().file_name().unwrap().to_string_lossy()
+    );
+    let session = SessionManager::with_root(tmp.path().to_path_buf());
+    let sid = session.current_id().to_string();
+
+    let provider = Arc::new(PrefixCaptureStream::new(vec![
+        vec![write_call("t1", &rel, "one"), StreamChunk::Done],
+        vec![StreamChunk::TextDelta("done".into()), StreamChunk::Done],
+        vec![StreamChunk::TextDelta("done2".into()), StreamChunk::Done],
+    ]));
+    let host = Host::new(
+        test_cfg(true),
+        session,
+        Arc::new(full_auto_policy()),
+        "static system prompt".into(),
+        conga_host::built_in_tools(),
+    )
+    .with_stream_fn(provider.clone() as Arc<dyn conga::StreamFn>);
+
+    host.run_turn("task one", |_| {}).await.unwrap();
+    host.run_turn("task two", |_| {}).await.unwrap();
+
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 3, "two calls in turn 1, one in turn 2");
+
+    // 1. Static head: identical system on every call.
+    for (system, _) in &seen {
+        assert_eq!(system, "static system prompt");
+    }
+    // 2. No dynamic env may leak into the cached prefix.
+    assert!(!seen[0].0.contains("Date (UTC)"));
+    assert!(!seen[0].0.contains("Git status"));
+    assert!(!seen[0].0.contains("<environment>"));
+
+    // 3. Prefix-extension: request K+1 starts with request K's exact
+    // messages (structurally equal ⇒ identical cached bytes).
+    let is_prefix = |shorter: &[AgentMessage], longer: &[AgentMessage]| {
+        longer.len() >= shorter.len() && &longer[..shorter.len()] == shorter
+    };
+    assert!(
+        is_prefix(&seen[0].1, &seen[1].1),
+        "mid-turn growth must be append-only: {:?} vs {:?}",
+        seen[0].1.len(),
+        seen[1].1.len()
+    );
+    assert!(
+        is_prefix(&seen[1].1, &seen[2].1),
+        "turn-2 request must prefix-extend turn-1's final request"
+    );
+
+    // 4. Send-what-you-persist: env rides in the persisted user tail, and
+    // the request history IS the log projection.
+    let user_text = |m: &AgentMessage| match m {
+        AgentMessage::User(u) => match &u.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        },
+        _ => panic!("expected user message"),
+    };
+    let first_user = user_text(&seen[0].1[0]);
+    assert!(
+        first_user.starts_with("task one\n\n<environment>"),
+        "env must be the tail of the persisted user message, got: {first_user:.60}…"
+    );
+    let reopen = SessionManager::with_root(tmp.path().to_path_buf());
+    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let projected = derive_messages(&events);
+    // The turn-2 request equals the final projection minus its TRAILING
+    // assistant — that message is persisted by this very provider call
+    // (after streaming), so it cannot have been in the request.
+    assert_eq!(
+        &seen[2].1, &projected[..projected.len() - 1],
+        "the request history must equal the log projection"
+    );
 }
 
 /// The unified `/clear`: `clear_session` appends a `Cleared` fact to the
@@ -664,12 +835,15 @@ async fn clear_session_marks_log_and_next_turn_starts_empty() {
             _ => None,
         })
         .collect();
-    assert!(texts.contains(&"fresh question".to_string()), "{texts:?}");
-    assert!(texts.contains(&"fresh answer".to_string()), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.starts_with("fresh question")),
+        "user text leads the (env-suffixed) message: {texts:?}"
+    );
+    assert!(texts.iter().any(|t| t == "fresh answer"), "{texts:?}");
     assert!(
         !texts
             .iter()
-            .any(|t| t == "old question" || t == "old answer"),
+            .any(|t| t.starts_with("old question") || t == "old answer"),
         "pre-clear content must not leak into the derived view: {texts:?}"
     );
 

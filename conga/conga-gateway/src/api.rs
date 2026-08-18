@@ -109,6 +109,35 @@ pub(crate) async fn get_messages(
     }
 }
 
+/// Prompt-cache accounting for a session, folded from the persisted
+/// usage rows (read-only observability; same 404/500 contract as
+/// `get_messages`).
+pub(crate) async fn get_cache_stats(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    match conga_host::session_cache_stats(&state.store_root, &key).await {
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown session: {key}") })),
+        )
+            .into_response(),
+        Ok(Some(stats)) => Json(json!({
+            "input_tokens": stats.input_tokens,
+            "cache_read_tokens": stats.cache_read_tokens,
+            "cache_write_tokens": stats.cache_write_tokens,
+            "calls": stats.calls,
+            "cache_reporting_calls": stats.cache_reporting_calls,
+            "hit_rate": stats.hit_rate(),
+        }))
+        .into_response(),
+        Err(e) => {
+            warn!("get_cache_stats {key}: {e}");
+            err_response(&e)
+        }
+    }
+}
+
 // ── Web-UI LLM env settings (file-backed, applied per LLM call) ──────────
 
 /// The masked settings view: raw API keys never cross this API (the
@@ -249,6 +278,7 @@ mod tests {
             .route("/api/sessions", get(list_sessions))
             .route("/api/sessions/search", get(search_sessions))
             .route("/api/sessions/{key}/messages", get(get_messages))
+            .route("/api/sessions/{key}/cache", get(get_cache_stats))
             .route("/api/sessions/{key}/name", put(rename_session))
             .route("/api/sessions/{key}", delete(delete_session))
             .with_state(state)
@@ -256,6 +286,40 @@ mod tests {
 
     fn get_uri(uri: &str) -> Request<Body> {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cache_stats_folds_usage_rows_over_http() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = EventStorage::new(tmp.path().to_path_buf());
+        storage
+            .append_event(
+                "sess-c",
+                &SessionEvent::Assistant {
+                    message: AgentMessage::assistant_text("answer"),
+                    usage: Some(conga::Usage {
+                        input_tokens: 1_000,
+                        output_tokens: 5,
+                        cache_read_tokens: Some(900),
+                        cache_write_tokens: Some(50),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let res = api_router(test_state(tmp.path().to_path_buf()))
+            .oneshot(get_uri("/api/sessions/sess-c/cache"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["input_tokens"], 1_000);
+        assert_eq!(v["cache_read_tokens"], 900);
+        assert_eq!(v["cache_write_tokens"], 50);
+        assert_eq!(v["calls"], 1);
+        let rate = v["hit_rate"].as_f64().unwrap();
+        assert!((rate - 0.9).abs() < 1e-9, "{rate}");
     }
 
     #[tokio::test]

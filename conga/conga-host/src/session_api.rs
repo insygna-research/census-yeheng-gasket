@@ -86,6 +86,26 @@ pub async fn session_messages(
     Ok(Some(conga::derive_messages(&events)))
 }
 
+/// Session-wide prompt-cache accounting, folded from the same on-disk
+/// event log (usage rows on Assistant events). `Ok(None)` = no on-disk
+/// data (same contract as [`session_messages`]); read-only observability —
+/// the hit rate is a fact about the log, recomputed on demand.
+pub async fn session_cache_stats(
+    store_root: &Path,
+    session_id: &str,
+) -> Result<Option<conga::CacheStats>, SessionApiError> {
+    let storage = EventStorage::new(store_root.to_path_buf());
+    if !storage.has_events(session_id) && !storage.messages_path(session_id).exists() {
+        return Ok(None);
+    }
+    let mgr = SessionManager::with_root(store_root.to_path_buf());
+    let events = mgr
+        .open_or_migrate(session_id)
+        .await
+        .map_err(|e| SessionApiError::Internal(e.to_string()))?;
+    Ok(Some(conga::cache_stats(&events)))
+}
+
 /// Persist the session's display name in its `meta.json` sidecar. Creates
 /// the session directory if needed, so a chat can be named before its first
 /// turn lands on disk. Bad id/name → `BadRequest`.

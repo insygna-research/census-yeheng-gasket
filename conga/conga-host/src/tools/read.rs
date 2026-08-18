@@ -63,6 +63,11 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
         .map(|(i, l)| format!("{:>6}\t{}", start + i + 1, l))
         .collect::<Vec<_>>()
         .join("\n");
+    // Freeze oversize output at birth: spill to disk + head preview, so
+    // the persisted event stores a bounded, immutable text — a read of a
+    // near-2MB file must not become a mutable context blob that later
+    // compaction rewrites (breaking the cache prefix every turn).
+    let out = super::spill_or_truncate(&ctx, &out);
 
     Ok(ToolResult {
         content: vec![ContentBlock::text(if out.is_empty() {
@@ -96,6 +101,31 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversize_read_spills_to_disk() {
+        // Freeze-at-birth: a read whose rendered output exceeds the
+        // in-context cap is spilled to `<state_dir>/spill/` and replaced
+        // by a head preview + path — the persisted tool result is final
+        // and bounded, never a blob that later compaction rewrites.
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(250_000);
+        tokio::fs::write(tmp.path().join("big.txt"), &big)
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"path": "big.txt"}), tmp.path()).await;
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(
+            text.contains("full output saved to"),
+            "expected spill notice, got {} bytes: {}…",
+            text.len(),
+            &text[..80.min(text.len())]
+        );
+        assert!(tmp.path().join("spill").is_dir(), "spill dir must exist");
     }
 
     #[tokio::test]

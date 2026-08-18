@@ -109,8 +109,11 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
     }
 
     entries.sort();
+    // Spill oversize listings at birth (freeze-at-birth contract; a
+    // 2000-entry recursive listing can exceed the in-context cap).
+    let text = super::spill_or_truncate(&ctx, &entries.join("\n"));
     Ok(ToolResult {
-        content: vec![ContentBlock::text(entries.join("\n"))],
+        content: vec![ContentBlock::text(text)],
         details: serde_json::json!({"count": entries.len()}),
         is_error: false,
     })

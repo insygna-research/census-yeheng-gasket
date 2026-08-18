@@ -107,10 +107,10 @@ impl HostConfig {
     /// (`Host::run_turn` for the CLI, the gateway's per-connection driver).
     /// Resets the abort signal, then builds the context + loop config from
     /// the provider/tunables. `inputs.history` is the log-derived working
-    /// copy (full — compaction happens inside the loop's
-    /// `transform_context` seam before every LLM call) — the event log on
-    /// disk remains the single source of truth. Returns owned values so
-    /// the caller can run the loop
+    /// copy — already past any turn-start compaction checkpoint (`Host::
+    /// run_turn` appends a `Compacted` event when over budget) — and the
+    /// event log on disk remains the single source of truth. Returns owned
+    /// values so the caller can run the loop
     /// however it likes - inline (CLI) or in a spawned task with
     /// event-channel forwarding (gateway). `persist`, when set, is handed to
     /// the loop so every Assistant/ToolResult lands on disk as it happens;
