@@ -394,11 +394,17 @@ impl Host {
         // (tools + system + history) survives; volatile env rides in the
         // request tail instead of poisoning the prefix from the top.
         let snapshot = crate::prompt::env_snapshot(&self.cwd).await;
-        let user_content = if snapshot.is_empty() {
+        let mut user_content = if snapshot.is_empty() {
             user_msg.to_string()
         } else {
             format!("{user_msg}\n\n<environment>\n{snapshot}\n</environment>")
         };
+        // Plan-mode directive rides the same persisted tail (volatile mode
+        // state must not touch the byte-stable system prompt / cache
+        // prefix). The policy gate below stays the law; this is the hint.
+        if self.policy.mode() == Mode::Plan {
+            user_content = format!("{user_content}\n\n{}", crate::prompt::PLAN_MODE_DIRECTIVE);
+        }
         let user = AgentMessage::User(UserMessage {
             content: vec![ContentBlock::text(user_content)],
             timestamp: conga::now(),
@@ -776,6 +782,64 @@ mod tests {
         assert!(
             raced.is_err(),
             "third turn should be in flight, not rejected"
+        );
+    }
+
+    /// Plan mode's directive must ride the PERSISTED user message tail —
+    /// same channel as the env snapshot — so the system prompt stays
+    /// byte-stable for the provider cache and the log replays exactly what
+    /// the model saw. RED marker: "<agent-mode>plan</agent-mode>".
+    #[tokio::test]
+    async fn plan_mode_directive_rides_persisted_user_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+        let host = Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::Plan,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        )
+        .with_stream_fn(Arc::new(ErroringProvider));
+
+        let _ = host.run_turn("do it", |_ev| {}).await;
+
+        let log = std::fs::read_to_string(&events_path).unwrap();
+        assert!(
+            log.contains("<agent-mode>plan</agent-mode>"),
+            "persisted user event must carry the plan directive, log: {log}"
+        );
+    }
+
+    /// The directive is plan-only: every other mode persists the user
+    /// message without it.
+    #[tokio::test]
+    async fn non_plan_modes_carry_no_plan_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+        let host = Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        )
+        .with_stream_fn(Arc::new(ErroringProvider));
+
+        let _ = host.run_turn("do it", |_ev| {}).await;
+
+        let log = std::fs::read_to_string(&events_path).unwrap();
+        assert!(
+            !log.contains("<agent-mode>"),
+            "non-plan mode must not carry the directive, log: {log}"
         );
     }
 }

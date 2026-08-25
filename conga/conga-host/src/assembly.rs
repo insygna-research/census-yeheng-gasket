@@ -277,8 +277,8 @@ impl SessionAssembly {
                 session.resume(&r).await
             };
             match res {
-                Ok(m) => println!("(resumed {} with {} msgs)", session.current_id(), m.len()),
-                Err(e) => println!("(resume: {e})"),
+                Ok(m) => eprintln!("(resumed {} with {} msgs)", session.current_id(), m.len()),
+                Err(e) => eprintln!("(resume: {e})"),
             }
         }
         let tools = gather_tools(ext_tools, Vec::new(), false).await;

@@ -1,4 +1,5 @@
 //! conga CLI REPL: 持一个 Host，每行调一次 run_turn，交互式终端 agent。
+//! `conga exec <task>`（见 `exec.rs`）是无头一次性入口，共用同一装配。
 use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use conga::ToolDefinition;
 use conga_host::{gather_tools, install_ctrl_c, EventPrinter, Host, Mode, SessionAssembly};
 use reedline::{DefaultPrompt, Reedline, Signal};
+mod exec;
 
 /// In-process extensions behind feature `ext`: tools + optional hook chain
 /// (`permission_gate`). Without the feature, empty tools / no extra hooks.
@@ -26,6 +28,13 @@ fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn conga::HookChain
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `conga exec ...` is the headless one-shot path; everything else is
+    // the interactive REPL.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("exec") {
+        let code = exec::run(&argv[1..]).await;
+        std::process::exit(code);
+    }
     let mode = std::env::args()
         .find_map(|a| a.strip_prefix("--mode=").and_then(Mode::parse))
         .unwrap_or(Mode::AutoEdit);
@@ -128,7 +137,7 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
                 host.policy().set_mode(m);
                 println!("(mode -> {m:?})");
             }
-            None => println!("usage: /mode <suggest|auto-edit|full-auto>"),
+            None => println!("usage: /mode <suggest|auto-edit|full-auto|plan>"),
         },
         Some("resume") => {
             let arg = parts.next().unwrap_or("last");
@@ -164,7 +173,7 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
             println!("(reloaded tools)");
         }
         Some("help") => println!(
-            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto>  /sessions  /reload-tools  /exit"
+            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto|plan>  /sessions  /reload-tools  /exit"
         ),
         _ => println!("unknown command; /help"),
     }

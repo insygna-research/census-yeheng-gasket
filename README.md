@@ -13,12 +13,13 @@ conga turns "an LLM agent that can call tools, stream output, manage sessions, a
 - **Multi-hunk edits** — one `edit` call applies several hunks atomically (all-or-nothing); approval dialogs render a real diff preview, not raw JSON.
 - **Mid-turn steering** — messages sent while a turn is running are queued (`queued`) and injected as real User messages before the next LLM call — not rejected.
 - **Subagents with receipts** — parallel sub-agent loops persist their own `events.jsonl` under the parent session and return their FULL transcripts (plus log paths) to the parent; an optional fast model (`CONGA_FAST_LLM_*`) routes them cheaper.
-- **Hook chain & permissions** — `before_tool_call` (async, can block/modify) + `after_tool_call` (sync, can rewrite results). Three permission modes: `suggest` / `auto-edit` / `full-auto`.
+- **Hook chain & permissions** — `before_tool_call` (async, can block/modify) + `after_tool_call` (sync, can rewrite results). Four permission modes: `suggest` / `auto-edit` / `full-auto` / `plan` (read-only planning: mutating tools are hard-blocked and a plan directive rides each turn's user message).
 - **Context compaction** — token-aware, turn-boundary-safe, pins the original task message and head-truncates old tool results; the on-disk event log stays append-only and complete.
 - **MCP client** — connect [Model Context Protocol](https://modelcontextprotocol.io) tool servers (stdio + Streamable HTTP). Reuse existing Claude-Desktop-style `mcp.json` configs.
 - **Two frontends, one host** — a terminal REPL (`conga` CLI) and a WebSocket gateway (`conga-gateway`) both drive the same `Host::run_turn`. The Vue 3 frontend runs as a browser app or a Tauri desktop app from one codebase.
 - **Crash-safe event log** — every session is an append-only `events.jsonl`: each side effect (assistant message, tool result) hits disk as it happens, so a crashed/aborted/errored turn keeps everything that already occurred. Torn-tail self-healing drops a truncated last line on crash; mid-file corruption reports with line numbers; unknown event variants fail closed. A `GET /api/sessions/{key}/messages` REST endpoint derives the transcript from disk on demand.
 - **Rate-limit-aware retry** — 429 responses back off on a longer schedule with jitter; partial-set `CONGA_FAST_LLM_*` typos fail loud at startup.
+- **Headless `conga exec`** — one-shot turns for CI/scripts: same host wiring as the REPL, NDJSON event stream on stdout (`--json`, the same wire schema as the gateway), CI-friendly exit codes (`0` done / `1` turn error / `130` aborted / `2` usage), task text via argument or stdin (`-`).
 - **Tool-name conflict detection** — assembled tool sets dedup by name with a warning (first registration wins: built-in → ext → external → MCP).
 
 ## Quick start (5 minutes)

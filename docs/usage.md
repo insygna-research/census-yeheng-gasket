@@ -141,13 +141,13 @@ cargo run --release --bin conga -- --mode=full-auto --resume=last
 ```
 
 - 启动后进入交互式 REPL,每行输入触发一轮对话。
-- **启动参数**:`--mode=<suggest|auto-edit|full-auto>`(默认 `auto-edit`)、`--resume=<id|last>`(恢复会话)。
+- **启动参数**:`--mode=<suggest|auto-edit|full-auto|plan>`(默认 `auto-edit`)、`--resume=<id|last>`(恢复会话)。
 - **斜杠命令**(输入 `/` 开头):
 
 | 命令 | 作用 |
 |---|---|
 | `/help` | 列出命令 |
-| `/mode <suggest\|auto-edit\|full-auto>` | 切换权限模式 |
+| `/mode <suggest\|auto-edit\|full-auto\|plan>` | 切换权限模式 |
 | `/resume [id\|last]` | 恢复会话(默认 last) |
 | `/clear` | 开新会话 |
 | `/sessions` | 列出会话 |
@@ -156,6 +156,23 @@ cargo run --release --bin conga -- --mode=full-auto --resume=last
 
 - **Ctrl-C**:在流式输出中触发**协作式中止**(在下一个安全点退出,返回已生成的部分);在输入行是 reedline 按键事件。
 - **工具审批**:取决于模式与工具风险,可能弹出 `[approve <tool>? y/N]`,输入 `y` 放行。
+
+#### Plan 模式(只读规划)
+
+`--mode=plan` 或 `/mode plan` 进入:与 `suggest` 同为只读门控(Low 风险工具放行,write/edit/bash/fetch/subagents 一律阻断且**不询问审批**),同时在每轮用户消息尾部注入规划指令——要求 agent 用只读工具勘察仓库后**以文本输出实施计划**(改哪些文件、方案、风险、验证方式)。指令随消息持久化(与 environment 快照同一通道),系统提示词保持字节稳定,不破坏 provider 缓存前缀;真正的强制力来自权限门控,指令只是引导。
+
+### 4.2.1 无头执行 `conga exec`(CI / 脚本)
+
+```bash
+./target/release/conga exec [--json] [--mode=<suggest|auto-edit|full-auto|plan>] [--resume=<id|last>] "<task>"
+echo "fix the lint errors" | ./target/release/conga exec -
+```
+
+- **一轮,无 REPL**:与 REPL 共用同一套 Host 装配(`SessionAssembly::build_cli`)与 `run_turn`,行为完全一致。
+- **默认 `--mode=full-auto`**:无头环境没有审批人,任何需要审批的工具都会被拒(stderr 提示);想更保守用 `--mode=plan`。
+- **`--json`**:stdout 每行一个 NDJSON 事件,**与 gateway/桌面端同一种 wire 协议**(`event_to_ws` → `OutgoingEvent`);非 JSON 模式复用 REPL 的 `EventPrinter` 人读输出。会话 id、审批拒绝、子代理日志走 stderr,保证 stdout 可机器解析。
+- **退出码**:`0` = 轮完成;`1` = 轮出错;`130` = 用户中断(SIGINT 惯例);`2` = 用法/装配错误。
+- **`-` 读 stdin**:管道传入任务文本,便于脚本组合。
 
 ### 4.3 编译内置扩展(可选)
 

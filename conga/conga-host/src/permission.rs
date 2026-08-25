@@ -11,6 +11,11 @@ pub enum Mode {
     Suggest,
     AutoEdit,
     FullAuto,
+    /// Read-only exploration + plan output: same tool gate as `Suggest`
+    /// (Low-risk only) but framed as planning — mutating tools are blocked
+    /// with a "present a plan" message and the approver is never consulted.
+    /// The run_turn prompt injects a matching plan directive while active.
+    Plan,
 }
 
 impl Mode {
@@ -19,6 +24,7 @@ impl Mode {
             "suggest" => Some(Mode::Suggest),
             "auto-edit" | "autoedit" | "auto" => Some(Mode::AutoEdit),
             "full-auto" | "fullauto" | "full" => Some(Mode::FullAuto),
+            "plan" => Some(Mode::Plan),
             _ => None,
         }
     }
@@ -66,11 +72,12 @@ impl PermissionPolicy {
         self.mode.store(mode as u8, Ordering::Relaxed);
     }
 
-    fn mode(&self) -> Mode {
+    pub fn mode(&self) -> Mode {
         match self.mode.load(Ordering::Relaxed) {
             0 => Mode::Suggest,
             1 => Mode::AutoEdit,
             2 => Mode::FullAuto,
+            3 => Mode::Plan,
             _ => Mode::AutoEdit,
         }
     }
@@ -120,6 +127,12 @@ impl HookChain for PermissionPolicy {
                 (Mode::Suggest, RiskLevel::Low) => ToolCallVerdict::Allow,
                 (Mode::Suggest, RiskLevel::Medium) | (Mode::Suggest, RiskLevel::High) => {
                     ToolCallVerdict::Block("read-only mode".into())
+                }
+                (Mode::Plan, RiskLevel::Low) => ToolCallVerdict::Allow,
+                (Mode::Plan, RiskLevel::Medium) | (Mode::Plan, RiskLevel::High) => {
+                    ToolCallVerdict::Block(format!(
+                        "{name} blocked: plan mode is read-only — present your plan as text"
+                    ))
                 }
             }
         })
@@ -267,5 +280,42 @@ mod tests {
             ToolCallVerdict::Block(msg) => assert!(msg.contains("aborted"), "{msg}"),
             v => panic!("expected Block, got {v:?}"),
         }
+    }
+
+    #[test]
+    fn parse_accepts_plan() {
+        assert_eq!(Mode::parse("plan"), Some(Mode::Plan));
+        assert_eq!(Mode::parse("PLAN"), Some(Mode::Plan));
+    }
+
+    /// Plan mode = Suggest's read-only gate with plan-flavored messaging:
+    /// Low-risk tools run, everything mutating is blocked WITHOUT consulting
+    /// the approver (there is nothing a human could approve in plan mode).
+    #[tokio::test]
+    async fn plan_mode_allows_readonly_blocks_mutating_without_approver() {
+        let (a, calls) = approver(true);
+        let p = PermissionPolicy::new(Mode::Plan, a);
+        assert!(matches!(
+            verdict(&p, "read", RiskLevel::Low).await,
+            ToolCallVerdict::Allow
+        ));
+        for (name, risk) in [
+            ("write", RiskLevel::Medium),
+            ("edit", RiskLevel::Medium),
+            ("fetch", RiskLevel::Medium),
+            ("bash", RiskLevel::High),
+        ] {
+            match verdict(&p, name, risk).await {
+                ToolCallVerdict::Block(msg) => {
+                    assert!(msg.contains("plan mode"), "{name}: {msg}")
+                }
+                v => panic!("{name} must be blocked in plan mode, got {v:?}"),
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "plan mode must not consult the approver"
+        );
     }
 }

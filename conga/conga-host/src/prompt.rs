@@ -84,6 +84,14 @@ pub fn with_custom_base_prompt(assembled: &str, custom: Option<&str>) -> String 
 /// append after the built-in head.
 const TAIL_MARKERS: [&str; 2] = ["\n\n## Project instructions (", "\n\n## Skills\n"];
 
+/// Plan-mode directive, appended to the PERSISTED user message tail while
+/// [`crate::permission::Mode::Plan`] is active (see `Host::run_turn`).
+/// Rides the tail — like the env snapshot — so the system prompt stays
+/// byte-stable across mode switches and the provider cache prefix survives.
+pub const PLAN_MODE_DIRECTIVE: &str = "\
+<agent-mode>plan</agent-mode>
+Plan mode is ON: mutating tools (write / edit / bash / fetch / subagents) are blocked. Explore the repository with read-only tools, then present a concrete implementation plan — files to touch, approach, risks, and how to verify. Do not attempt to make changes.";
+
 /// Append the nearest project doc (`AGENTS.md`, then `CLAUDE.md`) found at
 /// or above `cwd`. First hit wins; nothing found → `base` unchanged.
 pub fn append_project_doc(base: &str, cwd: &Path) -> String {
