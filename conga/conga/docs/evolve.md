@@ -2,18 +2,20 @@
 
 A design for conga's self-evolution capability: distill reusable
 **experience** and **skills** from session transcripts on demand, and
-inject relevant experience into every turn.
+surface relevant experience in every turn's prompt.
 
 Informed by: ReasoningBank (extract→consolidate→retrieve loop), Voyager
 (verified admission into a skill library), Anthropic Agent Skills
-(filesystem skill packs with frontmatter + progressive disclosure),
-Letta/MemGPT (self-editable memory), EvoAgentX (evaluation-gated
-evolution), Darwin Gödel Machine / AlphaEvolve (archive + rollback as
-the safety net — here distilled to: human-readable files, provenance
-keys, and `git init ~/.conga` if you want history).
+(filesystem skill packs with frontmatter + progressive disclosure — the
+read path below is exactly this pattern), Letta/MemGPT (self-editable
+memory), EvoAgentX (evaluation-gated evolution), Darwin Gödel Machine /
+AlphaEvolve (archive + rollback as the safety net — here distilled to:
+human-readable files, provenance keys, and `git init ~/.conga` if you
+want history).
 
-One sentence: distill sessions into tagged markdown notes, put the
-relevant ones into the prompt, gate every write behind a human.
+One sentence: distill sessions into tagged markdown notes, list them in
+a prompt catalog, let the model `read` the relevant ones on demand —
+and gate every write behind a human.
 
 ---
 
@@ -31,9 +33,9 @@ Does **not** evolve (explicit non-goals):
 - `systemPrompt` / hooks config / `CODING_AGENT_PROMPT` (offline prompt
   optimization needs an evaluator conga does not have).
 - conga's own source code (worst risk/benefit for a personal assistant).
-- No embedding store, no FTS5 memory index (in-process keyword scoring
-  suffices at the cap below; the injection interface stays stable if the
-  library outgrows it).
+- No embedding store, no FTS5 memory index, **no relevance scorer** —
+  the catalog plus model-driven `read` (progressive disclosure) does
+  the selection, exactly like skills.
 - No per-turn online extraction, no timers, no file watchers, no
   per-turn bookkeeping (the read path writes zero bytes).
 
@@ -61,8 +63,8 @@ then [patch] sections; root cause here was conga-ext -> conga-host.
 
 Frontmatter is exactly: `title`, `tags`, `created`, `source_session`.
 No counters, no usage tracking. Hard limits: **64 entries**, body
-≤ 2KB per entry. Small enough to load fully in-process and score per
-turn — no index, no vector store.
+≤ 2KB per entry. Small enough to scan fully per turn — no index, no
+vector store.
 
 Audit and rollback are the files themselves: every entry carries its
 `source_session`, everything is human-readable and human-editable,
@@ -90,10 +92,11 @@ One entry point, `Host::evolve(session_id)`, reached two ways:
 
 Pipeline (4 steps, no consolidation pass):
 
-1. **Load trajectory** — project the session's `events.jsonl` to a
-   conversation + tool-call summary. Skip segments dropped by
-   `Compacted`; if overlong, truncate oldest segments and say so in the
-   input.
+1. **Load trajectory** — project the session's `events.jsonl` via
+   `derive_messages` (which already restarts from the last
+   `Cleared`/`Compacted` checkpoint, so dropped segments are skipped by
+   construction) and render it to text. If overlong, truncate oldest
+   messages and say so in the input.
 2. **Extract** — one sub-agent via `HostSubagentSpawner` (inherits the
    fast-model routing). Input includes the current memory/skills
    catalog (titles + tags/descriptions) so it proposes deltas, not
@@ -123,36 +126,44 @@ Voyager's executable skill library).
 The architectural risk here is near zero (prompt text only); the real
 risk is **garbage insights**. An extractor left to its own devices
 produces "when the build fails, read the error carefully" — and once
-that pollutes the library, every keyword hit injects it into the
-prompt. Two defenses, both mandatory:
+that pollutes the library, every turn's catalog carries it. Two
+defenses, both mandatory:
 
 - The extraction prompt must require each insight to carry
   **root cause + the fix actually applied + evidence from the
   trajectory**. No general advice, only what this session proved.
-- The approver prompt shows title, tags, and the full body — enough to
+- The approver payload shows title, tags, and the full body — enough to
   judge specificity in one glance. If you cannot tell what situation
   an insight applies to, reject it.
 
 ---
 
-## Read path: per-turn injection (automatic, cheap, read-only)
+## Read path: catalog + progressive disclosure (automatic, cheap, read-only)
 
-Seam: `run_turn` already rebuilds the base prompt every turn
-(`with_custom_base_prompt` at the settings re-read, `lib.rs`). Move the
-one-shot skills append out of `assemble_host` into that seam, then:
+The host keeps the system prompt **byte-stable across turns** — that is
+the invariant that keeps the provider prompt-cache prefix warm (see the
+`run_turn` comments: volatile content rides in the request tail, never
+in the prompt). So memory must NOT be injected as per-turn-varying
+selected content — that would bust the cache every turn.
 
-```
-base_prompt -> settings systemPrompt -> append_skills(...) -> append_memory(...)
-```
+Instead, memory rides exactly like skills:
 
-`append_memory(base, last_user_message)` — reads, never writes:
-
-- Score every entry: keyword hits of `tags`/`title` against the last
-  User message (tokenized substring match, in-process).
-- Top 3 by score; ties broken by file mtime (most recently written
-  first). Total injection capped at 1.5KB.
-- Skills are rescanned at the same seam — an evolved skill enters the
-  catalog the very next turn.
+- At the per-turn seam where `run_turn` already re-reads settings and
+  rebuilds the base prompt, compose:
+  `base_prompt -> settings systemPrompt -> append_skills -> append_memory`.
+- `append_memory(base)` scans `~/.conga/memory/*.md` and appends a
+  `## Memory` catalog — one line per entry (`title — first body line`,
+  bounded) with the readable file path, mirroring `append_skills`.
+- The **model** decides relevance from the catalog and pulls the full
+  entry with the existing `read` tool (absolute paths under `~/.conga`
+  are already allowed there).
+- The catalog is deterministic (sorted by title): same files → same
+  bytes → the cache prefix survives every turn. It changes only when
+  the library changes (i.e. right after `/evolve` or a manual edit) —
+  one legitimate cache miss per real change, and the new entry is
+  visible the very next turn.
+- Skills move to the same seam (out of one-shot `assemble_host`), so an
+  evolved skill also enters the catalog the turn after it is written.
 
 Degradation: missing/empty memory dir → silent no-op; an unparsable
 entry → warn + skip (same semantics as `skills::scan_dir`).
@@ -164,7 +175,7 @@ entry → warn + skip (same semantics as `skills::scan_dir`).
 - Evolved content is prompt text only; no new code-execution surface.
 - Prompt-injection in trajectories (e.g. a poisoned web page) can at
   worst pollute a **candidate** — still behind the human Approver and
-  the 1.5KB injection cap. Blast radius bounded.
+  the bounded catalog (64 one-line entries). Blast radius bounded.
 - `evolve` tool is High risk: Suggest/Plan cannot trigger it at all.
 - Multiple concurrent sessions share the library through plain files;
   the read path is stateless and read-only, and the write path runs
@@ -175,16 +186,19 @@ entry → warn + skip (same semantics as `skills::scan_dir`).
 ## Verification
 
 1. Unit (pure functions, `skills.rs` test style): frontmatter parse;
-   scoring + top-3 + mtime tie-break; 1.5KB truncation; cap admission
-   check (add at cap rejected / freed slot admitted); `Compacted`
-   segment filtering.
+   catalog line bounding + unparsable-entry skip; cap admission check
+   (add at cap rejected / freed slot admitted); `Compacted`/`Cleared`
+   segment handling via `derive_messages`; byte-stability (two scans of
+   the same dir produce identical output).
 2. Integration (tempdir fake home): run `/evolve` with a stubbed
    extraction sub-agent returning fixed JSON → assert memory/skills on
    disk, retires deleted, no log sidecar; next turn asserts the
-   injected prompt section and that the read path wrote nothing.
+   catalog section in the composed prompt and that the read path wrote
+   nothing.
 3. Smoke (real CLI): create a "stumble → correct" trajectory, `/evolve`,
-   observe the approval flow and a hit injection in a fresh session;
-   confirm the produced insight names the root cause, not a platitude.
+   observe the approval flow and the new catalog line in the next
+   turn's prompt; confirm the produced insight names the root cause,
+   not a platitude.
 
 ---
 
@@ -192,10 +206,10 @@ entry → warn + skip (same semantics as `skills::scan_dir`).
 
 | File | Change |
 |---|---|
-| `conga-host/src/memory.rs` (new) | entry format, scanner, scorer, read-only injection append |
-| `conga-host/src/evolve.rs` (new) | `Host::evolve` pipeline, admission (incl. cap check), extraction prompt |
-| `conga-host/src/lib.rs` | per-turn seam: skills rescan + `append_memory` |
+| `conga-host/src/memory.rs` (new) | entry format, scanner, read-only catalog append |
+| `conga-host/src/evolve.rs` (new) | `Host::evolve` pipeline, trajectory renderer, extraction prompt, admission (incl. cap check) |
+| `conga-host/src/lib.rs` | per-turn seam: skills rescan + `append_memory`; spawner field for evolve |
 | `conga-host/src/assembly.rs` | move one-shot skills append to the seam |
 | `conga-host/src/tools/mod.rs` | register `evolve` tool (High risk) |
 | `conga-cli/src/main.rs` | `/evolve [--session <id>]` |
-| `docs/` + `.env.example` | document commands, formats, limits |
+| `docs/` | document commands, formats, limits |
