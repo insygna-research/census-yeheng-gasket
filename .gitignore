@@ -38,3 +38,5 @@ web/src-tauri/gen/
 # SDD plan-execution scratch (ledgers, briefs, review packages)
 .superpowers/
 docs/superpowers
+# local git worktrees (using-git-worktrees skill)
+.worktrees/
