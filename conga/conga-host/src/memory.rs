@@ -57,9 +57,10 @@ pub fn append_memory_in(base: &str, root: &Path) -> String {
     out
 }
 
-/// Sorted, cap-bounded view used by both the catalog and evolve's dedupe
-/// check. `load_entries` reports disk truth (no cap) — the cap is a catalog
-/// and admission concern, not a storage one.
+/// Sorted view used by both the catalog and evolve's dedupe check.
+/// `load_entries` reports disk truth (no cap; duplicate titles resolve to
+/// the lexicographically smallest source path so iteration order never
+/// decides) — the cap is a catalog and admission concern, not a storage one.
 pub fn load_entries(root: &Path) -> Vec<MemoryEntry> {
     let mut map: BTreeMap<String, MemoryEntry> = BTreeMap::new();
     let entries = match std::fs::read_dir(root) {
@@ -76,15 +77,26 @@ pub fn load_entries(root: &Path) -> Vec<MemoryEntry> {
             .and_then(|c| parse_entry(&c))
         {
             Some((title, tags, preview)) => {
-                map.insert(
-                    title.clone(),
-                    MemoryEntry {
-                        title,
-                        tags,
-                        source: path,
-                        preview,
-                    },
-                );
+                let entry = MemoryEntry {
+                    title: title.clone(),
+                    tags,
+                    source: path,
+                    preview,
+                };
+                match map.entry(title) {
+                    std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                        // Two files may carry the same `title:`; keep the
+                        // lexicographically smaller source path so the
+                        // catalog never depends on read_dir order
+                        // (byte-stable prompt invariant).
+                        if entry.source < occupied.get().source {
+                            occupied.insert(entry);
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(vacant) => {
+                        vacant.insert(entry);
+                    }
+                }
             }
             None => tracing::warn!(
                 path = %path.display(),
@@ -257,6 +269,30 @@ mod tests {
             "---\ntitle: t\ntags: [x]\ncreated: 1\nsource_session: s\n---\nBody.\n",
         );
         assert_eq!(append_memory_in("B", &root), append_memory_in("B", &root));
+    }
+
+    #[test]
+    fn duplicate_title_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "b.md",
+            "---\ntitle: dup\ntags: [b]\ncreated: 1\nsource_session: s\n---\nFrom b.\n",
+        );
+        write(
+            &root,
+            "a.md",
+            "---\ntitle: dup\ntags: [a]\ncreated: 1\nsource_session: s\n---\nFrom a.\n",
+        );
+        let entries = load_entries(&root);
+        assert_eq!(entries.len(), 1);
+        // Smaller source path wins regardless of read_dir order.
+        assert_eq!(entries[0].source, root.join("a.md"));
+        assert_eq!(entries[0].tags, vec!["a".to_string()]);
+        let first = append_memory_in("BASE", &root);
+        assert_eq!(first, append_memory_in("BASE", &root));
     }
 
     #[test]
