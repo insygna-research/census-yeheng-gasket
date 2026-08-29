@@ -253,8 +253,28 @@ impl Host {
         spawner: Arc<dyn crate::subagent_types::SubagentSpawner>,
     ) -> Self {
         self.spawner = Some(Arc::clone(&spawner));
+        self.rewire_spawner_tools();
+        self
+    }
+
+    /// Re-apply the live spawner wiring to the CURRENT tool list.
+    /// [`built_in_tools`](crate::tools::built_in_tools) registers both
+    /// `spawn_subagents` and `evolve` spawner-less, so the wiring must be
+    /// re-applied every time the list is replaced — not just from
+    /// [`with_spawner`](Self::with_spawner), but also after
+    /// [`set_tools`](Self::set_tools): `/reload-tools` rebuilds the list
+    /// from the spawner-less defaults, and without this re-application
+    /// both tools answer "unavailable" until restart. Returns the names
+    /// actually swapped, so tests can pin the wiring by name without
+    /// executing any tool.
+    fn rewire_spawner_tools(&mut self) -> Vec<&'static str> {
+        let mut swapped = Vec::new();
+        let Some(spawner) = self.spawner.clone() else {
+            return swapped;
+        };
         if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
-            *t = tools::subagent::tool(Some(spawner));
+            *t = tools::subagent::tool(Some(Arc::clone(&spawner)));
+            swapped.push("spawn_subagents");
         }
         // evolve needs the same spawner plus this host's policy/session —
         // both already on the Host, so wire the handle here too.
@@ -262,10 +282,11 @@ impl Host {
             *t = tools::evolve_tool::tool(Some(tools::evolve_tool::EvolveHandle {
                 session: self.session.clone(),
                 policy: Arc::clone(&self.policy),
-                spawner: self.spawner.clone(),
+                spawner: Some(spawner),
             }));
+            swapped.push("evolve");
         }
-        self
+        swapped
     }
 
     /// The wired subagent spawner (extraction runs on it). `None` on hosts
@@ -294,9 +315,13 @@ impl Host {
         .await
     }
 
-    /// Replace the tool list (used by `/reload-tools`).
+    /// Replace the tool list (used by `/reload-tools`). The fresh list is
+    /// rebuilt from spawner-less defaults, so the live wiring is re-applied
+    /// right after the swap (`rewire_spawner_tools`) — a reload must not
+    /// strip the `spawn_subagents`/`evolve` handles until restart.
     pub fn set_tools(&mut self, tools: Vec<ToolDefinition>) {
         self.tools = tools;
+        self.rewire_spawner_tools();
     }
 
     pub fn session(&self) -> &SessionManager {
@@ -668,6 +693,45 @@ mod tests {
         let _ = host
             .with_stream_fn(Arc::new(FakeProvider))
             .with_max_turns(1);
+    }
+
+    /// `/reload-tools` rebuilds the tool list from spawner-less defaults;
+    /// the live wiring must be re-applied on every swap or
+    /// `spawn_subagents` and `evolve` answer "unavailable" until restart.
+    /// Asserts on the swapped NAMES only — executing the tools would hit
+    /// real config_dir roots.
+    #[test]
+    fn spawner_tool_wiring_reapplied_on_every_list_swap() {
+        use crate::subagent_types::NoopSubagentSpawner;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { false })),
+            )),
+            "sys".into(),
+            crate::tools::built_in_tools(),
+        );
+        // No spawner wired: nothing to rewire even with both names present.
+        assert!(host.rewire_spawner_tools().is_empty());
+
+        // Wired spawner + both names in the list: both swap (and the
+        // helper is idempotent on re-runs).
+        let mut host = host.with_spawner(Arc::new(NoopSubagentSpawner));
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents", "evolve"]);
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents", "evolve"]);
+
+        // A list without `evolve` (sub-agent tool sets filter it out):
+        // only spawn_subagents rewires; the exclusion is preserved.
+        host.set_tools(
+            crate::tools::built_in_tools()
+                .into_iter()
+                .filter(|t| t.name != "evolve")
+                .collect(),
+        );
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents"]);
     }
 
     /// The settings file OVERRIDES the env-derived provider for hosts that
