@@ -246,7 +246,8 @@ impl Host {
     /// itself: [`evolve`](Self::evolve) extraction runs on it. Without
     /// this, the tool reports subagents as unavailable and `evolve`
     /// fails; CLI/gateway pass a `HostSubagentSpawner` built from the
-    /// host's config.
+    /// host's config. The `evolve` tool gets its live handle
+    /// (session + policy + spawner) here too.
     pub fn with_spawner(
         mut self,
         spawner: Arc<dyn crate::subagent_types::SubagentSpawner>,
@@ -254,6 +255,15 @@ impl Host {
         self.spawner = Some(Arc::clone(&spawner));
         if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
             *t = tools::subagent::tool(Some(spawner));
+        }
+        // evolve needs the same spawner plus this host's policy/session —
+        // both already on the Host, so wire the handle here too.
+        if let Some(t) = self.tools.iter_mut().find(|t| t.name == "evolve") {
+            *t = tools::evolve_tool::tool(Some(tools::evolve_tool::EvolveHandle {
+                session: self.session.clone(),
+                policy: Arc::clone(&self.policy),
+                spawner: self.spawner.clone(),
+            }));
         }
         self
     }
