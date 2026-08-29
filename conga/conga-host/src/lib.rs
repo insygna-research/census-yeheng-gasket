@@ -18,6 +18,7 @@ pub mod event_map;
 pub mod external_tool;
 pub mod hooks;
 pub mod mcp;
+pub mod memory;
 pub mod permission;
 pub mod preview;
 pub mod printer;
@@ -47,6 +48,7 @@ pub use external_tool::{
 };
 pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
+pub use memory::append_memory;
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use process_hooks::ProcessHookChain;
