@@ -257,15 +257,25 @@ pub async fn apply_proposals(
     // 2. Insight adds (cap-checked against a fresh disk scan).
     for ins in &proposal.insights {
         let title = ins.title.trim();
-        if title.is_empty() {
-            out.skipped.push("insight with empty title".into());
+        let file_title = title_slug(title);
+        if title.is_empty() || file_title.is_empty() {
+            out.skipped.push(format!(
+                "{title}: unusable title (empty or no file-safe characters)"
+            ));
             continue;
         }
         let existing: Vec<String> = crate::memory::load_entries(memory_root)
             .into_iter()
             .map(|e| e.title)
             .collect();
-        if existing.iter().any(|t| t == title) || proposal.duplicates.iter().any(|d| d == title) {
+        // The on-disk name is the slug: comparing raw titles alone would let
+        // "Rust Cyclic Dep" overwrite an existing "rust-cyclic-dep" entry
+        // (or its case variant on a case-insensitive filesystem).
+        if existing
+            .iter()
+            .any(|t| t == title || title_slug(t) == file_title)
+            || proposal.duplicates.iter().any(|d| d == title)
+        {
             out.skipped.push(format!("{title}: duplicate"));
             continue;
         }
@@ -285,7 +295,7 @@ pub async fn apply_proposals(
         }
         let _ = std::fs::create_dir_all(memory_root);
         let body = bound(&ins.content, 2_000);
-        let path = memory_root.join(format!("{}.md", title_slug(title)));
+        let path = memory_root.join(format!("{file_title}.md"));
         match std::fs::write(
             &path,
             crate::memory::entry_markdown(title, &ins.tags, &now, source_session, &body),
@@ -296,10 +306,19 @@ pub async fn apply_proposals(
     }
 
     // 3. Skill adds/updates (no cap — the skills dir is user-shared).
+    let mut seen_skill_slugs = std::collections::HashSet::new();
     for sk in &proposal.skills {
         let name = slug(&sk.name);
         if name.is_empty() {
             out.skipped.push("skill with empty name".into());
+            continue;
+        }
+        // Same-run collisions must not masquerade as "update skill" — the
+        // second proposal with an equal slug would clobber the first while
+        // the outcome reports both an add and an update.
+        if !seen_skill_slugs.insert(name.clone()) {
+            out.skipped
+                .push(format!("{name}: duplicate slug in proposal"));
             continue;
         }
         let path = skills_root.join(format!("{name}.md"));
@@ -550,6 +569,100 @@ mod tests {
         assert!(std::fs::read_to_string(skills.join("demo-skill.md"))
             .unwrap()
             .contains("Hand-written."));
+    }
+
+    /// Review fix 1: a title with no ASCII slug (CJK-only) must be skipped,
+    /// not written to a hidden `​.md` file that load_entries then ignores —
+    /// which would report an add that is invisible to catalog/cap/dedupe.
+    #[tokio::test]
+    async fn cjk_only_title_skipped_not_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let p: EvolveProposal = serde_json::from_str(
+            r#"{"insights":[{"title":"循环依赖排查","tags":["rust"],"content":"c"}],"skills":[],"retires":[],"duplicates":[]}"#,
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &p,
+            &mem,
+            &tmp.path().join("skills"),
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert!(out.skipped.iter().any(|s| s.contains("循环依赖排查")));
+        assert!(out.added_insights.is_empty());
+        assert_eq!(std::fs::read_dir(&mem).unwrap().count(), 0);
+    }
+
+    /// Review fix 2: dedupe must compare slugs, not raw titles — the on-disk
+    /// name IS the slug, so "Rust Cyclic Dep" would silently overwrite an
+    /// existing "rust-cyclic-dep" entry (or its case variant on APFS).
+    #[tokio::test]
+    async fn slug_equivalent_title_counts_as_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("rust-cyclic-dep.md"),
+            crate::memory::entry_markdown(
+                "rust-cyclic-dep",
+                &["rust".to_string()],
+                "1",
+                "s0",
+                "original body",
+            ),
+        )
+        .unwrap();
+        let p: EvolveProposal = serde_json::from_str(
+            r#"{"insights":[{"title":"Rust Cyclic Dep","tags":["rust"],"content":"new body"}],"skills":[],"retires":[],"duplicates":[]}"#,
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &p,
+            &mem,
+            &tmp.path().join("skills"),
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert!(out.skipped.iter().any(|s| s.contains("duplicate")));
+        assert!(out.added_insights.is_empty());
+        assert!(std::fs::read_to_string(mem.join("rust-cyclic-dep.md"))
+            .unwrap()
+            .contains("original body"));
+    }
+
+    /// Review fix 3: two proposed skills with equal slugs — the second must
+    /// be skipped, not treated as a pseudo-"update" that clobbers the first
+    /// while the outcome reports both added and updated.
+    #[tokio::test]
+    async fn skill_duplicate_slug_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let p: EvolveProposal = serde_json::from_str(
+            r#"{"insights":[],"skills":[{"name":"Demo Skill","description":"d","body":"first body"},{"name":"demo skill","description":"d","body":"second body"}],"retires":[],"duplicates":[]}"#,
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &p,
+            &tmp.path().join("memory"),
+            &skills,
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert_eq!(out.added_skills, vec!["demo-skill".to_string()]);
+        assert!(out.updated_skills.is_empty());
+        assert!(out
+            .skipped
+            .iter()
+            .any(|s| s.contains("duplicate slug in proposal")));
+        assert!(std::fs::read_to_string(skills.join("demo-skill.md"))
+            .unwrap()
+            .contains("first body"));
     }
 
     fn load_test(root: &Path) -> Vec<crate::memory::MemoryEntry> {
