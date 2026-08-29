@@ -310,7 +310,7 @@ fn apply_fast_provider(
 }
 
 /// The one Host assembly shared by every caller of this module:
-/// skills prompt -> hook stack (`extra_hooks` first, policy last) -> signal
+/// system prompt -> hook stack (`extra_hooks` first, policy last) -> signal
 /// wiring -> sub-agent spawner. Sub-agents get the built-in set minus
 /// `spawn_subagents` (nesting disabled; shared MCP/external servers are not
 /// built for N parallel loops); the SAME composed hook stack (extra gates,
@@ -325,10 +325,7 @@ async fn assemble_host(
     subagent_emit: SubagentEmit,
 ) -> Host {
     let cwd = crate::project_dir();
-    let system_prompt = crate::append_skills(
-        &crate::append_project_doc(crate::CODING_AGENT_PROMPT, &cwd),
-        &cwd,
-    );
+    let system_prompt = crate::append_project_doc(crate::CODING_AGENT_PROMPT, &cwd);
     let policy = Arc::new(PermissionPolicy::new(mode, approver));
 
     // Host hooks: extra gates first (e.g. the CLI's ext permission gate),
@@ -344,7 +341,7 @@ async fn assemble_host(
     // in-process gates and the policy: they are repo-shippable extra gates,
     // and the policy stays last so a failed/timed-out hook failing open can
     // never bypass the built-in floor gate. Loaded per assembly (same
-    // lifecycle as skills); None when no hooks.json exists anywhere.
+    // lifecycle as the base system prompt); None when no hooks.json exists anywhere.
     if let Some(process_chain) = crate::process_hooks::ProcessHookChain::discover(&cwd) {
         tracing::info!(
             hooks = process_chain.len(),

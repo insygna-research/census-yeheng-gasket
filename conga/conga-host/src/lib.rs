@@ -1,6 +1,6 @@
 //! conga-host - 可复用的 host 层（配置/session/权限/事件渲染/压缩/外部工具）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -418,9 +418,10 @@ impl Host {
             .append_event(&SessionEvent::User(user.clone()))
             .await?;
 
-        let base_prompt = crate::prompt::with_custom_base_prompt(
+        let base_prompt = compose_turn_prompt(
             &self.system_prompt,
             settings.system_prompt.as_deref(),
+            &self.cwd,
         );
         // Per-turn LLM settings: the web UI persists env overrides to
         // ~/.conga/settings.json; re-resolve the provider EVERY turn so a
@@ -498,6 +499,17 @@ impl Host {
     }
 }
 
+/// Per-turn prompt composition: custom base prompt (settings) first, then
+/// the skills and memory catalogs. Both catalogs are deterministic rescans
+/// — identical files produce identical bytes, so the provider cache prefix
+/// survives every turn; only a real library change (evolve run, manual
+/// edit) legitimately busts it. Kept as a named fn so the seam is testable
+/// without a full Host.
+pub(crate) fn compose_turn_prompt(base: &str, custom: Option<&str>, cwd: &Path) -> String {
+    let p = crate::prompt::with_custom_base_prompt(base, custom);
+    crate::append_memory(&crate::append_skills(&p, cwd))
+}
+
 /// Releases the per-Host turn slot when the turn future completes *or* is
 /// dropped (ws close, cancellation): run_turn is cancel-safe, so a dropped
 /// turn must not leave the host permanently busy.
@@ -551,6 +563,30 @@ mod tests {
             ("CONGA_LLM_MODEL", "m"),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn compose_turn_prompt_appends_skill_catalog_after_custom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let skills = cwd.join(".conga").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("demo.md"),
+            "---\nname: demo\ndescription: does things\n---\nBody\n",
+        )
+        .unwrap();
+        let out = compose_turn_prompt("BUILT-IN", Some("custom persona"), cwd);
+        assert!(out.starts_with("custom persona"));
+        assert!(out.contains("## Skills"));
+        assert!(out.contains("demo"));
+        // Memory catalog from the real config dir must not break composition
+        // and must ride last.
+        if conga::storage::config_dir().join("memory").is_dir() {
+            let idx_skills = out.find("## Skills").unwrap();
+            let idx_mem = out.find("## Memory").unwrap();
+            assert!(idx_mem > idx_skills);
+        }
     }
 
     #[test]
