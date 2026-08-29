@@ -173,6 +173,173 @@ pub fn catalog_snapshot(memory_root: &Path, cwd: &Path, global_root: &Path) -> S
     out
 }
 
+#[derive(Debug, Default)]
+pub struct EvolveOutcome {
+    pub added_insights: Vec<String>,
+    pub added_skills: Vec<String>,
+    pub updated_skills: Vec<String>,
+    pub retired: Vec<String>,
+    pub rejected: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+impl EvolveOutcome {
+    /// One-line human summary (CLI /evolve, tool result).
+    pub fn summarize(&self) -> String {
+        format!(
+            "evolve: +{} insights, +{} skills, ~{} skills updated, -{} retired, {} rejected, {} skipped",
+            self.added_insights.len(),
+            self.added_skills.len(),
+            self.updated_skills.len(),
+            self.retired.len(),
+            self.rejected.len(),
+            self.skipped.len(),
+        )
+    }
+}
+
+/// Kebab-case file-safe name (skill proposal names are model output).
+fn slug(name: &str) -> String {
+    let mut s: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+    s.trim_matches('-').to_string()
+}
+
+fn title_slug(title: &str) -> String {
+    slug(title)
+}
+
+/// Admit every proposal: retires first (they free cap slots), then adds.
+/// Each write/delete is individually approved; a rejection drops only
+/// that candidate. The 64-entry cap is enforced HERE, at admission —
+/// with the library full, an add lands only if a same-run retire freed
+/// a slot.
+pub async fn apply_proposals(
+    proposal: &EvolveProposal,
+    memory_root: &Path,
+    skills_root: &Path,
+    source_session: &str,
+    policy: &crate::permission::PermissionPolicy,
+) -> EvolveOutcome {
+    let mut out = EvolveOutcome::default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .to_string();
+
+    // 1. Retires (approved removals free slots for the adds below).
+    for title in &proposal.retires {
+        if let Some(entry) = crate::memory::load_entries(memory_root)
+            .into_iter()
+            .find(|e| &e.title == title)
+        {
+            let args = serde_json::json!({ "action": "retire", "title": title });
+            if policy.approve_action("evolve_write", &args).await {
+                match std::fs::remove_file(&entry.source) {
+                    Ok(()) => out.retired.push(title.clone()),
+                    Err(e) => out.skipped.push(format!("{title}: delete failed: {e}")),
+                }
+            } else {
+                out.rejected.push(format!("retire {title}: denied"));
+            }
+        } else {
+            out.skipped.push(format!("retire {title}: no such entry"));
+        }
+    }
+
+    // 2. Insight adds (cap-checked against a fresh disk scan).
+    for ins in &proposal.insights {
+        let title = ins.title.trim();
+        if title.is_empty() {
+            out.skipped.push("insight with empty title".into());
+            continue;
+        }
+        let existing: Vec<String> = crate::memory::load_entries(memory_root)
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        if existing.iter().any(|t| t == title) || proposal.duplicates.iter().any(|d| d == title) {
+            out.skipped.push(format!("{title}: duplicate"));
+            continue;
+        }
+        if existing.len() >= crate::memory::MAX_ENTRIES {
+            out.rejected.push(format!(
+                "{title}: library full ({} entries)",
+                existing.len()
+            ));
+            continue;
+        }
+        let args = serde_json::json!({
+            "action": "add insight", "title": title, "tags": ins.tags, "content": ins.content,
+        });
+        if !policy.approve_action("evolve_write", &args).await {
+            out.rejected.push(format!("{title}: denied"));
+            continue;
+        }
+        let _ = std::fs::create_dir_all(memory_root);
+        let body = bound(&ins.content, 2_000);
+        let path = memory_root.join(format!("{}.md", title_slug(title)));
+        match std::fs::write(
+            &path,
+            crate::memory::entry_markdown(title, &ins.tags, &now, source_session, &body),
+        ) {
+            Ok(()) => out.added_insights.push(title.to_string()),
+            Err(e) => out.skipped.push(format!("{title}: write failed: {e}")),
+        }
+    }
+
+    // 3. Skill adds/updates (no cap — the skills dir is user-shared).
+    for sk in &proposal.skills {
+        let name = slug(&sk.name);
+        if name.is_empty() {
+            out.skipped.push("skill with empty name".into());
+            continue;
+        }
+        let path = skills_root.join(format!("{name}.md"));
+        let _ = std::fs::create_dir_all(skills_root);
+        let body = format!(
+            "---\nname: {name}\ndescription: {}\nprovenance: evolve\nsource_session: {source_session}\n---\n{}\n",
+            sk.description.replace('\n', " "),
+            sk.body.trim()
+        );
+        let updating = path.exists();
+        if updating {
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            if !current.contains("provenance: evolve") {
+                out.skipped
+                    .push(format!("{name}: user-authored, not overwritten"));
+                continue;
+            }
+        }
+        let args = serde_json::json!({
+            "action": if updating { "update skill" } else { "add skill" },
+            "name": name, "description": sk.description, "body": sk.body,
+        });
+        if !policy.approve_action("evolve_write", &args).await {
+            out.rejected.push(format!("{name}: denied"));
+            continue;
+        }
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                if updating {
+                    out.updated_skills.push(name);
+                } else {
+                    out.added_skills.push(name);
+                }
+            }
+            Err(e) => out.skipped.push(format!("{name}: write failed: {e}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +431,128 @@ mod tests {
         assert!(p.contains("CATALOG"));
         assert!(p.contains("TRAJ"));
         assert!(p.contains("ONLY a JSON object"));
+    }
+
+    use std::sync::Arc;
+
+    fn policy_always(allow: bool) -> crate::permission::PermissionPolicy {
+        crate::permission::PermissionPolicy::new(
+            crate::permission::Mode::FullAuto,
+            Arc::new(move |_name, _args| Box::pin(async move { allow })),
+        )
+    }
+
+    fn proposal_1() -> EvolveProposal {
+        serde_json::from_str(
+            r#"{"insights":[{"title":"rust-cyclic-dep","tags":["rust"],"content":"check members first"}],
+                "skills":[{"name":"Demo Skill","description":"demo","body":"steps"}],
+                "retires":[],"duplicates":[]}"#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn adds_insight_and_skill_when_approved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        let out =
+            apply_proposals(&proposal_1(), &mem, &skills, "sess-1", &policy_always(true)).await;
+        assert_eq!(out.added_insights, vec!["rust-cyclic-dep".to_string()]);
+        assert_eq!(out.added_skills.len(), 1);
+        let md = std::fs::read_to_string(skills.join("demo-skill.md")).unwrap();
+        assert!(md.contains("provenance: evolve"));
+        assert!(md.contains("source_session: sess-1"));
+        let entry = std::fs::read_to_string(mem.join("rust-cyclic-dep.md")).unwrap();
+        assert!(entry.contains("title: rust-cyclic-dep"));
+    }
+
+    #[tokio::test]
+    async fn rejected_approval_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        let out = apply_proposals(&proposal_1(), &mem, &skills, "s", &policy_always(false)).await;
+        // 1 insight + 1 skill, retires empty: exactly 2 candidates denied.
+        // (Brief said 3, but proposal_1 only carries 2 approvable candidates.)
+        assert_eq!(out.rejected.len(), 2);
+        assert!(load_test(&mem).is_empty());
+        assert!(std::fs::read_dir(&skills).unwrap().count() == 0);
+    }
+
+    #[tokio::test]
+    async fn cap_rejects_adds_until_retire_frees_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        for i in 0..crate::memory::MAX_ENTRIES {
+            std::fs::write(
+                mem.join(format!("e{i:02}.md")),
+                &format!(
+                    "---\ntitle: e{i:02}\ntags: [t]\ncreated: 1\nsource_session: s\n---\nB.\n"
+                ),
+            )
+            .unwrap();
+        }
+        let full: EvolveProposal = serde_json::from_str(
+            r#"{"insights":[{"title":"new-one","tags":["x"],"content":"c"}],"skills":[],"retires":[],"duplicates":[]}"#,
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &full,
+            &mem,
+            &tmp.path().join("skills"),
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert!(out.rejected.iter().any(|r| r.contains("library full")));
+
+        let with_retire: EvolveProposal = serde_json::from_str(
+            r#"{"insights":[{"title":"new-two","tags":["x"],"content":"c"}],"skills":[],"retires":["e00"],"duplicates":[]}"#,
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &with_retire,
+            &mem,
+            &tmp.path().join("skills"),
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert_eq!(out.retired, vec!["e00".to_string()]);
+        assert_eq!(out.added_insights, vec!["new-two".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn user_authored_skill_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("demo-skill.md"),
+            "---\nname: demo-skill\ndescription: mine\n---\nHand-written.\n",
+        )
+        .unwrap();
+        let out = apply_proposals(
+            &proposal_1(),
+            &tmp.path().join("memory"),
+            &skills,
+            "s",
+            &policy_always(true),
+        )
+        .await;
+        assert!(out.skipped.iter().any(|s| s.contains("user-authored")));
+        assert!(std::fs::read_to_string(skills.join("demo-skill.md"))
+            .unwrap()
+            .contains("Hand-written."));
+    }
+
+    fn load_test(root: &Path) -> Vec<crate::memory::MemoryEntry> {
+        crate::memory::load_entries(root)
     }
 }

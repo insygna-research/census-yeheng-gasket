@@ -107,6 +107,22 @@ impl PermissionPolicy {
             ToolCallVerdict::Block(format!("{name} denied by user"))
         }
     }
+
+    /// Approve a non-tool-call action (evolve's per-candidate gate).
+    /// Same cancel race as [`Self::await_approver`]: a parked approver
+    /// unblocks instantly on cancel and counts as a rejection.
+    pub async fn approve_action(&self, name: &str, args: &serde_json::Value) -> bool {
+        let signal = self.signal.read().clone();
+        let mut approver = std::pin::pin!((self.approver)(name, args));
+        match signal {
+            Some(sig) => tokio::select! {
+                biased;
+                _ = sig.cancelled() => false,
+                allowed = &mut *approver => allowed,
+            },
+            None => approver.await,
+        }
+    }
 }
 
 impl HookChain for PermissionPolicy {
@@ -280,6 +296,35 @@ mod tests {
             ToolCallVerdict::Block(msg) => assert!(msg.contains("aborted"), "{msg}"),
             v => panic!("expected Block, got {v:?}"),
         }
+    }
+
+    /// approve_action (evolve's per-candidate gate) shares the cancel race:
+    /// a parked approver unblocks instantly on cancel and counts as false.
+    #[tokio::test]
+    async fn approve_action_cancel_counts_as_rejection() {
+        let policy = PermissionPolicy::new(
+            Mode::FullAuto,
+            Arc::new(|_n, _a| Box::pin(async { std::future::pending::<bool>().await })),
+        );
+        let signal = CancelSignal::new();
+        policy.set_signal(signal.clone());
+        let waiting = tokio::spawn(async move {
+            policy
+                .approve_action(
+                    "evolve_write",
+                    &serde_json::json!({ "action": "add insight" }),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        signal.cancel();
+        assert!(!waiting.await.unwrap(), "cancel must count as a rejection");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "cancel must unwind approve_action immediately, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
