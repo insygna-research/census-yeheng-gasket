@@ -3,6 +3,8 @@
 //! (`memory.rs`) only ever catalogs; everything here is the write side.
 
 use conga::types::message::{AgentMessage, ContentBlock};
+use serde::Deserialize;
+use std::path::Path;
 
 /// Render derived messages to compact extraction input. Oldest messages
 /// are dropped first when over budget (the freshest context — where the
@@ -80,6 +82,94 @@ fn bound(s: &str, max: usize) -> String {
     t
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct EvolveProposal {
+    #[serde(default)]
+    pub insights: Vec<InsightProposal>,
+    #[serde(default)]
+    pub skills: Vec<SkillProposal>,
+    #[serde(default)]
+    pub retires: Vec<String>,
+    #[serde(default)]
+    pub duplicates: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InsightProposal {
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SkillProposal {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// The one prompt the extraction sub-agent sees. The quality contract is
+/// the point: insights must be root-cause + applied fix + evidence, or
+/// the library fills with platitudes that get injected into every future
+/// prompt (see docs/evolve.md "Content quality").
+pub fn extraction_task_prompt(trajectory: &str, catalog: &str) -> String {
+    format!(
+        "You are a distillation engine for a coding assistant. You get ONE \
+session transcript. Extract reusable knowledge for FUTURE sessions. Reply \
+with ONLY a JSON object — no prose, no markdown fences.\n\n\
+Rules for \"insights\":\n\
+- Only what THIS session proved: each insight must state the root cause, the \
+fix actually applied, and the evidence (what happened in the transcript).\n\
+- No general advice (\"read errors carefully\"), no restating the task.\n\
+- tags: 2-5 lowercase single-word tokens likely to appear in future tasks.\n\
+- content: <= 2KB, imperative, self-contained.\n\n\
+Rules for \"skills\": repeatable multi-step procedures actually demonstrated \
+in the transcript; name = kebab-case; description = one line saying when to \
+use it.\n\
+Rules for \"retires\": titles from the existing library that this session \
+proved obsolete or wrong.\n\
+Rules for \"duplicates\": existing titles your new entries would duplicate — \
+list them here instead of re-proposing them.\n\n\
+Existing library:\n{catalog}\n\n\
+Transcript:\n{trajectory}\n\n\
+Output schema:\n\
+{{\"insights\":[{{\"title\":\"\",\"tags\":[\"\"],\"content\":\"\"}}],\
+\"skills\":[{{\"name\":\"\",\"description\":\"\",\"body\":\"\"}}],\
+\"retires\":[\"\"],\"duplicates\":[\"\"]}}"
+    )
+}
+
+/// Parse the extractor's reply: take the outermost {...} span so prose or
+/// markdown fences around the JSON are tolerated; fail loud otherwise —
+/// a silently empty proposal would look like "nothing to learn".
+pub fn parse_proposal(output: &str) -> Result<EvolveProposal, conga::AgentError> {
+    let start = output.find('{').ok_or_else(|| {
+        conga::AgentError::Tool(format!(
+            "extractor output has no JSON object: {}",
+            bound(output, 200)
+        ))
+    })?;
+    let end = output
+        .rfind('}')
+        .ok_or_else(|| conga::AgentError::Tool("extractor output has no closing brace".into()))?;
+    let json = &output[start..=end];
+    serde_json::from_str(json).map_err(conga::AgentError::Serde)
+}
+
+/// Library snapshot for the extractor input: every existing memory entry
+/// and skill, so it proposes deltas rather than echoes.
+pub fn catalog_snapshot(memory_root: &Path, cwd: &Path, global_root: &Path) -> String {
+    let mut out = String::new();
+    for e in crate::memory::load_entries(memory_root) {
+        out.push_str(&format!("memory: {} [{}]\n", e.title, e.tags.join(", ")));
+    }
+    for (name, desc) in crate::skills::catalog_entries(cwd, global_root) {
+        out.push_str(&format!("skill: {name} — {desc}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +226,35 @@ mod tests {
         assert!(out.starts_with("(older messages truncated"));
         assert!(!out.contains("message number 0"));
         assert!(out.contains("message number 99"));
+    }
+
+    #[test]
+    fn parses_proposal_with_surrounding_prose() {
+        let raw = "Here you go:\n```json\n{\"insights\":[{\"title\":\"t\",\"tags\":[\"a\"],\"content\":\"c\"}],\"skills\":[],\"retires\":[\"old\"],\"duplicates\":[]}\n```\nthanks";
+        let p = parse_proposal(raw).unwrap();
+        assert_eq!(p.insights.len(), 1);
+        assert_eq!(p.insights[0].title, "t");
+        assert_eq!(p.retires, vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn missing_keys_default_to_empty() {
+        let p = parse_proposal("{}").unwrap();
+        assert!(p.insights.is_empty() && p.skills.is_empty());
+    }
+
+    #[test]
+    fn garbage_fails_loud() {
+        assert!(parse_proposal("no json at all").is_err());
+    }
+
+    #[test]
+    fn extraction_prompt_carries_quality_contract() {
+        let p = extraction_task_prompt("TRAJ", "CATALOG");
+        assert!(p.contains("root cause"));
+        assert!(p.contains("evidence"));
+        assert!(p.contains("CATALOG"));
+        assert!(p.contains("TRAJ"));
+        assert!(p.contains("ONLY a JSON object"));
     }
 }

@@ -27,9 +27,7 @@ pub fn append_skills(base: &str, cwd: &Path) -> String {
 
 /// Testable core: `global_root` is injected (production uses the config dir).
 pub fn append_skills_in(base: &str, cwd: &Path, global_root: &Path) -> String {
-    let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
-    scan_dir(&global_root.join("skills"), None, &mut catalog);
-    scan_dir(&cwd.join(".conga").join("skills"), Some(cwd), &mut catalog);
+    let catalog = scan_catalog(cwd, global_root);
     if catalog.is_empty() {
         return base.to_string();
     }
@@ -46,6 +44,25 @@ pub fn append_skills_in(base: &str, cwd: &Path, global_root: &Path) -> String {
         ));
     }
     out
+}
+
+/// Shared scan: global skills first, then project skills (same `name:`
+/// wins over the global one).
+fn scan_catalog(cwd: &Path, global_root: &Path) -> BTreeMap<String, SkillMeta> {
+    let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
+    scan_dir(&global_root.join("skills"), None, &mut catalog);
+    scan_dir(&cwd.join(".conga").join("skills"), Some(cwd), &mut catalog);
+    catalog
+}
+
+/// (name, description) pairs for consumers that need the catalog without
+/// prompt formatting (evolve's extractor input). Same scan + override
+/// semantics as `append_skills_in`.
+pub(crate) fn catalog_entries(cwd: &Path, global_root: &Path) -> Vec<(String, String)> {
+    scan_catalog(cwd, global_root)
+        .into_iter()
+        .map(|(name, meta)| (name, meta.description))
+        .collect()
 }
 
 fn scan_dir(dir: &Path, relative_to: Option<&Path>, catalog: &mut BTreeMap<String, SkillMeta>) {
