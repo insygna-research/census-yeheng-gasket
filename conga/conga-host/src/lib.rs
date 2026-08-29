@@ -114,6 +114,10 @@ pub struct Host {
     signal: CancelSignal,
     system_prompt: String,
     tools: Vec<ToolDefinition>,
+    /// Wired subagent spawner (set by [`with_spawner`](Self::with_spawner)).
+    /// Extraction for [`evolve`](Self::evolve) runs on it; `None` on hosts
+    /// that never wired one.
+    spawner: Option<Arc<dyn crate::subagent_types::SubagentSpawner>>,
     cwd: PathBuf,
     max_turns: usize,
     /// Compaction knobs. The token count itself is NOT kept here: every turn
@@ -168,6 +172,7 @@ impl Host {
             hooks,
             system_prompt,
             tools,
+            spawner: None,
         }
     }
 
@@ -237,17 +242,46 @@ impl Host {
     /// concurrent hosts (one per gateway connection) never see each
     /// other's spawner. Hosts that excluded the tool from their list keep
     /// it excluded — sub-agent tool sets filter `spawn_subagents` out, so
-    /// nesting stays disabled. Without this, the tool reports subagents as
-    /// unavailable; CLI/gateway pass a `HostSubagentSpawner` built from
-    /// the host's config.
+    /// nesting stays disabled. The spawner is also stored on the Host
+    /// itself: [`evolve`](Self::evolve) extraction runs on it. Without
+    /// this, the tool reports subagents as unavailable and `evolve`
+    /// fails; CLI/gateway pass a `HostSubagentSpawner` built from the
+    /// host's config.
     pub fn with_spawner(
         mut self,
         spawner: Arc<dyn crate::subagent_types::SubagentSpawner>,
     ) -> Self {
+        self.spawner = Some(Arc::clone(&spawner));
         if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
             *t = tools::subagent::tool(Some(spawner));
         }
         self
+    }
+
+    /// The wired subagent spawner (extraction runs on it). `None` on hosts
+    /// that never called [`with_spawner`](Self::with_spawner) (evolve
+    /// reports unavailable).
+    pub fn spawner(&self) -> Option<&Arc<dyn crate::subagent_types::SubagentSpawner>> {
+        self.spawner.as_ref()
+    }
+
+    /// Self-evolution: distill a session into approved memory/skills.
+    /// `None` = the current session. See `docs/evolve.md`.
+    pub async fn evolve(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<evolve::EvolveOutcome, AgentError> {
+        let config = conga::storage::config_dir();
+        evolve::run_evolve(
+            &self.session,
+            &self.policy,
+            self.spawner.as_ref(),
+            session_id,
+            &config.join("memory"),
+            &config.join("skills"),
+            &self.cwd,
+        )
+        .await
     }
 
     /// Replace the tool list (used by `/reload-tools`).

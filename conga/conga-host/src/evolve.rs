@@ -5,6 +5,11 @@
 use conga::types::message::{AgentMessage, ContentBlock};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Arc;
+
+use crate::permission::PermissionPolicy;
+use crate::session::SessionManager;
+use crate::subagent_types::{SubagentSpawn, SubagentSpawner};
 
 /// Render derived messages to compact extraction input. Oldest messages
 /// are dropped first when over budget (the freshest context — where the
@@ -225,7 +230,7 @@ pub async fn apply_proposals(
     memory_root: &Path,
     skills_root: &Path,
     source_session: &str,
-    policy: &crate::permission::PermissionPolicy,
+    policy: &PermissionPolicy,
 ) -> EvolveOutcome {
     let mut out = EvolveOutcome::default();
     let now = std::time::SystemTime::now()
@@ -357,6 +362,49 @@ pub async fn apply_proposals(
         }
     }
     out
+}
+
+/// Default extraction-input budget (chars of rendered transcript).
+const MAX_TRAJECTORY_CHARS: usize = 48_000;
+
+/// The whole write path: load trajectory → extract (sub-agent) → parse →
+/// admit. `session_id = None` means the current session. Roots and cwd are
+/// injected so tests run hermetically against tempdirs; [`Host::evolve`]
+/// passes production paths.
+pub async fn run_evolve(
+    session: &SessionManager,
+    policy: &PermissionPolicy,
+    spawner: Option<&Arc<dyn SubagentSpawner>>,
+    session_id: Option<&str>,
+    memory_root: &Path,
+    skills_root: &Path,
+    cwd: &Path,
+) -> Result<EvolveOutcome, conga::AgentError> {
+    let sid = match session_id {
+        Some(id) => id.to_string(),
+        None => session.current_id(),
+    };
+    let events = session.open_or_migrate(&sid).await?;
+    let messages = conga::derive_messages(&events);
+    let trajectory = render_trajectory(&messages, MAX_TRAJECTORY_CHARS);
+    let catalog = catalog_snapshot(memory_root, cwd, &conga::storage::config_dir());
+
+    let spawner = spawner
+        .ok_or_else(|| conga::AgentError::Tool("no subagent spawner wired on this host".into()))?;
+    let results = spawner
+        .spawn(vec![SubagentSpawn {
+            task: extraction_task_prompt(&trajectory, &catalog),
+        }])
+        .await;
+    let result = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| conga::AgentError::Tool("extractor returned no result".into()))?;
+    if let Some(err) = result.error {
+        return Err(conga::AgentError::Tool(format!("extractor failed: {err}")));
+    }
+    let proposal = parse_proposal(&result.output)?;
+    Ok(apply_proposals(&proposal, memory_root, skills_root, &sid, policy).await)
 }
 
 #[cfg(test)]
@@ -663,6 +711,84 @@ mod tests {
         assert!(std::fs::read_to_string(skills.join("demo-skill.md"))
             .unwrap()
             .contains("first body"));
+    }
+
+    use crate::subagent_types::{SubagentResult, SubagentSpawn, SubagentSpawner};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// Fixed-output extractor: one insight, nothing else. Proves the write
+    /// path end-to-end (events -> trajectory -> prompt -> parse -> admit)
+    /// without a provider.
+    struct FakeExtractor(pub String);
+    impl SubagentSpawner for FakeExtractor {
+        fn spawn(
+            &self,
+            _tasks: Vec<SubagentSpawn>,
+        ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
+            let output = self.0.clone();
+            Box::pin(async move {
+                vec![SubagentResult {
+                    id: "x".into(),
+                    task: String::new(),
+                    index: 1,
+                    summary: String::new(),
+                    output,
+                    tool_count: 0,
+                    error: None,
+                    log_path: None,
+                }]
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_evolve_end_to_end_with_fake_extractor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let session = crate::SessionManager::with_root(root.clone());
+        // Seed a "stumble -> correct" trajectory on the current session.
+        session
+            .append_event(&conga::SessionEvent::TurnStart)
+            .await
+            .unwrap();
+        session
+            .append_event(&conga::SessionEvent::User(conga::AgentMessage::user(
+                "fix cyclic dep",
+            )))
+            .await
+            .unwrap();
+        let assistant = conga::AgentMessage::assistant_text(
+            "Root cause: conga-ext path-ref'd conga-host. Removed the edge; build green.",
+        );
+        session
+            .append_event(&conga::SessionEvent::from_message(&assistant, None).unwrap())
+            .await
+            .unwrap();
+
+        let spawner: Arc<dyn SubagentSpawner> = Arc::new(FakeExtractor(
+            r#"{"insights":[{"title":"rust-cyclic-dep","tags":["rust","cargo"],"content":"check members first"}],
+                "skills":[],"retires":[],"duplicates":[]}"#
+                .to_string(),
+        ));
+        let mem = root.join("memory");
+        let skills = root.join("skills");
+        let out = run_evolve(
+            &session,
+            &policy_always(true),
+            Some(&spawner),
+            None,
+            &mem,
+            &skills,
+            &root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.added_insights, vec!["rust-cyclic-dep".to_string()]);
+        assert!(mem.join("rust-cyclic-dep.md").exists());
+        // Source session provenance rides along.
+        let entry = std::fs::read_to_string(mem.join("rust-cyclic-dep.md")).unwrap();
+        assert!(entry.contains(&format!("source_session: {}", session.current_id())));
     }
 
     fn load_test(root: &Path) -> Vec<crate::memory::MemoryEntry> {

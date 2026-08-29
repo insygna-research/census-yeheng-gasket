@@ -24,6 +24,7 @@ pub struct SessionInfo {
 /// `new` / `resume` / `clear` change it; events always append to the
 /// current id. A fresh manager that was never resumed writes a brand-new
 /// session — callers that want an existing session MUST `resume` first.
+#[derive(Clone)]
 pub struct SessionManager {
     root: PathBuf,
     storage: EventStorage,
