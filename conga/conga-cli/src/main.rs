@@ -100,14 +100,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Payload banner for approval prompts. Empty args (the no-payload
+/// case) render nothing — the y/N prompt alone, unchanged UX. A payload
+/// (evolve admission passes action/title/tags/body per candidate;
+/// high-risk tool approvals pass their call args) renders as ONE JSON
+/// line above the prompt: docs/evolve.md's content-quality gate requires
+/// the approver to see what is being approved, and evolve candidates are
+/// not tool calls, so nothing else would render them.
+fn approval_banner(name: &str, args: &serde_json::Value) -> String {
+    if args.as_object().map_or(true, |m| m.is_empty()) {
+        return String::new();
+    }
+    let payload = serde_json::to_string(args).unwrap_or_default();
+    format!("[approve {name}] {payload}\n")
+}
+
 fn stdin_approver<'a>(
     name: &'a str,
-    _args: &'a serde_json::Value,
+    args: &'a serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
     // 读 stdin 是阻塞的，挪到 blocking 池，避免卡住 tokio worker。
+    // The banner is computed before the async block so the args borrow
+    // ends here; an empty banner keeps the prompt byte-identical to the
+    // old output.
+    let banner = approval_banner(name, args);
     let name = name.to_string();
     Box::pin(async move {
-        print!("\n[approve {name}? y/N] ");
+        print!("{banner}\n[approve {name}? y/N] ");
         let _ = io::stdout().flush();
         tokio::task::spawn_blocking(move || {
             let mut s = String::new();
@@ -154,6 +173,38 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
                 Err(e) => println!("(resume: {e})"),
             }
         }
+        Some("evolve") => {
+            // `/evolve [--session <id>]` — distill the current (or given)
+            // session into approved memory insights and skills. Direct
+            // host call: no main-model turn is spent on dispatch.
+            let mut sid: Option<String> = None;
+            while let Some(arg) = parts.next() {
+                if arg == "--session" {
+                    sid = parts.next().map(str::to_string);
+                }
+            }
+            match host.evolve(sid.as_deref()).await {
+                Ok(out) => {
+                    println!("( {} )", out.summarize());
+                    for t in &out.added_insights {
+                        println!("  + memory: {t}");
+                    }
+                    for t in &out.added_skills {
+                        println!("  + skill:  {t}");
+                    }
+                    for t in &out.updated_skills {
+                        println!("  ~ skill:  {t}");
+                    }
+                    for t in &out.retired {
+                        println!("  - retired: {t}");
+                    }
+                    for t in out.rejected.iter().chain(&out.skipped) {
+                        println!("  ! {t}");
+                    }
+                }
+                Err(e) => println!("(evolve failed: {e})"),
+            }
+        }
         Some("sessions") => match host.session().list().await {
             Ok(list) => {
                 if list.is_empty() {
@@ -173,8 +224,35 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
             println!("(reloaded tools)");
         }
         Some("help") => println!(
-            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto|plan>  /sessions  /reload-tools  /exit"
+            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto|plan>  /sessions  /evolve [--session <id>]  /reload-tools  /exit"
         ),
         _ => println!("unknown command; /help"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_banner_renders_evolve_payload_as_one_line() {
+        let args = serde_json::json!({
+            "action": "add insight",
+            "title": "Prefer narrow grep over full reads",
+            "tags": ["tooling", "rust"],
+            "content": "Scan with targeted patterns before opening files."
+        });
+        let banner = approval_banner("evolve_write", &args);
+        assert!(banner.contains("[approve evolve_write]"));
+        assert!(banner.contains("add insight"));
+        assert!(banner.contains("Prefer narrow grep over full reads"));
+        // One JSON line + trailing newline; the y/N prompt follows below.
+        assert!(banner.ends_with('\n'));
+        assert_eq!(banner.lines().count(), 1);
+    }
+
+    #[test]
+    fn approval_banner_empty_for_empty_args() {
+        assert_eq!(approval_banner("bash", &serde_json::json!({})), "");
     }
 }

@@ -1,6 +1,6 @@
 //! conga-host - 可复用的 host 层（配置/session/权限/事件渲染/压缩/外部工具）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -15,9 +15,11 @@ pub mod assembly;
 pub mod compact;
 pub mod config;
 pub mod event_map;
+pub mod evolve;
 pub mod external_tool;
 pub mod hooks;
 pub mod mcp;
+pub mod memory;
 pub mod permission;
 pub mod preview;
 pub mod printer;
@@ -47,6 +49,7 @@ pub use external_tool::{
 };
 pub use hooks::HookStack;
 pub use mcp::{load_all_mcp, McpBridge, McpError, McpServerConfig};
+pub use memory::append_memory;
 pub use permission::{Mode, PermissionPolicy};
 pub use printer::EventPrinter;
 pub use process_hooks::ProcessHookChain;
@@ -111,6 +114,10 @@ pub struct Host {
     signal: CancelSignal,
     system_prompt: String,
     tools: Vec<ToolDefinition>,
+    /// Wired subagent spawner (set by [`with_spawner`](Self::with_spawner)).
+    /// Extraction for [`evolve`](Self::evolve) runs on it; `None` on hosts
+    /// that never wired one.
+    spawner: Option<Arc<dyn crate::subagent_types::SubagentSpawner>>,
     cwd: PathBuf,
     max_turns: usize,
     /// Compaction knobs. The token count itself is NOT kept here: every turn
@@ -165,6 +172,7 @@ impl Host {
             hooks,
             system_prompt,
             tools,
+            spawner: None,
         }
     }
 
@@ -234,22 +242,86 @@ impl Host {
     /// concurrent hosts (one per gateway connection) never see each
     /// other's spawner. Hosts that excluded the tool from their list keep
     /// it excluded — sub-agent tool sets filter `spawn_subagents` out, so
-    /// nesting stays disabled. Without this, the tool reports subagents as
-    /// unavailable; CLI/gateway pass a `HostSubagentSpawner` built from
-    /// the host's config.
+    /// nesting stays disabled. The spawner is also stored on the Host
+    /// itself: [`evolve`](Self::evolve) extraction runs on it. Without
+    /// this, the tool reports subagents as unavailable and `evolve`
+    /// fails; CLI/gateway pass a `HostSubagentSpawner` built from the
+    /// host's config. The `evolve` tool gets its live handle
+    /// (session + policy + spawner) here too.
     pub fn with_spawner(
         mut self,
         spawner: Arc<dyn crate::subagent_types::SubagentSpawner>,
     ) -> Self {
-        if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
-            *t = tools::subagent::tool(Some(spawner));
-        }
+        self.spawner = Some(Arc::clone(&spawner));
+        self.rewire_spawner_tools();
         self
     }
 
-    /// Replace the tool list (used by `/reload-tools`).
+    /// Re-apply the live spawner wiring to the CURRENT tool list.
+    /// [`built_in_tools`](crate::tools::built_in_tools) registers both
+    /// `spawn_subagents` and `evolve` spawner-less, so the wiring must be
+    /// re-applied every time the list is replaced — not just from
+    /// [`with_spawner`](Self::with_spawner), but also after
+    /// [`set_tools`](Self::set_tools): `/reload-tools` rebuilds the list
+    /// from the spawner-less defaults, and without this re-application
+    /// both tools answer "unavailable" until restart. Returns the names
+    /// actually swapped, so tests can pin the wiring by name without
+    /// executing any tool.
+    fn rewire_spawner_tools(&mut self) -> Vec<&'static str> {
+        let mut swapped = Vec::new();
+        let Some(spawner) = self.spawner.clone() else {
+            return swapped;
+        };
+        if let Some(t) = self.tools.iter_mut().find(|t| t.name == "spawn_subagents") {
+            *t = tools::subagent::tool(Some(Arc::clone(&spawner)));
+            swapped.push("spawn_subagents");
+        }
+        // evolve needs the same spawner plus this host's policy/session —
+        // both already on the Host, so wire the handle here too.
+        if let Some(t) = self.tools.iter_mut().find(|t| t.name == "evolve") {
+            *t = tools::evolve_tool::tool(Some(tools::evolve_tool::EvolveHandle {
+                session: self.session.clone(),
+                policy: Arc::clone(&self.policy),
+                spawner: Some(spawner),
+            }));
+            swapped.push("evolve");
+        }
+        swapped
+    }
+
+    /// The wired subagent spawner (extraction runs on it). `None` on hosts
+    /// that never called [`with_spawner`](Self::with_spawner) (evolve
+    /// reports unavailable).
+    pub fn spawner(&self) -> Option<&Arc<dyn crate::subagent_types::SubagentSpawner>> {
+        self.spawner.as_ref()
+    }
+
+    /// Self-evolution: distill a session into approved memory/skills.
+    /// `None` = the current session. See `docs/evolve.md`.
+    pub async fn evolve(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<evolve::EvolveOutcome, AgentError> {
+        let config = conga::storage::config_dir();
+        evolve::run_evolve(
+            &self.session,
+            &self.policy,
+            self.spawner.as_ref(),
+            session_id,
+            &config.join("memory"),
+            &config.join("skills"),
+            &self.cwd,
+        )
+        .await
+    }
+
+    /// Replace the tool list (used by `/reload-tools`). The fresh list is
+    /// rebuilt from spawner-less defaults, so the live wiring is re-applied
+    /// right after the swap (`rewire_spawner_tools`) — a reload must not
+    /// strip the `spawn_subagents`/`evolve` handles until restart.
     pub fn set_tools(&mut self, tools: Vec<ToolDefinition>) {
         self.tools = tools;
+        self.rewire_spawner_tools();
     }
 
     pub fn session(&self) -> &SessionManager {
@@ -416,9 +488,10 @@ impl Host {
             .append_event(&SessionEvent::User(user.clone()))
             .await?;
 
-        let base_prompt = crate::prompt::with_custom_base_prompt(
+        let base_prompt = compose_turn_prompt(
             &self.system_prompt,
             settings.system_prompt.as_deref(),
+            &self.cwd,
         );
         // Per-turn LLM settings: the web UI persists env overrides to
         // ~/.conga/settings.json; re-resolve the provider EVERY turn so a
@@ -496,6 +569,17 @@ impl Host {
     }
 }
 
+/// Per-turn prompt composition: custom base prompt (settings) first, then
+/// the skills and memory catalogs. Both catalogs are deterministic rescans
+/// — identical files produce identical bytes, so the provider cache prefix
+/// survives every turn; only a real library change (evolve run, manual
+/// edit) legitimately busts it. Kept as a named fn so the seam is testable
+/// without a full Host.
+pub(crate) fn compose_turn_prompt(base: &str, custom: Option<&str>, cwd: &Path) -> String {
+    let p = crate::prompt::with_custom_base_prompt(base, custom);
+    crate::append_memory(&crate::append_skills(&p, cwd))
+}
+
 /// Releases the per-Host turn slot when the turn future completes *or* is
 /// dropped (ws close, cancellation): run_turn is cancel-safe, so a dropped
 /// turn must not leave the host permanently busy.
@@ -552,6 +636,29 @@ mod tests {
     }
 
     #[test]
+    fn compose_turn_prompt_appends_skill_catalog_after_custom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let skills = cwd.join(".conga").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("demo.md"),
+            "---\nname: demo\ndescription: does things\n---\nBody\n",
+        )
+        .unwrap();
+        let out = compose_turn_prompt("BUILT-IN", Some("custom persona"), cwd);
+        assert!(out.starts_with("custom persona"));
+        assert!(out.contains("## Skills"));
+        assert!(out.contains("demo"));
+        // Memory catalog from the real config dir must not break composition
+        // and must ride last.
+        if let Some(idx_mem) = out.find("## Memory") {
+            let idx_skills = out.find("## Skills").unwrap();
+            assert!(idx_mem > idx_skills);
+        }
+    }
+
+    #[test]
     fn project_dir_env_override_beats_process_cwd() {
         assert_eq!(
             project_dir_with(Some("/some/project")),
@@ -586,6 +693,45 @@ mod tests {
         let _ = host
             .with_stream_fn(Arc::new(FakeProvider))
             .with_max_turns(1);
+    }
+
+    /// `/reload-tools` rebuilds the tool list from spawner-less defaults;
+    /// the live wiring must be re-applied on every swap or
+    /// `spawn_subagents` and `evolve` answer "unavailable" until restart.
+    /// Asserts on the swapped NAMES only — executing the tools would hit
+    /// real config_dir roots.
+    #[test]
+    fn spawner_tool_wiring_reapplied_on_every_list_swap() {
+        use crate::subagent_types::NoopSubagentSpawner;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { false })),
+            )),
+            "sys".into(),
+            crate::tools::built_in_tools(),
+        );
+        // No spawner wired: nothing to rewire even with both names present.
+        assert!(host.rewire_spawner_tools().is_empty());
+
+        // Wired spawner + both names in the list: both swap (and the
+        // helper is idempotent on re-runs).
+        let mut host = host.with_spawner(Arc::new(NoopSubagentSpawner));
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents", "evolve"]);
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents", "evolve"]);
+
+        // A list without `evolve` (sub-agent tool sets filter it out):
+        // only spawn_subagents rewires; the exclusion is preserved.
+        host.set_tools(
+            crate::tools::built_in_tools()
+                .into_iter()
+                .filter(|t| t.name != "evolve")
+                .collect(),
+        );
+        assert_eq!(host.rewire_spawner_tools(), ["spawn_subagents"]);
     }
 
     /// The settings file OVERRIDES the env-derived provider for hosts that

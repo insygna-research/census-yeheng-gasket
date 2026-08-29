@@ -1,7 +1,8 @@
-//! Built-in tools: read / write / edit / bash / list / grep / fetch / spawn_subagents.
+//! Built-in tools: read / write / edit / bash / list / grep / fetch / spawn_subagents / evolve.
 
 pub mod bash;
 pub mod edit;
+pub mod evolve_tool;
 pub mod fetch;
 pub mod grep;
 pub mod list;
@@ -15,10 +16,10 @@ pub mod write;
 use std::path::{Component, Path, PathBuf};
 
 use conga::types::tool::ToolDefinition;
-
-/// The 9 built-in tools, ready to drop into `AgentContext.tools`.
-/// `spawn_subagents` is built WITHOUT a spawner here; hosts wire their own
-/// via `Host::with_spawner`, which replaces the tool in their list.
+/// The built-in tools, ready to drop into `AgentContext.tools`.
+/// `spawn_subagents` and `evolve` are built WITHOUT live state here; hosts
+/// wire their own via `Host::with_spawner`, which replaces both tools in
+/// their list.
 pub fn built_in_tools() -> Vec<ToolDefinition> {
     vec![
         read::tool(),
@@ -30,6 +31,7 @@ pub fn built_in_tools() -> Vec<ToolDefinition> {
         fetch::tool(),
         todo::tool(),
         subagent::tool(None),
+        evolve_tool::tool(None),
     ]
 }
 

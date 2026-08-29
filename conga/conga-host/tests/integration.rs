@@ -727,9 +727,13 @@ async fn consecutive_requests_are_prefix_stable_and_env_stays_out_of_system() {
     let seen = provider.seen();
     assert_eq!(seen.len(), 3, "two calls in turn 1, one in turn 2");
 
-    // 1. Static head: identical system on every call.
+    // 1. Static head: identical system on every call. The per-turn seam
+    //    (compose_turn_prompt) appends the skills/memory catalogs after the
+    //    base — deterministic rescans, so the appended bytes are identical
+    //    on every call; the base itself must still ride the head.
     for (system, _) in &seen {
-        assert_eq!(system, "static system prompt");
+        assert_eq!(system, &seen[0].0);
+        assert!(system.starts_with("static system prompt"));
     }
     // 2. No dynamic env may leak into the cached prefix.
     assert!(!seen[0].0.contains("Date (UTC)"));
