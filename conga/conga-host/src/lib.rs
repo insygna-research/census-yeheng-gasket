@@ -15,6 +15,7 @@ pub mod assembly;
 pub mod compact;
 pub mod config;
 pub mod event_map;
+pub mod evolve;
 pub mod external_tool;
 pub mod hooks;
 pub mod mcp;
