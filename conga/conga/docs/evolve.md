@@ -213,3 +213,15 @@ entry → warn + skip (same semantics as `skills::scan_dir`).
 | `conga-host/src/tools/mod.rs` | register `evolve` tool (High risk) |
 | `conga-cli/src/main.rs` | `/evolve [--session <id>]` |
 | `docs/` | document commands, formats, limits |
+
+---
+
+## Usage
+
+- CLI: `/evolve` (current session) or `/evolve --session <id>`.
+- Any transport: ask the agent to "evolve this session" — the High-risk
+  `evolve` tool routes to the same core.
+- Every candidate (insight add, skill add/update, retire) is a separate
+  approval; denying one drops only that candidate.
+- Library: `~/.conga/memory/*.md` (cap 64) and the skills dirs. Delete a
+  file to undo an entry; `git init ~/.conga` for history.
