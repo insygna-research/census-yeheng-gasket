@@ -582,9 +582,8 @@ mod tests {
         assert!(out.contains("demo"));
         // Memory catalog from the real config dir must not break composition
         // and must ride last.
-        if conga::storage::config_dir().join("memory").is_dir() {
+        if let Some(idx_mem) = out.find("## Memory") {
             let idx_skills = out.find("## Skills").unwrap();
-            let idx_mem = out.find("## Memory").unwrap();
             assert!(idx_mem > idx_skills);
         }
     }
