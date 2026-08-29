@@ -142,7 +142,9 @@ Output schema:\n\
 
 /// Parse the extractor's reply: take the outermost {...} span so prose or
 /// markdown fences around the JSON are tolerated; fail loud otherwise —
-/// a silently empty proposal would look like "nothing to learn".
+/// a silently empty proposal would look like "nothing to learn". A `}`
+/// in prose before the first `{` closes nothing: it counts as absent so
+/// an inverted span is an Err, never a slice panic.
 pub fn parse_proposal(output: &str) -> Result<EvolveProposal, conga::AgentError> {
     let start = output.find('{').ok_or_else(|| {
         conga::AgentError::Tool(format!(
@@ -152,6 +154,7 @@ pub fn parse_proposal(output: &str) -> Result<EvolveProposal, conga::AgentError>
     })?;
     let end = output
         .rfind('}')
+        .filter(|&e| e >= start)
         .ok_or_else(|| conga::AgentError::Tool("extractor output has no closing brace".into()))?;
     let json = &output[start..=end];
     serde_json::from_str(json).map_err(conga::AgentError::Serde)
@@ -246,6 +249,11 @@ mod tests {
     #[test]
     fn garbage_fails_loud() {
         assert!(parse_proposal("no json at all").is_err());
+    }
+
+    #[test]
+    fn parses_no_panic_on_stray_closing_brace() {
+        assert!(parse_proposal("here } take this {\"insights\": [{\"title\":\"t\"").is_err());
     }
 
     #[test]
