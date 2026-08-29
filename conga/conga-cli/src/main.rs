@@ -154,6 +154,38 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
                 Err(e) => println!("(resume: {e})"),
             }
         }
+        Some("evolve") => {
+            // `/evolve [--session <id>]` — distill the current (or given)
+            // session into approved memory insights and skills. Direct
+            // host call: no main-model turn is spent on dispatch.
+            let mut sid: Option<String> = None;
+            while let Some(arg) = parts.next() {
+                if arg == "--session" {
+                    sid = parts.next().map(str::to_string);
+                }
+            }
+            match host.evolve(sid.as_deref()).await {
+                Ok(out) => {
+                    println!("( {} )", out.summarize());
+                    for t in &out.added_insights {
+                        println!("  + memory: {t}");
+                    }
+                    for t in &out.added_skills {
+                        println!("  + skill:  {t}");
+                    }
+                    for t in &out.updated_skills {
+                        println!("  ~ skill:  {t}");
+                    }
+                    for t in &out.retired {
+                        println!("  - retired: {t}");
+                    }
+                    for t in out.rejected.iter().chain(&out.skipped) {
+                        println!("  ! {t}");
+                    }
+                }
+                Err(e) => println!("(evolve failed: {e})"),
+            }
+        }
         Some("sessions") => match host.session().list().await {
             Ok(list) => {
                 if list.is_empty() {
@@ -173,7 +205,7 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
             println!("(reloaded tools)");
         }
         Some("help") => println!(
-            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto|plan>  /sessions  /reload-tools  /exit"
+            "commands: /resume [id|last]  /clear  /mode <suggest|auto-edit|full-auto|plan>  /sessions  /evolve [--session <id>]  /reload-tools  /exit"
         ),
         _ => println!("unknown command; /help"),
     }
