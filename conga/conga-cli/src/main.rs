@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the approver to see what is being approved, and evolve candidates are
 /// not tool calls, so nothing else would render them.
 fn approval_banner(name: &str, args: &serde_json::Value) -> String {
-    if args.as_object().map_or(true, |m| m.is_empty()) {
+    if args.as_object().is_none_or(|m| m.is_empty()) {
         return String::new();
     }
     let payload = serde_json::to_string(args).unwrap_or_default();

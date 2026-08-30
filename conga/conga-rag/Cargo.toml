@@ -1,0 +1,37 @@
+[package]
+name = "conga-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Personal RAG pipeline and retrieval CLI on the conga harness"
+
+[lib]
+name = "conga_rag"
+path = "src/lib.rs"
+
+[dependencies]
+conga = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+dotenvy = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }

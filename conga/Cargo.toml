@@ -16,6 +16,7 @@ members = [
     "conga-cli",
     "conga-ext",
     "conga-gateway",
+    "conga-rag",
 ]
 
 [profile.release]
@@ -94,3 +95,11 @@ parking_lot = "0.12"
 
 # Test utilities
 tempfile = "3"
+
+# conga-rag
+rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "0.1"
+toml = "0.9"
+globset = "0.4"
+ignore = "0.4"
+sha2 = "0.10"
