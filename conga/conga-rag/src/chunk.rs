@@ -12,16 +12,29 @@ pub fn chunk(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Chunk
     let mut cur = String::new();
     let mut ordinal = 0usize;
 
-    fn flush(cur: &mut String, chunks: &mut Vec<Chunk>, ordinal: &mut usize) {
-        let content = cur.trim().to_string();
-        if !content.is_empty() {
-            chunks.push(Chunk {
-                ordinal: *ordinal,
-                content,
-            });
-            *ordinal += 1;
-        }
+    fn flush(
+        cur: &mut String,
+        chunks: &mut Vec<Chunk>,
+        ordinal: &mut usize,
+        overlap: usize,
+    ) -> String {
+        // trim_end only: the leading edge may be the carried overlap tail,
+        // whose exact characters (including a leading space) must survive so
+        // the next chunk starts with the exact tail of this one.
+        let content = cur.trim_end().to_string();
         cur.clear();
+        if content.is_empty() {
+            return String::new();
+        }
+        // The overlap tail must come from the same trimmed content that is
+        // emitted, so the next chunk starts with the exact tail of this one.
+        let tail = tail_chars(&content, overlap);
+        chunks.push(Chunk {
+            ordinal: *ordinal,
+            content,
+        });
+        *ordinal += 1;
+        tail
     }
 
     for para in text.split("\n\n") {
@@ -36,8 +49,7 @@ pub fn chunk(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Chunk
                 && (is_heading || cur.chars().count() + piece.chars().count() + 2 > target_chars)
             {
                 // Emit current chunk; carry the overlap tail into the next.
-                let tail = tail_chars(&cur, overlap_chars);
-                flush(&mut cur, &mut chunks, &mut ordinal);
+                let tail = flush(&mut cur, &mut chunks, &mut ordinal, overlap_chars);
                 if !tail.is_empty() {
                     cur.push_str(&tail);
                     cur.push_str("\n\n");
@@ -49,7 +61,7 @@ pub fn chunk(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Chunk
             cur.push_str(&piece);
         }
     }
-    flush(&mut cur, &mut chunks, &mut ordinal);
+    flush(&mut cur, &mut chunks, &mut ordinal, overlap_chars);
     chunks
 }
 
@@ -189,6 +201,28 @@ mod tests {
             out[1].content.starts_with(&tail),
             "second chunk should start with overlap tail"
         );
+    }
+
+    #[test]
+    fn overlap_tail_is_exact_after_whitespace_soft_split() {
+        // Plain English words: no 。！？!?；; punctuation, so soft_split must
+        // cut at whitespace and the resulting piece can end in a space.
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+                    lima mike november oscar papa quebec romeo sierra tango uniform \
+                    victor whiskey xray yankee zulu";
+        let out = chunk(text, 120, 20);
+        assert!(out.len() > 1, "must produce multiple chunks");
+        for pair in out.windows(2) {
+            let prev: Vec<char> = pair[0].content.chars().collect();
+            let n = 20.min(prev.len());
+            let tail: String = prev[prev.len() - n..].iter().collect();
+            assert!(
+                pair[1].content.starts_with(&tail),
+                "chunk {} must start with the exact last {n} chars of chunk {}",
+                pair[1].ordinal,
+                pair[0].ordinal
+            );
+        }
     }
 
     #[test]
