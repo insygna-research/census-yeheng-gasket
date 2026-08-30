@@ -4,4 +4,5 @@
 pub mod chunk;
 pub mod clean;
 pub mod config;
+pub mod source;
 pub mod store;
