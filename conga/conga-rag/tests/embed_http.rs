@@ -1,4 +1,4 @@
-mod common;
+use conga_rag::testsupport::spawn_mock_embeddings;
 
 use conga::RetryPolicy;
 use conga_rag::config::ResolvedEmbedding;
@@ -24,7 +24,7 @@ fn fast_retry() -> RetryPolicy {
 
 #[tokio::test]
 async fn batches_are_split_by_config() {
-    let (base, requests) = common::spawn_mock(0).await;
+    let (base, requests) = spawn_mock_embeddings(0).await;
     let client = EmbeddingsClient::with_retry(&cfg(), &base, fast_retry());
     let texts: Vec<String> = (0..5).map(|i| format!("doc text {i}")).collect();
     let out = client.embed_batch(&texts).await.unwrap();
@@ -39,7 +39,7 @@ async fn batches_are_split_by_config() {
 
 #[tokio::test]
 async fn retry_on_429_then_success() {
-    let (base, requests) = common::spawn_mock(1).await;
+    let (base, requests) = spawn_mock_embeddings(1).await;
     let client = EmbeddingsClient::with_retry(&cfg(), &base, fast_retry());
     let out = client.embed_batch(&["one".to_string()]).await.unwrap();
     assert_eq!(out.len(), 1);
@@ -52,7 +52,7 @@ async fn retry_on_429_then_success() {
 #[tokio::test]
 async fn non_retryable_error_propagates_fast() {
     // fail_first=999 keeps failing; retries exhaust and error surfaces
-    let (base, requests) = common::spawn_mock(999).await;
+    let (base, requests) = spawn_mock_embeddings(999).await;
     let client = EmbeddingsClient::with_retry(&cfg(), &base, fast_retry());
     let err = client.embed_batch(&["one".to_string()]).await.unwrap_err();
     assert!(err.is_retryable() || err.to_string().contains("429"));

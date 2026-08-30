@@ -1,3 +1,7 @@
+//! Shared test doubles (unit tests + doc examples). Compiled always; tiny.
+
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -11,7 +15,7 @@ use serde_json::Value;
 /// its length; `[1,0,0,0]` for texts containing the word "match" so retrieval
 /// tests are predictable. Records request count; fails the first N requests
 /// with 429 when `fail_first` > 0.
-pub async fn spawn_mock(fail_first: u32) -> (String, Arc<AtomicU32>) {
+pub async fn spawn_mock_embeddings(fail_first: u32) -> (String, Arc<AtomicU32>) {
     let state = Arc::new(AtomicU32::new(fail_first));
     let requests = Arc::new(AtomicU32::new(0));
     let req_clone = requests.clone();

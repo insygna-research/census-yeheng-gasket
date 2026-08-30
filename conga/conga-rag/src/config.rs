@@ -249,6 +249,12 @@ impl RagConfig {
                 .join(".conga/rag/index.db")
         })
     }
+
+    /// Builder: override the store path (test injection).
+    pub fn with_store_path(mut self, path: PathBuf) -> Self {
+        self.store.path = Some(path);
+        self
+    }
 }
 
 #[cfg(test)]
