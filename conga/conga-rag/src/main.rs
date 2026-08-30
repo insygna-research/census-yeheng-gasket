@@ -1,6 +1,9 @@
 //! conga-rag — personal RAG headless CLI.
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
+use conga_rag::ask;
 use conga_rag::config::RagConfig;
 use conga_rag::pipeline;
 use conga_rag::search;
@@ -39,6 +42,13 @@ enum Cmd {
         /// Restrict to one source
         #[arg(short, long)]
         source: Option<String>,
+    },
+    /// Retrieve top-k, then answer the question with a chat model (CONGA_LLM_*)
+    Ask {
+        question: String,
+        /// Top-k context chunks (default: ask.top_k from config)
+        #[arg(short, long)]
+        k: Option<usize>,
     },
 }
 
@@ -116,6 +126,88 @@ async fn main() {
                             println!("[{}] {:.3} {}:{}", i, h.score, h.source, h.path);
                             let preview: String = h.content.chars().take(200).collect();
                             println!("    {preview}");
+                        }
+                    }
+                    exit(0)
+                }
+                Err(e) => {
+                    eprintln!("conga-rag: {e}");
+                    exit(1)
+                }
+            }
+        }
+        Cmd::Ask { question, k } => {
+            let (_path, cfg) = load_config_or_exit();
+            let k = k.unwrap_or(cfg.ask.top_k);
+            let hits = match search::run_search(&cfg, &question, k, None).await {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("conga-rag: {e}");
+                    exit(1)
+                }
+            };
+            if hits.is_empty() {
+                eprintln!("conga-rag: 无相关资料");
+                exit(1)
+            }
+            let provider = match conga::ProviderConfig::from_env() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("conga-rag: ask 需要 CONGA_LLM_* 配置: {e}");
+                    exit(2)
+                }
+            };
+            let max_tokens: usize = std::env::var("CONGA_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
+            let model = conga::ModelSpec {
+                id: provider.model.clone(),
+                api: provider.api,
+                max_tokens,
+            };
+            let stream: std::sync::Arc<dyn conga::StreamFn> = match provider.api {
+                conga::ProviderApi::OpenAiCompat => {
+                    Arc::new(conga::OpenAiCompat::from_config(&provider))
+                }
+                conga::ProviderApi::Anthropic => {
+                    Arc::new(conga::AnthropicProvider::from_config(&provider))
+                }
+            };
+            use std::io::Write;
+            let mut json_out = |t: &str| {
+                if cli.json {
+                    println!("{}", serde_json::json!({"type": "delta", "text": t}));
+                } else {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            match ask::run_ask(stream, model, &question, &hits, &mut json_out).await {
+                Ok(()) => {
+                    if cli.json {
+                        let cites: Vec<_> = hits
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| {
+                                serde_json::json!({"n": i + 1, "source": h.source, "path": h.path,
+                                    "score": h.score})
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::json!({"type": "citations", "cites": cites})
+                        );
+                    } else {
+                        println!("\n引用:");
+                        for (i, h) in hits.iter().enumerate() {
+                            println!(
+                                "  [{}] {}:{} (score {:.3})",
+                                i + 1,
+                                h.source,
+                                h.path,
+                                h.score
+                            );
                         }
                     }
                     exit(0)
