@@ -64,6 +64,8 @@ conga is a Cargo workspace with 6 crates, in a strict `core → host → fronten
 | `conga-cli` | bin | Interactive terminal REPL. |
 | `conga-rag` | bin+lib | Personal RAG: ingest → clean → chunk → embed → sqlite-vec store, headless `ingest`/`search`/`ask`/`status` CLI. |
 
+`conga-rag` note: hidden (dot) files and directories are never scanned — include patterns like `.config/**/*.md` match nothing (`ignore` crate default).
+
 The frontend (`web/`) is Vue 3 + Vite + Tauri 2 — one codebase for both browser and desktop.
 
 For the full design — data flow, tool system, compaction algorithm, hook semantics, MCP integration — see [docs/architecture.md](./docs/architecture.md).

@@ -243,3 +243,5 @@ chunk 级增量 diff、向量缓存、Web UI、并发 embedding 请求。
 - vec0 KNN 用参数绑定 `rowid IN (...)` 预过滤,替代匹配子句。
 - 配置 `discover`/`apply_env` fail-loud:`CONGA_RAG_CONFIG` 指向不存在文件、
   `CONGA_RAG_EMBED_BATCH` 不可解析 → 直接报错(§10 精神)。
+- ingest `--json` 输出单个汇总统计对象(§9 原为「每源一条 + 汇总」)。
+- search `--json` 命中对象不含 `query` 字段(§9 表格所列为规划,非实际输出)。

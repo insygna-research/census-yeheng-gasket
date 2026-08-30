@@ -62,7 +62,7 @@ fn load_config_or_exit() -> (std::path::PathBuf, RagConfig) {
     match RagConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("conga-rag: {e}");
+            eprintln!("conga-rag: {e:#}");
             exit(2)
         }
     }
@@ -101,7 +101,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("conga-rag: {e}");
+                    eprintln!("conga-rag: {e:#}");
                     exit(1)
                 }
             }
@@ -133,7 +133,7 @@ async fn main() {
                     exit(0)
                 }
                 Err(e) => {
-                    eprintln!("conga-rag: {e}");
+                    eprintln!("conga-rag: {e:#}");
                     exit(1)
                 }
             }
@@ -144,7 +144,7 @@ async fn main() {
             let hits = match search::run_search(&cfg, &question, k, None).await {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("conga-rag: {e}");
+                    eprintln!("conga-rag: {e:#}");
                     exit(1)
                 }
             };
@@ -155,7 +155,7 @@ async fn main() {
             let provider = match conga::ProviderConfig::from_env() {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("conga-rag: ask 需要 CONGA_LLM_* 配置: {e}");
+                    eprintln!("conga-rag: ask 需要 CONGA_LLM_* 配置: {e:#}");
                     exit(2)
                 }
             };
@@ -215,7 +215,7 @@ async fn main() {
                     exit(0)
                 }
                 Err(e) => {
-                    eprintln!("conga-rag: {e}");
+                    eprintln!("conga-rag: {e:#}");
                     exit(1)
                 }
             }
@@ -225,7 +225,7 @@ async fn main() {
             let store = match conga_rag::store::Store::open(&cfg.store_path()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("conga-rag: {e}");
+                    eprintln!("conga-rag: {e:#}");
                     exit(1)
                 }
             };
