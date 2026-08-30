@@ -189,13 +189,17 @@ fn remove_store_files(db: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
     use crate::config::{RagConfig, SourceConfig};
 
-    async fn test_cfg(dir: &std::path::Path, db: &std::path::Path, base_url: &str) -> RagConfig {
+    pub(crate) fn cfg_with_store(
+        dir: &std::path::Path,
+        db: &std::path::Path,
+        base_url: &str,
+    ) -> RagConfig {
         let mut sources = BTreeMap::new();
         sources.insert(
             "notes".to_string(),
@@ -224,7 +228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dbdir = tempfile::tempdir().unwrap();
         let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
-        let cfg = test_cfg(dir.path(), &dbdir.path().join("t.db"), &base).await;
+        let cfg = cfg_with_store(dir.path(), &dbdir.path().join("t.db"), &base);
 
         std::fs::write(dir.path().join("match.md"), "# T\n\nmatch one").unwrap();
         std::fs::write(dir.path().join("other.md"), "other text").unwrap();
@@ -249,7 +253,7 @@ mod tests {
         let dbdir = tempfile::tempdir().unwrap();
         let db = dbdir.path().join("t.db");
         let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
-        let cfg = test_cfg(dir.path(), &db, &base).await;
+        let cfg = cfg_with_store(dir.path(), &db, &base);
         std::fs::write(dir.path().join("a.md"), "match").unwrap();
         run_ingest(&cfg, None, false).await.unwrap();
         let s = run_ingest(&cfg, None, true).await.unwrap();
@@ -262,7 +266,7 @@ mod tests {
         let dbdir = tempfile::tempdir().unwrap();
         let db = dbdir.path().join("t.db");
         let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
-        let cfg = test_cfg(dir.path(), &db, &base).await;
+        let cfg = cfg_with_store(dir.path(), &db, &base);
         std::fs::write(dir.path().join("a.md"), "match").unwrap();
         run_ingest(&cfg, None, false).await.unwrap();
 
