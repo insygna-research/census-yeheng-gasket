@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -47,7 +47,7 @@ pub async fn run_ingest(
     let mut stats = IngestStats::default();
     let db_path = cfg.store_path();
     if rebuild && db_path.exists() {
-        fs::remove_file(&db_path).context("删除旧库失败(--rebuild)")?;
+        remove_store_files(&db_path)?;
     }
     let resolved = cfg.resolve_embedding()?;
     let client = EmbeddingsClient::new(&resolved);
@@ -166,6 +166,28 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Remove the store file plus its WAL sidecars (`<db>-wal`, `<db>-shm`).
+/// Tolerates absence; an orphaned `-wal` left by an unclean shutdown could
+/// otherwise replay onto the freshly recreated db and resurrect the old index.
+fn remove_store_files(db: &Path) -> anyhow::Result<()> {
+    let sidecar = |suffix: &str| -> PathBuf {
+        let mut s = db.as_os_str().to_os_string();
+        s.push(suffix);
+        PathBuf::from(s)
+    };
+    for p in [db.to_path_buf(), sidecar("-wal"), sidecar("-shm")] {
+        match fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("删除旧库失败(--rebuild): {}", p.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +254,40 @@ mod tests {
         run_ingest(&cfg, None, false).await.unwrap();
         let s = run_ingest(&cfg, None, true).await.unwrap();
         assert_eq!((s.added, s.scanned), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn rebuild_removes_wal_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let db = dbdir.path().join("t.db");
+        let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
+        let cfg = test_cfg(dir.path(), &db, &base).await;
+        std::fs::write(dir.path().join("a.md"), "match").unwrap();
+        run_ingest(&cfg, None, false).await.unwrap();
+
+        // Simulate an unclean shutdown: orphaned WAL sidecars next to the db.
+        std::fs::write(dbdir.path().join("t.db-wal"), b"stale wal").unwrap();
+        std::fs::write(dbdir.path().join("t.db-shm"), b"stale shm").unwrap();
+
+        let s = run_ingest(&cfg, None, true).await.unwrap();
+        assert_eq!(
+            (s.added, s.scanned),
+            (1, 1),
+            "rebuild must start from a fresh index"
+        );
+        assert!(db.exists(), "fresh db file must be recreated");
+        assert!(
+            !dbdir.path().join("t.db-wal").exists(),
+            "-wal sidecar must be gone"
+        );
+        assert!(
+            !dbdir.path().join("t.db-shm").exists(),
+            "-shm sidecar must be gone"
+        );
+
+        // The doc is registered in the recreated index: a plain re-run skips it.
+        let s2 = run_ingest(&cfg, None, false).await.unwrap();
+        assert_eq!((s2.added, s2.skipped), (0, 1));
     }
 }
