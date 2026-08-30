@@ -50,6 +50,8 @@ enum Cmd {
         #[arg(short, long)]
         k: Option<usize>,
     },
+    /// Show sources, document/chunk counts, and embedding fingerprint
+    Status,
 }
 
 fn exit(code: i32) -> ! {
@@ -217,6 +219,39 @@ async fn main() {
                     exit(1)
                 }
             }
+        }
+        Cmd::Status => {
+            let (_path, cfg) = load_config_or_exit();
+            let store = match conga_rag::store::Store::open(&cfg.store_path()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("conga-rag: {e}");
+                    exit(1)
+                }
+            };
+            let stats = store.stats().unwrap_or_default();
+            let fp = store.fingerprint();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "store": cfg.store_path().display().to_string(),
+                        "sources": cfg.sources.keys().collect::<Vec<_>>(),
+                        "stats": stats,
+                        "fingerprint": fp,
+                    })
+                );
+            } else {
+                println!("store: {}", cfg.store_path().display());
+                match fp {
+                    Some((m, d)) => println!("embedding: {m} [{d}]"),
+                    None => println!("embedding: (空索引,未 ingest)"),
+                }
+                for st in &stats {
+                    println!("{:<20} docs={} chunks={}", st.source, st.docs, st.chunks);
+                }
+            }
+            exit(0)
         }
     }
     exit(0)

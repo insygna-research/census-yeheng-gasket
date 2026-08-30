@@ -233,3 +233,13 @@ conga-rag status
 
 PDF/Office/URL 输入源、文件 watcher、BM25 混合检索、rerank、多语言分块策略、
 chunk 级增量 diff、向量缓存、Web UI、并发 embedding 请求。
+
+## 附录:实现差异(评审已接受)
+
+- mtime 以纳秒存储(spec 未指明单位,实现取 `SystemTime` 纳秒)。
+- chunk 落库前仅 `trim_end`(保留行首空白,便于引用对齐)。
+- embed mock 以 `testsupport` 常驻模块提供(axum 作为真实依赖,单测/集成测试共用)。
+- CLI 的 search/ask 在入口层增加空索引 `is_empty` 守卫(§9 的提示与退出码 1 在 CLI 层实现)。
+- vec0 KNN 用参数绑定 `rowid IN (...)` 预过滤,替代匹配子句。
+- 配置 `discover`/`apply_env` fail-loud:`CONGA_RAG_CONFIG` 指向不存在文件、
+  `CONGA_RAG_EMBED_BATCH` 不可解析 → 直接报错(§10 精神)。

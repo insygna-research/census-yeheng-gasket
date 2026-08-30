@@ -75,7 +75,10 @@ impl EmbeddingsClient {
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
             batch: cfg.batch.max(1),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("reqwest client construction with 60s timeout"),
             retry,
         }
     }

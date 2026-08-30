@@ -53,7 +53,7 @@ cd conga && cargo run --release --bin conga
 
 ## Architecture
 
-conga is a Cargo workspace with 5 crates, in a strict `core → host → frontends` layering:
+conga is a Cargo workspace with 6 crates, in a strict `core → host → frontends` layering:
 
 | Crate | Type | Responsibility |
 |---|---|---|
@@ -62,6 +62,7 @@ conga is a Cargo workspace with 5 crates, in a strict `core → host → fronten
 | `conga-ext` | lib | Optional in-process extensions (`hello` / `todo` / `search` / `permission_gate`). |
 | `conga-gateway` | bin | WebSocket gateway server: bridges the Vue frontend to the agent loop, plus a REST transcript endpoint (`GET /api/sessions/{key}/messages`) that derives history from the on-disk event log. |
 | `conga-cli` | bin | Interactive terminal REPL. |
+| `conga-rag` | bin+lib | Personal RAG: ingest → clean → chunk → embed → sqlite-vec store, headless `ingest`/`search`/`ask`/`status` CLI. |
 
 The frontend (`web/`) is Vue 3 + Vite + Tauri 2 — one codebase for both browser and desktop.
 

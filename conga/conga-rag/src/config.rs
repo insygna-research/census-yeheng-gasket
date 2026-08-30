@@ -116,7 +116,7 @@ impl RagConfig {
     pub fn load_with(
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> anyhow::Result<(PathBuf, Self)> {
-        let path = Self::discover(env).ok_or_else(|| {
+        let path = Self::discover(env)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "未找到配置:设置 CONGA_RAG_CONFIG,或创建 ./rag.toml / ~/.conga/rag.toml"
             )
@@ -124,31 +124,38 @@ impl RagConfig {
         let raw = std::fs::read_to_string(&path)?;
         let mut cfg: RagConfig = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("配置解析失败 {}: {e}", path.display()))?;
-        cfg.apply_env(env);
+        cfg.apply_env(env)?;
         cfg.expand_tilde();
         cfg.validate()?;
         Ok((path, cfg))
     }
 
     /// `CONGA_RAG_CONFIG` → `./rag.toml` → `~/.conga/rag.toml`,取第一个存在者。
-    pub fn discover(env: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Option<PathBuf> {
+    /// `CONGA_RAG_CONFIG` 已设置但文件不存在 → 报错(fail-loud,不静默回落)。
+    pub fn discover(
+        env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<Option<PathBuf>> {
         if let Ok(p) = env("CONGA_RAG_CONFIG") {
-            let p = PathBuf::from(p);
+            let p = PathBuf::from(&p);
             if p.exists() {
-                return Some(p);
+                return Ok(Some(p));
             }
+            anyhow::bail!("CONGA_RAG_CONFIG 已设置但文件不存在: {}", p.display());
         }
         let cwd = PathBuf::from("rag.toml");
         if cwd.exists() {
-            return Some(cwd);
+            return Ok(Some(cwd));
         }
-        dirs::home_dir()
+        Ok(dirs::home_dir()
             .map(|h| h.join(".conga/rag.toml"))
-            .filter(|p| p.exists())
+            .filter(|p| p.exists()))
     }
 
-    /// `CONGA_RAG_*` 单值覆盖。
-    pub fn apply_env(&mut self, env: &dyn Fn(&str) -> Result<String, std::env::VarError>) {
+    /// `CONGA_RAG_*` 单值覆盖。不可解析的值直接报错(fail-loud)。
+    pub fn apply_env(
+        &mut self,
+        env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> anyhow::Result<()> {
         let s = |k: &str| env(k).ok();
         if let Some(v) = s("CONGA_RAG_EMBED_BASE_URL") {
             self.embedding.base_url = Some(v);
@@ -159,12 +166,15 @@ impl RagConfig {
         if let Some(v) = s("CONGA_RAG_EMBED_MODEL") {
             self.embedding.model = Some(v);
         }
-        if let Some(v) = s("CONGA_RAG_EMBED_BATCH").and_then(|v| v.parse().ok()) {
-            self.embedding.batch = v;
+        if let Some(v) = s("CONGA_RAG_EMBED_BATCH") {
+            self.embedding.batch = v
+                .parse()
+                .map_err(|_| anyhow::anyhow!("CONGA_RAG_EMBED_BATCH 值无法解析为 usize: {v:?}"))?;
         }
         if let Some(v) = s("CONGA_RAG_STORE_PATH") {
             self.store.path = Some(PathBuf::from(v));
         }
+        Ok(())
     }
 
     /// `~/` 前缀展开到家目录(源路径与库路径)。
@@ -324,12 +334,46 @@ overlap_chars = 50
             "CONGA_LLM_KEY" => Ok("fb-key".into()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let cfg: RagConfig = toml::from_str(TOML).unwrap();
-        let mut cfg = cfg;
-        cfg.apply_env(&env);
+        let mut cfg: RagConfig = toml::from_str(TOML).unwrap();
+        cfg.apply_env(&env).unwrap();
         let r = cfg.resolve_embedding_with(&env).unwrap();
         assert_eq!(r.model, "env-model");
         assert_eq!(r.batch, 3);
+    }
+
+    #[test]
+    fn discover_fails_loud_when_env_config_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-rag.toml");
+        let env = |_k: &str| -> Result<String, std::env::VarError> {
+            Ok(missing.to_string_lossy().into_owned())
+        };
+        let err = RagConfig::discover(&env).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CONGA_RAG_CONFIG"), "must name the var: {msg}");
+        assert!(
+            msg.contains("no-such-rag.toml"),
+            "must name the path: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_env_rejects_unparsable_batch() {
+        let env = |k: &str| match k {
+            "CONGA_RAG_EMBED_BATCH" => Ok("not-a-number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let mut cfg: RagConfig = toml::from_str(TOML).unwrap();
+        let err = cfg.apply_env(&env).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONGA_RAG_EMBED_BATCH"),
+            "must name the var: {msg}"
+        );
+        assert!(
+            msg.contains("not-a-number"),
+            "must include the value: {msg}"
+        );
     }
 
     #[test]

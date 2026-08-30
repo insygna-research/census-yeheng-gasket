@@ -22,7 +22,7 @@ pub struct DocRow {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SourceStat {
     pub source: String,
     pub docs: i64,
