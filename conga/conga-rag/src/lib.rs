@@ -4,5 +4,6 @@
 pub mod chunk;
 pub mod clean;
 pub mod config;
+pub mod embed;
 pub mod source;
 pub mod store;
