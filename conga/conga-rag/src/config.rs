@@ -334,7 +334,7 @@ overlap_chars = 50
 
     #[test]
     fn validation_rejects_bad_chunking_and_empty_sources() {
-        let mut cfg: RagConfig = toml::from_str("").unwrap();
+        let cfg: RagConfig = toml::from_str("").unwrap();
         assert!(cfg.validate().is_err(), "empty sources");
         let cfg2: RagConfig = toml::from_str(TOML).unwrap();
         assert!(cfg2.validate().is_ok());
